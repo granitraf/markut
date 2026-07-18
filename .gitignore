@@ -1,0 +1,17 @@
+# secrets — never in history
+.env
+
+# caches / local state
+edgar_cache/
+news_cache/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
+*.egg-info/
+
+# environment
+.venv/
+
+# local result dumps
+*_results.json
