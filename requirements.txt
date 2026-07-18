@@ -1,0 +1,10 @@
+langgraph
+anthropic
+python-dotenv
+requests
+yfinance
+sentence-transformers
+chromadb
+beautifulsoup4
+fastmcp
+pytest
