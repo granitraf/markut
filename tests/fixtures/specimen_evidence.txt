@@ -1,0 +1,8 @@
+Price: $195.55 [source: yfinance/info]
+Market cap: $4.74T [source: yfinance/info]
+Forward P/E: 15.32x [source: yfinance/info]
+Forward EPS: $12.76 [source: yfinance/info]
+52-week low: $157.34 [source: yfinance/info]
+DCF fair value: $244.85 vs price $195.55 (+25.2%) [source: FMP/dcf]
+Analyst mean target: $301.62 [source: yfinance/analyst_price_targets]
+Analyst low target: $180.00 [source: yfinance/analyst_price_targets]

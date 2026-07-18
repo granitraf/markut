@@ -51,3 +51,12 @@ def test_review_skeleton_and_prompt_verbatim(nodes_cell):
     assert skeleton == prompts.REVIEW_JSON_SKELETON
     rendered = eval(_grab(seg, "system_prompt"), {"json_skeleton": skeleton})
     assert rendered == prompts.REVIEW_SYSTEM_PROMPT
+
+
+def test_baseline_prompt_verbatim():
+    nb = json.load(open(NB))
+    harness_cell = next("".join(c["source"]) for c in nb["cells"]
+                        if c["cell_type"] == "code"
+                        and "_eval_baseline_system = (" in "".join(c["source"]))
+    literal = _grab(harness_cell, "_eval_baseline_system", indent="        ")
+    assert eval(literal) == prompts.BASELINE_SYSTEM_PROMPT
