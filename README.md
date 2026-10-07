@@ -91,7 +91,10 @@ steps for Railway:
 3. Settings -> Networking -> Generate Domain. The public page is `/`, the
    console `/console` (browser asks for the password; any username).
 
-Sizing: the server needs ~2 GB RAM for the models; keep one always-on
+Sizing: measured peak RSS of one research step (torch + both models + a
+~400-chunk filing index) is ~700 MB; give the service a **2 GB** memory
+limit. On a 512 MB / 1 GB trial allocation the container is OOM-killed
+right after `RAG: collection ... ready` with no traceback. Keep one always-on
 replica (the live-debate lock and warmed models live in process memory, so
 a second replica would double cost and allow two paid runs at once). The
 first build downloads torch and the models and takes several minutes;
