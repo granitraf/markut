@@ -89,21 +89,6 @@ build time so cold starts are fast, non-root user, port 7860) that runs on
 Hugging Face Spaces and on Railway. The block at the very top of this file
 is the Spaces metadata (`sdk: docker`, `app_port: 7860`).
 
-### Modal (free Starter plan: $30/month compute credits, no card) — recommended
-
-`modal_app.py` wraps the same FastAPI app in a Modal web endpoint: a real
-container (2 vCPU, 2 GB) with both models baked into the image, scaling to
-zero when idle so a demo site stays well inside the free credits.
-
-    pip install modal && modal setup                      # once: browser login
-    modal secret create markut ANTHROPIC_API_KEY=sk-ant-... FMP_API_KEY=... \
-        DATABASE_URL='postgresql://...' CONSOLE_PASSWORD='...'   # once
-    modal deploy modal_app.py                             # prints the URL
-
-The URL looks like `https://<workspace>--markut-web.modal.run`; console at
-`/console`. Re-run `modal deploy` after every code change. A cold start
-(first visit after 10 idle minutes) takes a few seconds.
-
 ### Hugging Face Spaces (Docker/Gradio Spaces are now a paid feature)
 
 The Dockerfile and the metadata block at the top of this README still work
