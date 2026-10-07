@@ -4,6 +4,10 @@
 # caches / local state
 edgar_cache/
 news_cache/
+# run log (SQLite) + the pre-database JSON records it imports on first start
+markut_runs.db
+markut_runs.db-journal
+web_records/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
@@ -15,3 +19,5 @@ __pycache__/
 
 # local result dumps
 *_results.json
+.DS_Store
+.vscode/

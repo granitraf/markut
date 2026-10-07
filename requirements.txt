@@ -8,3 +8,9 @@ chromadb
 beautifulsoup4
 fastmcp
 pytest
+# web UI (markut.web). fastapi 0.142+ pins opentelemetry-api>=1.44, which
+# breaks the chromadb/opentelemetry-sdk pair this venv runs — stay below it.
+fastapi<0.142
+uvicorn
+# hosted run log (Supabase Postgres); the SQLite fallback needs nothing extra
+psycopg[binary]

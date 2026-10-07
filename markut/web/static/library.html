@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Markut Archive</title>
+<meta name="description" content="Every debate Markut has run, by date and ticker, with grounding stats and a link to read each one.">
+<link rel="stylesheet" href="/static/debate.css">
+<style>
+  body { font-size: 15px; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 24px 16px 64px; }
+  header { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  h1 { margin: 0; font-size: 26px; } h1 small { font-size: 13px; color: var(--muted); font-weight: 500; margin-left: 8px; letter-spacing: .08em; text-transform: uppercase; }
+  header p { margin: 4px 0 0; color: var(--muted); }
+  nav { display: flex; gap: 14px; } nav a, td a { text-decoration: none; font-weight: 600; }
+  .bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 18px 0 12px; }
+  .bar input { width: 160px; background: var(--surface); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { font: 600 12px/1 var(--mono); padding: 6px 9px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); cursor: pointer; color: var(--ink); }
+  .chip.on { border-color: var(--accent); color: var(--accent); }
+  .summary { color: var(--muted); font-size: 13px; margin-left: auto; }
+  .tablewrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+  table { border-collapse: collapse; width: 100%; min-width: 760px; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; cursor: pointer; user-select: none; }
+  th.sorted::after { content: " ▾"; } th.sorted.asc::after { content: " ▴"; }
+  tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+  td.num, th.num { text-align: right; font-family: var(--mono); font-size: 13px; }
+  .tk { font-family: var(--mono); font-weight: 700; }
+  .yes { color: var(--good); } .no { color: var(--muted); } .err { color: var(--bad); font-weight: 600; }
+  .meter { display: inline-block; width: 64px; height: 6px; background: var(--line); border-radius: 3px; vertical-align: middle; margin-right: 6px; overflow: hidden; }
+  .meter i { display: block; height: 100%; background: var(--good); }
+  .empty { padding: 28px; text-align: center; color: var(--muted); }
+  .foot { color: var(--muted); font-size: 13px; margin-top: 14px; }
+  @media (max-width: 520px) { h1 { font-size: 22px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div><h1>Archive <small>console</small></h1><p>Every debate that has been run, newest first. Click a row to read the whole thing.</p></div>
+    <nav><a href="/console">← Console</a><a href="/">Public site</a></nav>
+  </header>
+
+  <div class="bar">
+    <input id="q" placeholder="Filter ticker…" aria-label="Filter by ticker" autocomplete="off">
+    <div class="chips" id="chips"></div>
+    <span class="summary" id="summary"></span>
+  </div>
+
+  <div class="tablewrap">
+    <table id="table">
+      <thead><tr>
+        <th data-k="started_at" class="sorted">Date run</th><th data-k="ticker">Ticker</th><th data-k="price" class="num">Price</th>
+        <th data-k="mode">Mode</th><th data-k="rounds" class="num">Rounds</th><th data-k="converged">Converged</th>
+        <th data-k="grounding">Grounding</th><th data-k="annotated" class="num">Tagged</th><th data-k="tokens" class="num">Tokens</th><th data-k="status">Status</th><th></th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty" hidden>No runs yet. Run a debate from the <a href="/console">console</a> or <code>python run.py TICKER</code>.</div>
+  </div>
+  <p class="foot" id="foot"></p>
+</div>
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+  let runs = [], sortKey = "started_at", asc = false, tickerFilter = "";
+
+  const derived = (r) => ({ ...r, grounding: r.claims ? r.cited / r.claims : -1, tokens: (r.input_tokens || 0) + (r.output_tokens || 0),
+    priceNum: r.price ? parseFloat(r.price.replace(/[$,]/g, "")) : -1 });
+
+  function render() {
+    const q = $("q").value.trim().toUpperCase();
+    let rows = runs.map(derived).filter((r) => (!q || r.ticker.includes(q)) && (!tickerFilter || r.ticker === tickerFilter));
+    rows.sort((a, b) => {
+      let x = a[sortKey], y = b[sortKey];
+      if (sortKey === "price") { x = a.priceNum; y = b.priceNum; }
+      if (typeof x === "string") return asc ? x.localeCompare(y) : y.localeCompare(x);
+      return asc ? (x ?? -1) - (y ?? -1) : (y ?? -1) - (x ?? -1);
+    });
+    $("rows").innerHTML = rows.map((r) => {
+      const g = r.claims ? `<span class="meter"><i style="width:${Math.round(100 * r.grounding)}%"></i></span>${r.cited}/${r.claims}` : "–";
+      const st = r.status === "done" ? `<span class="pill">${esc(r.review_status || "done")}</span>` : `<span class="err" title="${esc(r.error || "")}">error</span>`;
+      return `<tr onclick="location.href='/console?run=${r.id}'" style="cursor:pointer">
+        <td>${esc(r.started_at)}</td><td class="tk">${esc(r.ticker)}</td><td class="num">${esc(r.price || "–")}</td>
+        <td><span class="pill">${esc(r.mode)}</span></td><td class="num">${r.rounds ?? "–"}</td>
+        <td class="${r.converged ? "yes" : "no"}">${r.converged ? "yes" : "no"}</td>
+        <td>${g}</td><td class="num">${r.annotated ?? "–"}</td><td class="num">${r.tokens ? r.tokens.toLocaleString() : "–"}</td>
+        <td>${st}</td><td><a href="/console?run=${r.id}" onclick="event.stopPropagation()">read →</a></td></tr>`;
+    }).join("");
+    $("empty").hidden = rows.length > 0;
+    $("summary").textContent = `${rows.length} of ${runs.length} run(s) · ${new Set(runs.map((r) => r.ticker)).size} ticker(s)`;
+  }
+  function chips() {
+    const counts = {}; for (const r of runs) counts[r.ticker] = (counts[r.ticker] || 0) + 1;
+    const el = $("chips"); el.innerHTML = "";
+    for (const [t, n] of Object.entries(counts).sort()) {
+      const b = document.createElement("button"); b.className = "chip" + (tickerFilter === t ? " on" : ""); b.textContent = `${t} ×${n}`;
+      b.onclick = () => { tickerFilter = tickerFilter === t ? "" : t; chips(); render(); }; el.appendChild(b);
+    }
+  }
+  document.querySelectorAll("th[data-k]").forEach((th) => th.addEventListener("click", () => {
+    const k = th.dataset.k; if (sortKey === k) asc = !asc; else { sortKey = k; asc = k === "ticker"; }
+    document.querySelectorAll("th").forEach((t) => t.classList.remove("sorted", "asc")); th.classList.add("sorted"); if (asc) th.classList.add("asc");
+    render();
+  }));
+  $("q").addEventListener("input", render);
+  (async () => {
+    try { const h = await (await fetch("/api/health")).json(); $("foot").textContent = "Stored in " + h.db_path; runs = (await (await fetch("/api/runs")).json()).runs; }
+    catch (_) { $("foot").textContent = "Could not load the run log."; }
+    chips(); render();
+  })();
+})();
+</script>
+</body>
+</html>

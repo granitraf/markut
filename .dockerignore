@@ -1,0 +1,17 @@
+.venv
+.git
+.gitignore
+.vscode
+.cursor
+.DS_Store
+.pytest_cache
+__pycache__
+*.pyc
+*.ipynb
+.env
+.env.*
+edgar_cache
+news_cache
+web_records
+markut_runs.db*
+tests

@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Markut Console</title>
+<meta name="description" content="Operator console: run a live bull-vs-bear debate on any ticker, or replay a stored one, agent by agent.">
+<link rel="stylesheet" href="/static/debate.css">
+<style>
+  .wrap { max-width: 880px; margin: 0 auto; padding: 24px 16px 64px; }
+  header { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 26px; letter-spacing: -0.01em; }
+  header h1 small { font-size: 13px; color: var(--muted); font-weight: 500; margin-left: 8px; letter-spacing: .08em; text-transform: uppercase; }
+  header p { margin: 4px 0 0; color: var(--muted); }
+  header nav { display: flex; gap: 14px; } header nav a { text-decoration: none; font-weight: 600; font-size: 14px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 20px 0 8px; padding: 14px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+  .controls input { width: 110px; text-transform: uppercase; font-family: var(--mono); }
+  .spacer { flex: 1; }
+  .status { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--muted); font-size: 14px; min-height: 22px; margin-bottom: 16px; }
+  .status b { color: var(--ink); font-weight: 600; }
+  .readhead { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: baseline; margin: 20px 0 6px; padding: 14px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+  .readhead .t { font-size: 24px; font-weight: 700; font-family: var(--mono); }
+  .readhead .d { color: var(--muted); }
+  .disclaimer { margin-top: 24px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--line); padding-top: 12px; }
+  @media (max-width: 520px) { .controls { gap: 8px; } .controls input { width: 90px; } header h1 { font-size: 22px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Markut <small>console</small></h1>
+      <p>Run a live debate on any ticker, or replay a stored one. Each card is one agent finishing its turn.</p>
+    </div>
+    <nav><a href="/console/library">Archive →</a><a href="/">Public site</a></nav>
+  </header>
+
+  <div class="readhead hidden" id="readhead"></div>
+
+  <form class="controls" id="controls">
+    <input id="ticker" value="NVDA" placeholder="TICKER" maxlength="7" autocomplete="off" aria-label="Ticker">
+    <select id="rounds" aria-label="Max rounds"><option value="1">1 round</option><option value="2" selected>2 rounds</option><option value="3">3 rounds</option></select>
+    <button class="primary" id="run" type="submit">Run live debate</button>
+    <span class="spacer"></span>
+    <select id="record" aria-label="Stored run"></select>
+    <button id="replay" type="button">Replay stored run</button>
+  </form>
+  <div class="status" id="status"><span>Live runs are paid (8–12 model calls) and are logged to the archive. Replays are free.</span></div>
+
+  <div class="timeline" id="timeline"></div>
+
+  <p class="disclaimer">Markut is a research tool. Everything it produces is research framing only and does not constitute investment advice.
+    Verdict numbers are traced against the evidence packet; anything without an anchor is tagged inline rather than removed.</p>
+</div>
+
+<script src="/static/debate.js"></script>
+<script>
+(function () {
+  const { esc, Timeline, play } = window.Markut;
+  const $ = (id) => document.getElementById(id);
+  const status = $("status"), head = $("readhead");
+  let player = null, timer = null, startedAt = 0;
+
+  const setStatus = (html) => { status.innerHTML = html; };
+  function startClock() { stopClock(); startedAt = Date.now(); timer = setInterval(() => { const c = $("clock"); if (c) c.textContent = Math.round((Date.now() - startedAt) / 1000) + "s"; }, 1000); }
+  function stopClock() { if (timer) clearInterval(timer); timer = null; }
+  function setBusy(b) { $("run").disabled = b || !liveEnabled; $("replay").disabled = b; }
+  let liveEnabled = true;
+
+  const timeline = Timeline($("timeline"), {
+    onStart(d) {
+      const mode = d.mode === "replay" ? "replay" : "live";
+      setStatus(`<span class="pill ${mode}">${mode === "replay" ? "STORED RUN" : "LIVE"}</span> <b>${esc(d.ticker)}</b> · up to ${d.max_rounds} round(s) · model ${esc(d.model || "")}` +
+        (d.recorded_at ? ` · recorded ${esc(d.recorded_at)}` : "") + ` · <span id="clock">0s</span>`);
+    },
+    onEnd() { stopClock(); setBusy(false); },
+    onSaved(d) {
+      if (d.run) { timeline.card("route", `Logged as run #${d.run} — <a href="/console?run=${d.run}">read it</a>, or find it in the <a href="/console/library">archive</a>.`); loadRuns(String(d.run)); }
+      else if (d.error) timeline.card("route", "Run finished but could not be logged: " + esc(d.error));
+    },
+  });
+
+  function open(url) {
+    if (player) player.close();
+    timeline.clear(); setBusy(true); setStatus("Connecting…"); startClock();
+    player = play(url, timeline);
+  }
+
+  $("controls").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const t = $("ticker").value.trim().toUpperCase();
+    if (!/^[A-Z]{1,5}(\.[A-Z])?$/.test(t)) { setStatus(`<b>${esc(t) || "(empty)"}</b> is not a ticker shape (1–5 letters, optional .X class).`); return; }
+    open(`/api/debate?ticker=${encodeURIComponent(t)}&max_rounds=${$("rounds").value}`);
+  });
+  $("replay").addEventListener("click", () => { const r = $("record").value; if (r) open(`/api/replay?run=${encodeURIComponent(r)}`); });
+
+  async function loadRuns(select) {
+    try {
+      const { runs } = await (await fetch("/api/runs")).json(); const sel = $("record"); sel.innerHTML = "";
+      for (const r of runs) { const o = document.createElement("option"); o.value = String(r.id); o.textContent = `#${r.id} ${r.ticker} · ${r.started_at}${r.mode === "course" ? " · course run" : ""}${r.status !== "done" ? " · " + r.status : ""}`; sel.appendChild(o); }
+      if (select) sel.value = select;
+      $("replay").disabled = runs.length === 0;
+    } catch (_) { $("replay").disabled = true; }
+  }
+  async function loadHealth() {
+    try {
+      const h = await (await fetch("/api/health")).json();
+      liveEnabled = !!h.live_enabled;
+      if (!liveEnabled) { $("run").disabled = true; $("run").title = "ANTHROPIC_API_KEY not set on the server"; setStatus("Live debates are disabled on this server (no API key). Stored runs still play."); }
+    } catch (_) {}
+  }
+
+  // ---- read mode: /console?run=ID renders a stored run instantly as a document ----
+  async function openRead(id) {
+    $("controls").classList.add("hidden"); status.classList.add("hidden");
+    head.classList.remove("hidden"); head.innerHTML = "Loading run #" + esc(id) + "…";
+    let run;
+    try { const res = await fetch("/api/runs/" + encodeURIComponent(id)); if (!res.ok) throw new Error(res.status); run = await res.json(); }
+    catch (e) { head.innerHTML = `Run #${esc(id)} was not found. <a href="/console/library">Back to the archive</a>.`; return; }
+    const grounding = run.claims != null ? `${run.cited}/${run.claims} grounded` : "";
+    head.innerHTML = `<span class="t">${esc(run.ticker)}</span><span class="d">${esc(run.started_at)}</span>` +
+      `<span class="pill">${esc(run.mode)}</span>${run.price ? `<span class="d">price ${esc(run.price)}</span>` : ""}` +
+      `${grounding ? `<span class="d">${grounding}</span>` : ""}<span class="spacer"></span>` +
+      `<button id="readreplay" type="button">Replay with pacing</button> <a href="/console/library" style="align-self:center">Archive</a>`;
+    $("readreplay").addEventListener("click", () => { head.classList.add("hidden"); status.classList.remove("hidden"); open(`/api/replay?run=${encodeURIComponent(id)}`); });
+    timeline.renderAll(run.events); stopClock();
+  }
+
+  loadRuns(); loadHealth();
+  const wantRun = new URLSearchParams(location.search).get("run");
+  if (wantRun) openRead(wantRun);
+})();
+</script>
+</body>
+</html>
