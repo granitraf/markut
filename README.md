@@ -1,3 +1,14 @@
+---
+title: Markut
+emoji: ⚖️
+colorFrom: green
+colorTo: red
+sdk: docker
+app_port: 7860
+pinned: false
+short_description: Bull-vs-bear research debate swarm with a governed verdict
+---
+
 # Markut — AI Investment Research Advisor
 
 A bull-vs-bear debate swarm: ticker in, evidence-grounded, guardrail-governed
@@ -71,12 +82,31 @@ direct `db.<ref>.supabase.co` host is IPv6-only), replace `[YOUR-PASSWORD]`
 Loose `web_records/*.json` files from before the database are imported
 once on first start, whichever backend is active.
 
-## Deploy (Railway)
+## Deploy
 
 The repo ships a `Dockerfile` (CPU-only torch, both local models baked in at
-build time so cold starts are fast) and `railway.json` (health check on
-`/api/health`, restart on failure, one replica). Any Docker host works; the
-steps for Railway:
+build time so cold starts are fast, non-root user, port 7860) that runs on
+Hugging Face Spaces and on Railway. The block at the very top of this file
+is the Spaces metadata (`sdk: docker`, `app_port: 7860`).
+
+### Hugging Face Spaces (free; 16 GB RAM — enough for live debates)
+
+1. Create a Space: huggingface.co/new-space, SDK **Docker**, template
+   **Blank**, public. Note its id, e.g. `granitraf/markut`.
+2. Push this repo to it (the Space is a git repo; the default branch is
+   `main`; password = a **write** access token from Settings -> Access Tokens):
+
+       git remote add hf https://huggingface.co/spaces/granitraf/markut
+       git push hf master:main
+
+3. Space -> Settings -> **Variables and secrets** -> add as *secrets*:
+   `ANTHROPIC_API_KEY`, `FMP_API_KEY`, `DATABASE_URL`, `CONSOLE_PASSWORD`;
+   optionally `FEATURED_TICKERS` as a variable. The Space rebuilds.
+4. The site is `https://<user>-markut.hf.space` (and embedded on the Space
+   page). Console: `/console`. A free Space sleeps after ~48h without
+   visitors and wakes on the next visit (about a minute).
+
+### Railway (paid plan needed for the memory)
 
 1. Push the repo to GitHub. In Railway: New Project -> Deploy from GitHub
    repo -> pick it. Railway detects the Dockerfile.

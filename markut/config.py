@@ -34,9 +34,11 @@ LEGACY_RECORDS_DIR = "web_records"
 FEATURED_TICKERS = [t for t in os.getenv("FEATURED_TICKERS", "").split(",") if t.strip()]
 FEATURED_LIMIT = 5
 
-# deployment: Railway sets RAILWAY_ENVIRONMENT; the Dockerfile sets MARKUT_PRODUCTION.
+# deployment: Railway sets RAILWAY_ENVIRONMENT, Hugging Face Spaces sets SPACE_ID,
+# the Dockerfile sets MARKUT_PRODUCTION.
 # In production the console FAILS CLOSED without a password.
-IN_PRODUCTION = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("MARKUT_PRODUCTION"))
+IN_PRODUCTION = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("SPACE_ID")
+                     or os.getenv("MARKUT_PRODUCTION"))
 # operator side gate (HTTP Basic, any username). Unset locally = open; unset in
 # production = console locked.
 CONSOLE_PASSWORD = os.getenv("CONSOLE_PASSWORD") or None
