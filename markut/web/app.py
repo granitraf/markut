@@ -53,7 +53,41 @@ MAX_ROUNDS_CAP = 4  # a web form must not be able to request a 40-round debate
 
 # EXECUTION GUARDRAIL for the web layer: one live debate at a time. Each one
 # is 8-12 paid calls; a page refreshed five times must queue, not fan out.
-_live_lock = asyncio.Lock()
+# The debate runs in its OWN thread (not the request's lifetime): if the
+# viewer's connection drops mid-run — proxy timeout, closed tab — the run
+# still completes and is logged, so the tokens already spent are never wasted.
+_live_job = None            # threading.Thread of the run in progress (or finished)
+_live_guard = threading.Lock()
+HEARTBEAT_SECONDS = 15      # SSE comment cadence during silent phases (research ~1-2 min)
+
+
+def live_busy() -> bool:
+    return _live_job is not None and _live_job.is_alive()
+
+
+def _run_debate_job(ticker: str, max_rounds: int, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
+    # PRODUCER (worker thread): iterate the sync graph to COMPLETION, hand each
+    # event to the async consumer, then log the run. Nothing here depends on
+    # the HTTP connection staying open.
+    seen = []
+    def push(item):
+        loop.call_soon_threadsafe(queue.put_nowait, item)
+    try:
+        for event in ev.stream_debate(ticker, max_rounds):
+            seen.append(stamped(event))
+            push(event)
+        # EVERY run that got past validation is logged — finished or errored —
+        # so the archive is a complete history, not a highlight reel
+        if seen and seen[0]["event"] == "start":
+            try:
+                run_id = store.record_run(seen, mode="web", db=store.target())
+                push({"event": "saved", "data": {"run": run_id}})
+            except Exception as e:  # a logging failure must not look like a debate failure
+                push({"event": "saved", "data": {"run": None, "error": f"{type(e).__name__}: {e}"}})
+    except Exception as e:
+        push({"event": "error", "data": {"stage": "server", "message": f"{type(e).__name__}: {e}"}})
+    finally:
+        push(None)  # end of stream
 
 # store.bootstrap() once per DB target per process — lazily, on first use, so
 # tests can repoint config.DB_PATH without lifespan plumbing
@@ -152,7 +186,7 @@ def health():
     return {"ok": True, "model": config.MODEL_NAME, "token_budget": config.TOKEN_BUDGET,
             "default_max_rounds": config.DEFAULT_MAX_ROUNDS, "db_path": store.backend_label(),
             "db_backend": "postgres" if store.is_postgres() else "sqlite",
-            "live_enabled": bool(config.ANTHROPIC_API_KEY), "live_busy": _live_lock.locked(),
+            "live_enabled": bool(config.ANTHROPIC_API_KEY), "live_busy": live_busy(),
             "console_locked": config.IN_PRODUCTION and not config.CONSOLE_PASSWORD,
             "console_protected": bool(config.CONSOLE_PASSWORD),
             "models_warm": bool(rag and rag._EMBEDDER is not None and rag._RERANKER is not None)}
@@ -211,30 +245,36 @@ def runs(ticker: str = Query(None)):
 @app.get("/api/debate", dependencies=OPERATOR)
 async def debate_stream(ticker: str = Query(...),
                         max_rounds: int = Query(config.DEFAULT_MAX_ROUNDS, ge=1, le=MAX_ROUNDS_CAP)):
+    global _live_job
     _ensure_store()
 
     async def gen():
+        global _live_job
         if not config.ANTHROPIC_API_KEY:
             yield sse({"event": "error", "data": {"stage": "config",
                        "message": "ANTHROPIC_API_KEY is not set — live debates are disabled on this server. "
                                   "Use a stored run instead."}})
             return
-        if _live_lock.locked():
-            yield sse({"event": "error", "data": {"stage": "busy",
-                       "message": "A live debate is already running on this server. Try again in a minute, "
-                                  "or watch a stored run."}})
-            return
-        async with _live_lock:
-            seen = []
-            async for event in iterate_in_threadpool(ev.stream_debate(ticker, max_rounds)):
-                seen.append(stamped(event))
-                yield sse(event)
-            # EVERY run that got past validation is logged — finished or
-            # errored — so the archive is a complete history, not a highlight reel
-            if seen and seen[0]["event"] == "start":
-                try:
-                    run_id = store.record_run(seen, mode="web", db=store.target())
-                    yield sse({"event": "saved", "data": {"run": run_id}})
-                except Exception as e:  # a logging failure must not look like a debate failure
-                    yield sse({"event": "saved", "data": {"run": None, "error": f"{type(e).__name__}: {e}"}})
+        queue: asyncio.Queue = asyncio.Queue()
+        with _live_guard:
+            if live_busy():
+                yield sse({"event": "error", "data": {"stage": "busy",
+                           "message": "A live debate is already running on this server. Try again in a minute, "
+                                      "or watch a stored run."}})
+                return
+            _live_job = threading.Thread(target=_run_debate_job, name="debate",
+                                         args=(ticker, max_rounds, queue, asyncio.get_running_loop()),
+                                         daemon=True)
+            _live_job.start()
+        # CONSUMER: forward events; during silent phases send an SSE comment
+        # every HEARTBEAT_SECONDS so proxies never see an idle connection.
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_SECONDS)
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"
+                continue
+            if item is None:
+                return
+            yield sse(item)
     return StreamingResponse(gen(), media_type="text/event-stream", headers=SSE_HEADERS)

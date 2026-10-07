@@ -122,19 +122,29 @@ window.Markut = (function () {
     return { el, card, setPending, clearPending, clear, render, renderAll };
   }
 
-  /* play(url, timeline): open an SSE stream and feed every event to the timeline. Returns {close}. */
+  /* play(url, timeline): open an SSE stream and feed every event to the timeline. Returns {close}.
+     Two kinds of "error" reach us: the SERVER's `event: error` (has JSON data — a debate problem) and the
+     browser's native EventSource error (no data — the connection itself failed: auth, proxy, network). */
   function play(url, timeline, hooks = {}) {
     const source = new EventSource(url);
     let finished = false;
     const finish = () => { finished = true; source.close(); };
+    const connectionLost = () => {
+      if (finished) return;
+      timeline.render.error({ stage: "connection", message:
+        "The connection to the server dropped before the debate finished. If the run had started, it keeps " +
+        "going on the server and will appear in the archive when it completes; reload in a minute or two." });
+      finish(); if (hooks.onClose) hooks.onClose("error");
+    };
     for (const name of Object.keys(timeline.render)) {
       source.addEventListener(name, (e) => {
+        if (name === "error" && (e.data === undefined || e.data === null)) return connectionLost();   // native
         let d = {}; try { d = JSON.parse(e.data); } catch (_) {}
         timeline.render[name](d);
         if (name === "done" || name === "error") { finish(); if (hooks.onClose) hooks.onClose(name); }
       });
     }
-    source.onerror = () => { if (!finished) { timeline.render.error({ stage: "connection", message: "The stream closed before the debate finished (server stopped or network dropped)." }); finish(); if (hooks.onClose) hooks.onClose("error"); } };
+    source.onerror = connectionLost;
     return { close: finish, get finished() { return finished; } };
   }
 

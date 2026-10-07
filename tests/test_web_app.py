@@ -147,3 +147,49 @@ def test_health_does_not_touch_the_database(monkeypatch):
     monkeypatch.setattr(config, "DATABASE_URL", "postgresql://u:p@db.invalid:5432/x")
     h = client.get("/api/health").json()
     assert h["ok"] is True and h["db_backend"] == "postgres" and "db.invalid" in h["db_path"]
+
+
+def test_live_stream_heartbeats_and_logs_even_after_viewer_leaves(monkeypatch):
+    # a slow phase longer than the heartbeat interval must produce SSE comment
+    # lines (keeps proxies from dropping an idle connection); the run must be
+    # logged by the worker thread regardless of the consumer
+    import time as _t
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr(app_mod, "HEARTBEAT_SECONDS", 0.05)
+    def slow_stream(ticker, max_rounds):
+        yield {"event": "start", "data": {"ticker": ticker, "max_rounds": max_rounds, "model": "m"}}
+        _t.sleep(0.25)                                   # "research" silence
+        yield {"event": "research", "data": {"evidence": "- Price (current): $2.00  [source: x]"}}
+        yield {"event": "done", "data": {"rounds": 0, "converged": False, "budget_exceeded": False,
+               "usage": {"calls": 0, "input": 0, "output": 0}}}
+    monkeypatch.setattr(app_mod.ev, "stream_debate", slow_stream)
+    raw = client.get("/api/debate", params={"ticker": "MSFT"}).text
+    assert raw.count(": ping") >= 2
+    events = parse_sse(raw.replace(": ping\n\n", ""))
+    assert [e["event"] for e in events] == ["start", "research", "done", "saved"]
+    rid = events[-1]["data"]["run"]
+    assert store.get_run(rid, config.DB_PATH)["ticker"] == "MSFT"
+    assert app_mod.live_busy() is False                  # thread finished
+
+
+def test_live_stream_busy_refusal(monkeypatch):
+    import threading as _th
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "test-key")
+    release = _th.Event()
+    def blocking_stream(ticker, max_rounds):
+        yield {"event": "start", "data": {"ticker": ticker, "max_rounds": max_rounds}}
+        release.wait(5)
+        yield {"event": "done", "data": {"rounds": 0, "converged": False, "usage": {}}}
+    monkeypatch.setattr(app_mod.ev, "stream_debate", blocking_stream)
+    # start a run in a side thread so it is mid-flight when the second request arrives
+    first = {}
+    def go(): first["text"] = client.get("/api/debate", params={"ticker": "AAPL"}).text
+    t = _th.Thread(target=go); t.start()
+    for _ in range(100):
+        if app_mod.live_busy(): break
+        _t_sleep = __import__("time").sleep(0.01)
+    assert app_mod.live_busy()
+    second = parse_sse(client.get("/api/debate", params={"ticker": "TSLA"}).text)
+    assert second[0]["event"] == "error" and second[0]["data"]["stage"] == "busy"
+    release.set(); t.join(10)
+    assert "saved" in first["text"] and not app_mod.live_busy()
