@@ -1,5 +1,14 @@
-"""call_claude + the shared TOKENS accumulator (notebook cell 6, verbatim;
-model name and budget backstop read late-bound from markut.config)."""
+"""call_claude + the shared TOKENS accumulator (notebook cell 6; model name,
+thinking setting and budget backstop read late-bound from markut.config).
+
+Sonnet 5.5 notes (why this differs from the notebook's one-liner):
+- thinking is ON by default on this model; we send the explicit setting from
+  config so cost and max_tokens semantics are deliberate, not accidental
+- the reply is read by block TYPE: with thinking enabled a response can start
+  with a thinking block, so content[0].text is no longer the answer
+- a safety refusal is a normal 200 with stop_reason "refusal"; it is raised
+  as ModelRefusal and NOT retried (retrying a refusal just refuses again)
+"""
 import time
 
 from anthropic import Anthropic
@@ -9,6 +18,27 @@ from markut import config
 client = Anthropic()
 
 TOKENS = {"input": 0, "output": 0, "calls": 0}
+
+
+class ModelRefusal(RuntimeError):
+    """The model declined the request (stop_reason == "refusal")."""
+
+
+def _request_kwargs(system_prompt: str, user_content: str, max_tokens: int) -> dict:
+    kwargs = {"model": config.MODEL_NAME, "max_tokens": max_tokens, "system": system_prompt,
+              "messages": [{"role": "user", "content": user_content}]}
+    if config.THINKING_EFFORT:
+        kwargs["thinking"] = {"type": "adaptive"}
+        kwargs["output_config"] = {"effort": config.THINKING_EFFORT}
+    else:
+        kwargs["thinking"] = {"type": "between_tools"}   # lowest setting = no extended thinking
+    return kwargs
+
+
+def _text_of(response) -> str:
+    # join the TEXT blocks only — thinking blocks (empty under the default
+    # display) must never leak into a bull case or a judge's JSON
+    return "".join(block.text for block in response.content if getattr(block, "type", "") == "text")
 
 
 def call_claude(system_prompt: str, user_content: str, max_tokens: int = 1000) -> str:
@@ -30,18 +60,19 @@ def call_claude(system_prompt: str, user_content: str, max_tokens: int = 1000) -
     last_error = None
     for attempt in range(2):
         try:
-            response = client.messages.create(
-                model=config.MODEL_NAME,
-                max_tokens=max_tokens,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_content}],
-            )
+            response = client.messages.create(**_request_kwargs(system_prompt, user_content, max_tokens))
             # WHY: only count usage on SUCCESS, so a failed+retried call isn't
             # double-billed in our totals. usage is on the response object.
             TOKENS["input"] += response.usage.input_tokens
             TOKENS["output"] += response.usage.output_tokens
             TOKENS["calls"] += 1
-            return response.content[0].text
+            if response.stop_reason == "refusal":
+                details = getattr(response, "stop_details", None)
+                category = getattr(details, "category", None) if details else None
+                raise ModelRefusal(f"model refused the request (category: {category})")
+            return _text_of(response)
+        except ModelRefusal:
+            raise  # deliberate: a refusal is not a transient error
         except Exception as e:
             last_error = e
             if attempt == 0:

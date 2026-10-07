@@ -13,8 +13,15 @@ load_dotenv()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 FMP_API_KEY = os.getenv("FMP_API_KEY")
 
-# model used for every agent call (notebook: call_claude's hardcoded model=)
-MODEL_NAME = "claude-sonnet-4-6"
+# model used for every agent call (notebook: call_claude's hardcoded model=).
+# Sonnet 5.5: same price as Sonnet 5 ($2/$10 per MTok), 1M context.
+MODEL_NAME = os.getenv("MARKUT_MODEL", "claude-sonnet-5-5")
+# Extended thinking on the Sonnet 5.5 family. Unset -> thinking OFF
+# ("between_tools", the model's lowest setting): closest to the notebook's
+# no-thinking calls, cheapest, and max_tokens stays the budget for the VISIBLE
+# reply. Set to low|medium|high to run adaptive thinking at that effort
+# (thinking tokens then count toward max_tokens and are billed as output).
+THINKING_EFFORT = os.getenv("THINKING_EFFORT") or None
 
 # SEC EDGAR requires a contactable User-Agent; cache dirs are created lazily
 # by the modules that own them (mirrors the notebook cells' makedirs calls).
