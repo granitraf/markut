@@ -89,22 +89,26 @@ build time so cold starts are fast, non-root user, port 7860) that runs on
 Hugging Face Spaces and on Railway. The block at the very top of this file
 is the Spaces metadata (`sdk: docker`, `app_port: 7860`).
 
-### Hugging Face Spaces (free; 16 GB RAM — enough for live debates)
+### Modal (free Starter plan: $30/month compute credits, no card) — recommended
 
-1. Create a Space: huggingface.co/new-space, SDK **Docker**, template
-   **Blank**, public. Note its id, e.g. `granitraf/markut`.
-2. Push this repo to it (the Space is a git repo; the default branch is
-   `main`; password = a **write** access token from Settings -> Access Tokens):
+`modal_app.py` wraps the same FastAPI app in a Modal web endpoint: a real
+container (2 vCPU, 2 GB) with both models baked into the image, scaling to
+zero when idle so a demo site stays well inside the free credits.
 
-       git remote add hf https://huggingface.co/spaces/granitraf/markut
-       git push hf master:main
+    pip install modal && modal setup                      # once: browser login
+    modal secret create markut ANTHROPIC_API_KEY=sk-ant-... FMP_API_KEY=... \
+        DATABASE_URL='postgresql://...' CONSOLE_PASSWORD='...'   # once
+    modal deploy modal_app.py                             # prints the URL
 
-3. Space -> Settings -> **Variables and secrets** -> add as *secrets*:
-   `ANTHROPIC_API_KEY`, `FMP_API_KEY`, `DATABASE_URL`, `CONSOLE_PASSWORD`;
-   optionally `FEATURED_TICKERS` as a variable. The Space rebuilds.
-4. The site is `https://<user>-markut.hf.space` (and embedded on the Space
-   page). Console: `/console`. A free Space sleeps after ~48h without
-   visitors and wakes on the next visit (about a minute).
+The URL looks like `https://<workspace>--markut-web.modal.run`; console at
+`/console`. Re-run `modal deploy` after every code change. A cold start
+(first visit after 10 idle minutes) takes a few seconds.
+
+### Hugging Face Spaces (Docker/Gradio Spaces are now a paid feature)
+
+The Dockerfile and the metadata block at the top of this README still work
+on a Space if you have a paid account: push the repo to the Space's `main`
+branch and set the four secrets under Variables and secrets.
 
 ### Railway (paid plan needed for the memory)
 
