@@ -17,17 +17,20 @@
 
   /* Terminal theme: always dark, macOS Terminal background (#1e1e1e).
      Overrides the shared tokens from debate.css for this page only. */
-  :root, :root[data-theme="light"], :root[data-theme="dark"] {
-    --bg: #1e1e1e; --surface: #262626; --ink: #e5e5e5; --muted: #8c8c8c; --line: #383838;
-    --accent: #6cb6ff; --bull: #5fd38d; --bull-bg: #1c2e23; --bear: #ff7b72; --bear-bg: #34201f;
-    --judge: #c4a7ff; --judge-bg: #26213a; --review: #e6c07b; --review-bg: #33291a; --tag-bg: #4a1f1a; --tag-ink: #ffb3aa;
+  /* Declared on html:root:root:not(#_) so it outranks debate.css's
+     dark-mode rule (:root:not([data-theme="light"])), which otherwise wins on
+     systems set to dark mode and paints its old blue-tinted greys. */
+  html:root:root:not(#_) {
+    --bg: #1e1e1e; --surface: #252525; --ink: #e4e4e4; --muted: #8a8a8a; --line: #353535;
+    --accent: #6cb6ff; --bull: #5fd38d; --bull-bg: #232823; --bear: #ff7b72; --bear-bg: #2b2323;
+    --judge: #c4a7ff; --judge-bg: #2a2a2a; --review: #e6c07b; --review-bg: #2a2722; --tag-bg: #4a1f1a; --tag-ink: #ffb3aa;
     --good: #5fd38d; --bad: #ff7b72;
     --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     --sans: var(--mono); --serif: var(--mono);
     color-scheme: dark;
   }
   body { background: var(--bg); color: var(--ink); font: 15px/1.65 var(--mono); }
-  ::selection { background: #3b5a7a; }
+  ::selection { background: #4a4a4a; }
   .logo { text-align: center; padding: 28px 0 8px; }
   .logo h1 { margin: 0; font: 400 56px/1 "Dico", "JetBrains Mono", monospace; letter-spacing: .02em; color: var(--ink); }
   .logo p { margin: 10px 0 0; color: var(--muted); font-size: 13px; letter-spacing: .04em; }
