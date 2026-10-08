@@ -94,7 +94,9 @@ summary.typing::after, .argtitle.typing::after, .typing::after { content: "▍";
 .pkh { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 4px 0 6px; }
 .pkg { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 4px 14px; }
 .pkr { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; padding: 3px 0; border-bottom: 1px dotted var(--line); }
-.pkk { color: var(--muted); } .pkv { text-align: right; white-space: nowrap; }
+.pkk { color: var(--muted); } .pkv { text-align: right; overflow-wrap: anywhere; }   /* long values wrap inside the cell, never across the grid */
+.pks { grid-column: 1 / -1; color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .06em; padding: 8px 0 2px; }
+.pkn { grid-column: 1 / -1; color: var(--muted); font-size: 12.5px; line-height: 1.5; padding: 6px 0 2px; border-top: 1px dotted var(--line); }
 
 /* verdict payoff */
 .verdict { font-size: 14.5px; }

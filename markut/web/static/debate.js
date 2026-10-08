@@ -107,14 +107,17 @@ window.Markut = (function () {
     for (; i < lines.length; i++) {
       const l = lines[i].trim(); let m;
       if (!l) continue;
-      if ((m = l.match(/^\[([^\]]+)\]$/))) { section = { name: m[1], rows: [] }; grid.push(section); continue; }
-      if ((m = l.match(/^-\s+([^:]+):\s+(.*?)\s*(?:\[source:\s*([^\]]+)\])?$/)) && section) { section.rows.push({ k: m[1], v: m[2], src: m[3] || "" }); continue; }
+      if ((m = l.match(/^\[([^\]]+)\]/)) && !/^\[.*unavailable.*\]$/.test(l)) { section = { name: m[1], rows: [], notes: [], subs: [] }; grid.push(section); continue; }
       if (/^\[.*unavailable.*\]$/.test(l) && section) continue;
+      if (section && (m = l.match(/^-\s+((?:BASIS|PERIOD)\s+NOTE|[A-Z][A-Z ]{2,}NOTE)\s*:\s*(.*?)\s*(?:\[source:[^\]]*\])?$/))) { section.notes.push(m[2]); continue; }   // a note, not a metric
+      if (section && (m = l.match(/^-\s+([^:]{3,120}):\s*$/))) { section.rows.push({ sub: m[1] }); continue; }                      // "- Peer comparison (...):" sub-header
+      if ((m = l.match(/^-\s+([^:]+):\s+(.*?)\s*(?:\[source:\s*([^\]]+)\])?$/)) && section) { section.rows.push({ k: m[1], v: m[2], src: m[3] || "" }); continue; }
       break;                                                        // first line that is not market data
     }
     const rest = lines.slice(i).join("\n").trim();
-    const gridHtml = grid.filter((s) => s.rows.length).map((s) => `<div class="pk"><div class="pkh">${esc(s.name.toLowerCase())}</div><div class="pkg">` +
-      s.rows.map((r) => `<div class="pkr" title="${esc(r.src)}"><span class="pkk">${esc(r.k)}</span><span class="pkv">${highlightNums(esc(r.v))}</span></div>`).join("") + `</div></div>`).join("");
+    const gridHtml = grid.filter((s) => s.rows.length || s.notes.length).map((s) => `<div class="pk"><div class="pkh">${esc(s.name.toLowerCase())}</div><div class="pkg">` +
+      s.rows.map((r) => r.sub ? `<div class="pks">${esc(r.sub)}</div>` : `<div class="pkr" title="${esc(r.src)}"><span class="pkk">${esc(r.k)}</span><span class="pkv">${highlightNums(esc(r.v))}</span></div>`).join("") +
+      s.notes.map((n) => `<div class="pkn">${highlightNums(esc(n))}</div>`).join("") + `</div></div>`).join("");
     return (gridHtml || "") + (rest ? `<details class="pt"><summary>filings &amp; news evidence (${num(rest.length)} chars)</summary><pre class="evidence">${esc(rest)}</pre></details>` : "") +
       (!gridHtml ? `<pre class="evidence">${esc(evidence || "")}</pre>` : "");
   }

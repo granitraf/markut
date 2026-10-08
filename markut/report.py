@@ -166,6 +166,12 @@ def parse_packet(evidence: str) -> tuple:
         m = re.match(r"^\[([^\]]+)\]$", l)
         if m:
             section = {"name": m.group(1), "rows": []}; grid.append(section); continue
+        m = re.match(r"^-\s+((?:BASIS|PERIOD)\s+NOTE|[A-Z][A-Z ]{2,}NOTE)\s*:\s*(.*?)\s*(?:\[source:[^\]]*\])?$", l)
+        if m and section:
+            section.setdefault("notes", []).append(m.group(2)); continue
+        m = re.match(r"^-\s+([^:]{3,120}):\s*$", l)
+        if m and section:
+            section["rows"].append((m.group(1), "", "")); continue      # sub-header row (empty value)
         m = re.match(r"^-\s+([^:]+):\s+(.*?)\s*(?:\[source:\s*([^\]]+)\])?$", l)
         if m and section:
             section["rows"].append((m.group(1), m.group(2), m.group(3) or "")); continue
@@ -173,7 +179,7 @@ def parse_packet(evidence: str) -> tuple:
     else:
         i = len(lines)
     rest = "\n".join(lines[i:]).strip() if i < len(lines) else ""
-    return [s for s in grid if s["rows"]], rest
+    return [s for s in grid if s["rows"] or s.get("notes")], rest
 
 
 def footnote_verdict(verdict: str) -> tuple:
@@ -248,13 +254,16 @@ def build_report(run: dict) -> bytes:
         rows = []
         for sec in grid:
             rows.append([Paragraph(escape(sec["name"].lower()), st["boxlabel"]), "", "", ""])
-            pairs = sec["rows"]
+            pairs = [p for p in sec["rows"] if p[1]]           # sub-headers (empty value) are not metrics
             for j in range(0, len(pairs), 2):
                 left = pairs[j]; right = pairs[j + 1] if j + 1 < len(pairs) else ("", "", "")
                 rows.append([Paragraph(escape(left[0]), st["small"]), Paragraph(_inline(left[1]), st["box"]),
                              Paragraph(escape(right[0]), st["small"]), Paragraph(_inline(right[1]), st["box"])])
+            for note in sec.get("notes", []):
+                rows.append([Paragraph("<i>" + _inline(note) + "</i>", st["small"]), "", "", ""])
         kt = Table(rows, colWidths=[width * .27, width * .23, width * .27, width * .23])
-        kt.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 2),
+        spans = [("SPAN", (0, r), (-1, r)) for r, row in enumerate(rows) if row[1] == "" and row[2] == ""]
+        kt.setStyle(TableStyle(spans + [("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 2),
                                 ("BOTTOMPADDING", (0, 0), (-1, -1), 2), ("TOPPADDING", (0, 0), (-1, -1), 2),
                                 ("LINEBELOW", (0, 0), (-1, -1), 0.25, LINE)]))
         story += [kt, Spacer(1, 6)]
