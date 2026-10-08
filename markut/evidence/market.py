@@ -80,10 +80,13 @@ def format_market_lines(info: dict) -> list:
     # companies. Unlabeled, the pair reads like "earnings will double" when it
     # is really GAAP-vs-non-GAAP across different years.
     add("P/E (trailing TTM, GAAP EPS)", fmt_ratio(info.get("trailingPE")))
-    add("P/E (forward, consensus non-GAAP EPS)", fmt_ratio(info.get("forwardPE")))
+    add("P/E (forward, on next-FY consensus non-GAAP EPS)", fmt_ratio(info.get("forwardPE")))
     add("Price/Book (mrq)", fmt_ratio(info.get("priceToBook")))
     add("EPS (trailing TTM, GAAP)", fmt_price(info.get("trailingEps")))
-    add("EPS (forward, consensus non-GAAP, next 12 months)", fmt_price(info.get("forwardEps")))
+    # yfinance forwardEps is the NEXT-FISCAL-YEAR consensus (it equals the
+    # earnings_estimate "+1y" average — verified on AVGO: both $19.39), not a
+    # rolling 12-month figure; the P/E built on it is a next-FY multiple
+    add("EPS (forward, consensus non-GAAP, next fiscal year)", fmt_price(info.get("forwardEps")))
 
     lines.append("\n[FUNDAMENTALS]")
     add("Profit margin (TTM)", fmt_pct(info.get("profitMargins")))
@@ -153,7 +156,7 @@ def basis_notes(info: dict) -> list:
     # evidence, and the governor's label check enforces them downstream.
     notes = []
     if info.get("trailingEps") is not None and info.get("forwardEps") is not None:
-        notes.append("- BASIS NOTE: trailing EPS is GAAP (TTM); forward EPS is non-GAAP analyst consensus for a future period. "
+        notes.append("- BASIS NOTE: trailing EPS is GAAP (TTM); forward EPS is the non-GAAP analyst consensus for the NEXT fiscal year. "
                      "Their ratio is NOT an earnings growth rate, and trailing P/E vs forward P/E are not on the same basis.")
     if info.get("revenueGrowth") is not None:
         notes.append("- PERIOD NOTE: 'Revenue growth (MRQ YoY)' is one quarter against the year-ago quarter, not a fiscal-year rate; "

@@ -45,8 +45,8 @@ def test_market_lines_name_period_and_basis():
             "revenueGrowth": 0.855, "earningsGrowth": 1.2, "currentPrice": 375.81}
     text = "\n".join(market.format_market_lines(info))
     assert "EPS (trailing TTM, GAAP): $8.12" in text
-    assert "EPS (forward, consensus non-GAAP, next 12 months): $19.39" in text
-    assert "P/E (forward, consensus non-GAAP EPS): 19.38" in text
+    assert "EPS (forward, consensus non-GAAP, next fiscal year): $19.39" in text
+    assert "P/E (forward, on next-FY consensus non-GAAP EPS): 19.38" in text
     assert "Revenue growth (MRQ YoY, most recent quarter vs year-ago quarter): 85.50%" in text
     assert "Revenue growth (yoy)" not in text
     notes = "\n".join(market.basis_notes(info))

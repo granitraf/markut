@@ -29,7 +29,7 @@ def test_format_market_lines_block():
               "Price (current)" in joined and "Market cap" in joined
               and "P/E (trailing TTM, GAAP EPS)" in joined and "Profit margin (TTM)" in joined)
         check("missing keys produce NO lines (no forward P/E, 52-week, D/E)",
-              "P/E (forward, consensus non-GAAP EPS)" not in joined and "52-week" not in joined
+              "P/E (forward, on next-FY consensus non-GAAP EPS)" not in joined and "52-week" not in joined
               and "Debt/Equity" not in joined)
         data_lines = [l for l in lines if l.startswith("- ")]
         check("every data line carries a [source: yfinance/...] tag",
