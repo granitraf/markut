@@ -177,3 +177,24 @@ are cache reads billed at a tenth of the input price. Run #8 (2026-10-08):
 $0.25 for the first AVGO run on a smaller packet. A cold cache (first run on
 a ticker) writes four prefixes (one per schema) and lands near $0.22.
 Per-call usage is printed as `CALL: in=... cache_w=... cache_r=... out=...`.
+
+### Run #9 audit (2026-10-08)
+
+- **Data gaps.** The packet opens with a `[DATA GAPS]` block naming every
+  source that failed, with a clean reason (FMP's plan limit shows as
+  "not covered by the FMP subscription (HTTP 402)", never a parser trace),
+  plus the known permanent gap (earnings-call transcripts). The governor
+  line, the page and the PDF say "N sources unavailable".
+- **Guarantees in full.** Every dollar-bearing sentence of the 10-Q
+  commitments note is its own packet line (the $29B Backstop maximum, the
+  $42B convertible notes); a commitments quote is never cut before its first
+  dollar figure; corroboration accepts the filing's "$ 29 billion" spelling.
+- **Scenarios.** P/E on the current-FY and next-FY consensus side by side; a
+  trailing P/E band from the company's own history, used as the multiple
+  range only when p75/p25 ≤ 2 (otherwise shown as information and the grid
+  falls back to today's forward multiple ±20%, saying so); EPS cases −15% /
+  consensus / +10%; the "today's multiple × current-FY EPS" rows are gone.
+- **All-time high** from daily closes, checked against the 52-week high
+  close of the same series. **8-K highlights** (headline figures, segment and
+  AI lines, CEO quote) and **dated customer-concentration** sentences from the
+  10-K, 10-Q and 8-K are deterministic packet blocks.
