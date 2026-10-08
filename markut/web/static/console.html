@@ -28,7 +28,9 @@
   .cursor { display: inline-block; width: .62em; height: 1.15em; background: #c8c8c8; vertical-align: text-bottom; margin-left: 1px; animation: blink 1.05s steps(1) infinite; }
   .wrap.blur .cursor { animation: none; background: transparent; outline: 1px solid #8a8a8a; }
   @keyframes blink { 50% { opacity: 0; } }
-  .reader { position: absolute; left: -9999px; top: 0; width: 1px; height: 1px; opacity: 0; }
+  /* fixed = always inside the viewport, so focusing it never scrolls the page
+     (an off-screen absolute input made every keystroke jump to the top) */
+  .reader { position: fixed; bottom: 0; left: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; }
   .out { margin: 10px 0 14px; }
   .out .timeline { gap: 10px; }
   .out .card { padding: 12px 14px; }
@@ -36,11 +38,15 @@
   .status { color: var(--muted); }
   .status b { color: var(--ink); font-weight: 500; }
   .status .pill { border-color: var(--line); }
+  .tools { position: fixed; top: 12px; right: 14px; font-size: 12px; color: var(--muted); z-index: 2; }
+  .tools button { background: transparent; border: 1px solid var(--line); color: var(--muted); padding: 4px 10px; font-size: 12px; }
+  .tools button:hover { color: var(--ink); border-color: var(--muted); }
   .hidden { display: none !important; }
 </style>
 </head>
 <body>
 <div class="wrap" id="wrap">
+  <div class="tools"><button type="button" id="clearbtn" title="clear the screen (also: type clear, or ctrl+l)">clear</button></div>
   <header class="logo">
     <h1><a href="/">markut.dev</a></h1>
     <p>console</p>
@@ -77,7 +83,10 @@
   // ---- output helpers ----
   function println(html, cls = "") { const d = document.createElement("div"); d.className = "line " + cls; d.innerHTML = html; term.appendChild(d); scroll(); return d; }
   function echo(text) { println(`<span class="ps">$ </span>${esc(text)}`, "echo"); }
-  function scroll() { window.scrollTo({ top: document.body.scrollHeight, behavior: "instant" }); }
+  function scroll() {
+    const nearBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 160;
+    if (nearBottom) window.scrollTo({ top: document.body.scrollHeight, behavior: "instant" });
+  }
   function setPrompt() {
     typed.textContent = reader.value;
     ghost.innerHTML = reader.value ? "" : (HINTS[step] ? HINTS[step]() : "");
@@ -85,6 +94,12 @@
   function setStep(s) { step = s; reader.value = ""; setPrompt(); }
 
   // ---- commands ----
+  function clearScreen() {
+    term.innerHTML = "";
+    if (player) player.close();
+    if (running) { running = false; stopClock(); }
+    setStep("ticker"); window.scrollTo({ top: 0, behavior: "instant" }); reader.focus();
+  }
   function help() {
     println("commands", "info");
     println("  <ticker>              start a debate on that symbol (then rounds, then run debate)");
@@ -114,7 +129,7 @@
     const [cmd, ...rest] = text.split(/\s+/);
     const low = (cmd || "").toLowerCase();
 
-    if (low === "clear") { term.innerHTML = ""; return; }
+    if (low === "clear") return clearScreen();
     if (low === "help" || low === "?") return help();
     if (low === "archive") { location.href = "/console/library"; return; }
     if (low === "cancel" || low === "back") {
@@ -232,10 +247,11 @@
     }
     if (e.key === "ArrowUp") { e.preventDefault(); if (histIdx > 0) { histIdx--; reader.value = history[histIdx]; setPrompt(); } return; }
     if (e.key === "ArrowDown") { e.preventDefault(); histIdx = Math.min(history.length, histIdx + 1); reader.value = history[histIdx] || ""; setPrompt(); return; }
-    if (e.key === "l" && e.ctrlKey) { e.preventDefault(); term.innerHTML = ""; return; }
+    if (e.key === "l" && e.ctrlKey) { e.preventDefault(); clearScreen(); return; }
     if (e.key === "c" && e.ctrlKey && !window.getSelection().toString()) { e.preventDefault(); echo(reader.value + "^C"); reader.value = ""; if (!running) setStep("ticker"); else setPrompt(); return; }
   });
   wrap.addEventListener("mousedown", (e) => { if (!window.getSelection().toString() && e.target.tagName !== "A") setTimeout(() => reader.focus(), 0); });
+  $("clearbtn").addEventListener("click", (e) => { e.stopPropagation(); clearScreen(); });
   reader.addEventListener("focus", () => wrap.classList.remove("blur"));
   reader.addEventListener("blur", () => wrap.classList.add("blur"));
 
@@ -246,7 +262,7 @@
       liveEnabled = !!h.live_enabled;
       println(`markut console · model ${esc(h.model)} · store ${esc(h.db_backend)}${liveEnabled ? "" : " · live debates disabled (no API key)"}`, "dim");
     } catch (_) { println("markut console · could not reach the server", "err"); }
-    println("type help for commands", "dim");
+    println("type help for commands · clear (or ctrl+l) clears the screen", "dim");
     loadTickers();
     const want = new URLSearchParams(location.search).get("run");
     if (want) await openRead(want);
