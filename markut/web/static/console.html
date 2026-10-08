@@ -204,7 +204,7 @@
     statusEl = document.createElement("div"); statusEl.className = "line status"; statusEl.textContent = "connecting…"; out.appendChild(statusEl);
     const tl = document.createElement("div"); tl.className = "timeline"; out.appendChild(tl);
     running = true; setStep("running");
-    const timeline = Timeline(tl, {
+    const timeline = Timeline(tl, { reveal: url.includes("/api/replay"),
       onStart(d) {
         const mode = d.mode === "replay" ? "replay" : "live";
         statusEl.innerHTML = `<span class="pill ${mode}">${mode === "replay" ? "STORED RUN" : "LIVE"}</span> <b>${esc(d.ticker)}</b> · up to ${d.max_rounds} round(s) · model ${esc(d.model || "")}` +
