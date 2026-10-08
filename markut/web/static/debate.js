@@ -101,23 +101,51 @@ window.Markut = (function () {
   /* packetHtml: the market section of the evidence packet is "[SECTION]" headers
      and "- Key: value  [source: x]" lines — shown as a grid; everything after
      (filings, news) stays collapsed as text. */
+  /* packetHtml: the evidence packet's market lines ("[SECTION]" headers and
+     "- Key: value  [source: x]") become a two-column key/value grid; the
+     valuation block's peer rows and EPS×multiple scenario rows become small
+     tables; BASIS/PERIOD notes become full-width text. Values never wrap —
+     labels do. Everything after the market lines (filings, news) stays
+     collapsed as text. */
   function packetHtml(evidence) {
     const lines = String(evidence || "").split("\n");
     const grid = []; let i = 0, section = null;
+    const newSection = (name) => { section = { name, rows: [], notes: [], peers: [], scenarios: [] }; grid.push(section); };
     for (; i < lines.length; i++) {
       const l = lines[i].trim(); let m;
       if (!l) continue;
-      if ((m = l.match(/^\[([^\]]+)\]/)) && !/^\[.*unavailable.*\]$/.test(l)) { section = { name: m[1], rows: [], notes: [], subs: [] }; grid.push(section); continue; }
+      if ((m = l.match(/^\[([^\]]+)\]/)) && !/^\[.*unavailable.*\]$/.test(l)) { newSection(m[1]); continue; }
       if (/^\[.*unavailable.*\]$/.test(l) && section) continue;
-      if (section && (m = l.match(/^-\s+((?:BASIS|PERIOD)\s+NOTE|[A-Z][A-Z ]{2,}NOTE)\s*:\s*(.*?)\s*(?:\[source:[^\]]*\])?$/))) { section.notes.push(m[2]); continue; }   // a note, not a metric
-      if (section && (m = l.match(/^-\s+([^:]{3,120}):\s*$/))) { section.rows.push({ sub: m[1] }); continue; }                      // "- Peer comparison (...):" sub-header
-      if ((m = l.match(/^-\s+([^:]+):\s+(.*?)\s*(?:\[source:\s*([^\]]+)\])?$/)) && section) { section.rows.push({ k: m[1], v: m[2], src: m[3] || "" }); continue; }
+      if (!section) break;
+      const body = l.replace(/\s*\[source:[^\]]*\]\s*$/, "");
+      if ((m = body.match(/^-\s+((?:BASIS|PERIOD)\s+NOTE|[A-Z][A-Z ]{2,}NOTE)\s*:\s*(.*)$/))) { section.notes.push(m[2]); continue; }
+      if ((m = body.match(/^-\s+Scenario multiples\s*\((.*)\)\s*$/))) { section.notes.push("Scenario multiples: " + m[1]); continue; }
+      if ((m = body.match(/^-\s+(This company|Peer [A-Z.]+):\s+(.*)$/))) {           // peer table row
+        const cells = {}; m[2].split("|").forEach((c) => { const cm = c.trim().match(/^(.*?)\s+([\d.]+)$/); if (cm) cells[cm[1]] = cm[2]; });
+        section.peers.push({ who: m[1].replace(/^Peer /, ""), cells }); continue;
+      }
+      if ((m = body.match(/^-\s+Implied price from (.*?)\s+consensus EPS\s+(\$[\d.]+)\s*\(non-GAAP\):\s+(.*)$/))) {   // scenario table row
+        const cells = m[3].split("|").map((c) => { const cm = c.trim().match(/^(bear|base|bull)\s+([\d.]+x)\s+=\s+(\$[\d,.]+)\s+\(([-+][\d.]+%)/); return cm ? { name: cm[1], mult: cm[2], price: cm[3], pct: cm[4] } : null; }).filter(Boolean);
+        section.scenarios.push({ label: m[1], eps: m[2], cells }); continue;
+      }
+      if ((m = body.match(/^-\s+([^:]{3,120}):\s*$/))) { section.rows.push({ sub: m[1] }); continue; }         // bare sub-header
+      if ((m = body.match(/^-\s+(.+?):\s+(.+)$/))) { section.rows.push({ k: m[1], v: m[2] }); continue; }
       break;                                                        // first line that is not market data
     }
     const rest = lines.slice(i).join("\n").trim();
-    const gridHtml = grid.filter((s) => s.rows.length || s.notes.length).map((s) => `<div class="pk"><div class="pkh">${esc(s.name.toLowerCase())}</div><div class="pkg">` +
-      s.rows.map((r) => r.sub ? `<div class="pks">${esc(r.sub)}</div>` : `<div class="pkr" title="${esc(r.src)}"><span class="pkk">${esc(r.k)}</span><span class="pkv">${highlightNums(esc(r.v))}</span></div>`).join("") +
-      s.notes.map((n) => `<div class="pkn">${highlightNums(esc(n))}</div>`).join("") + `</div></div>`).join("");
+    const peerCols = ["fwd P/E", "trailing P/E", "EV/EBITDA", "P/S"];
+    const sectionHtml = (s) => {
+      let h = `<div class="pk"><div class="pkh">${esc(s.name.toLowerCase())}</div>`;
+      const kv = s.rows.filter((r) => !r.sub);
+      if (kv.length) h += `<div class="pkg">` + kv.map((r) => `<div class="pkr"><span class="pkk">${esc(r.k)}</span><span class="pkv">${esc(r.v)}</span></div>`).join("") + `</div>`;
+      if (s.peers.length) h += `<table class="pkt"><thead><tr><th>peer comparison</th>${peerCols.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>` +
+        s.peers.map((p) => `<tr><td>${esc(p.who)}</td>${peerCols.map((c) => `<td>${esc(p.cells[c] || "–")}</td>`).join("")}</tr>`).join("") + `</tbody></table>`;
+      if (s.scenarios.length) h += `<table class="pkt"><thead><tr><th>implied price (EPS × multiple)</th><th>bear</th><th>base</th><th>bull</th></tr></thead><tbody>` +
+        s.scenarios.map((r) => `<tr><td>${esc(r.label)} EPS <b>${esc(r.eps)}</b></td>` + ["bear", "base", "bull"].map((n) => { const c = r.cells.find((x) => x.name === n); return c ? `<td><b>${esc(c.price)}</b> <small>${esc(c.pct)} · ${esc(c.mult)}</small></td>` : "<td>–</td>"; }).join("") + `</tr>`).join("") + `</tbody></table>`;
+      h += s.notes.map((n) => `<div class="pkn">${esc(n)}</div>`).join("");
+      return h + `</div>`;
+    };
+    const gridHtml = grid.filter((s) => s.rows.length || s.notes.length || s.peers.length || s.scenarios.length).map(sectionHtml).join("");
     return (gridHtml || "") + (rest ? `<details class="pt"><summary>filings &amp; news evidence (${num(rest.length)} chars)</summary><pre class="evidence">${esc(rest)}</pre></details>` : "") +
       (!gridHtml ? `<pre class="evidence">${esc(evidence || "")}</pre>` : "");
   }
