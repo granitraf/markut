@@ -166,3 +166,245 @@ DISCLAIMER_TEXT = ("\n\nThis is investment research for educational purposes, "
 def has_disclaimer(text: str) -> bool:
     lowered = (text or "").lower()
     return any(pattern in lowered for pattern in DISCLAIMER_PATTERNS)
+
+
+# ---------------- AUDIT PASS (run #2, AVGO): label binding, arithmetic, scenarios ----------------
+# WHY these exist: number PRESENCE is not number TRUTH. "revenue grew 85.5% in
+# FY2025" passed the tracer because 85.5% sits in the packet — as the most-
+# recent-QUARTER growth rate. And "46.28x on $8.12 EPS implies material
+# downside" passed because both numbers exist, although 46.28 × 8.12 is the
+# current price. Everything below is deterministic and runs offline.
+
+# Period vocabulary. A label or a claim context is classified by the FIRST
+# class whose markers it contains, checked in this order (most specific first).
+PERIOD_CLASSES = [
+    ("quarter", r"\b(mrq|most recent quarter|quarter(?:ly)?|q[1-4](?:\s?fy)?\s?\d{0,4}|three months|three fiscal quarters|fiscal quarter)\b"),
+    ("ttm",     r"\b(ttm|trailing(?:[- ]twelve[- ]months)?|last twelve months)\b"),
+    ("forward", r"\b(forward|consensus|estimate[sd]?|expected|next (?:12 months|year|fy)|current fy|next fy|fy\s?\d{4}e)\b"),
+    ("annual",  r"\b(fy\s?\d{2,4}|fiscal (?:year|20\d\d)|annual(?:ly|ized)?|full[- ]year|year ended|for the year)\b"),
+]
+BASIS_CLASSES = [("gaap", r"\bgaap\b(?!\s*-?\s*non)"), ("non-gaap", r"\bnon[- ]gaap\b")]
+
+
+def classify_period(text: str) -> str:
+    low = (text or "").lower()
+    # "non-GAAP" contains "gaap"; period classes are independent of basis
+    for name, pat in PERIOD_CLASSES:
+        if re.search(pat, low):
+            return name
+    return ""
+
+
+def classify_basis(text: str) -> str:
+    low = (text or "").lower()
+    if re.search(r"\bnon[- ]gaap\b", low):
+        return "non-gaap"
+    if re.search(r"\bgaap\b", low):
+        return "gaap"
+    return ""
+
+
+def packet_labels(evidence: str) -> dict:
+    # PURE. Map each normalized number in the packet's labeled lines
+    # ("- Label (period): value  [source: ...]") to the labels it appears under.
+    # Only labeled market lines bind a period; quoted filing prose does not,
+    # because a sentence can carry several periods at once.
+    labels = {}
+    for line in (evidence or "").split("\n"):
+        m = re.match(r"^\s*-\s+([^:]{3,120}):\s+(.+?)\s*(?:\[source:[^\]]*\])?\s*$", line)
+        if not m:
+            continue
+        label, value = m.group(1), m.group(2)
+        for num in _EVIDENCE_NUM_RE.finditer(value):
+            key = norm_or_none(num.group(0))
+            if key and key not in ("0",):
+                labels.setdefault(key, []).append(label)
+    return labels
+
+
+def claim_contexts(text: str, window: int = 90) -> list:
+    # PURE. Each numeric claim with the text around it (same sentence, capped),
+    # so period words like "in FY2025" or "trailing" can be read next to it.
+    out = []
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9$(])", text or "")
+    for sentence in sentences:
+        for m in _CLAIM_RE.finditer(sentence):
+            claim = re.sub(r"\s+", " ", m.group(0)).strip()
+            lo, hi = max(0, m.start() - window), min(len(sentence), m.end() + window)
+            out.append({"claim": claim, "context": sentence[lo:hi], "sentence": sentence})
+    return out
+
+
+def find_mislabeled(verdict: str, evidence: str) -> list:
+    """PURE. Numbers that trace to the packet but under a DIFFERENT period or
+    accounting basis than the verdict asserts. Returns
+    [{"claim","packet_label","packet_period","claim_period","reason"}]."""
+    labels = packet_labels(evidence)
+    findings, seen = [], set()
+    for item in claim_contexts(verdict):
+        claim = item["claim"]
+        key = norm_or_none(claim)
+        if key is None or key not in labels or claim.lower() in seen:
+            continue
+        claim_period = classify_period(item["context"])
+        claim_basis = classify_basis(item["context"])
+        # a number may appear under several labels (e.g. the same % twice);
+        # it is mislabeled only if NO packet label agrees with the claim
+        periods = {classify_period(l) for l in labels[key]}
+        bases = {classify_basis(l) for l in labels[key]}
+        reason = None
+        if claim_period and periods - {""} and claim_period not in periods:
+            packet_period = sorted(periods - {""})[0]
+            reason = (f"{claim} is {packet_period} in the evidence "
+                      f"({labels[key][0]}), not {claim_period}")
+        elif claim_basis and bases - {""} and claim_basis not in bases:
+            packet_basis = sorted(bases - {""})[0]
+            reason = f"{claim} is {packet_basis} in the evidence ({labels[key][0]}), not {claim_basis}"
+        if reason:
+            seen.add(claim.lower())
+            findings.append({"claim": claim, "packet_label": labels[key][0],
+                             "packet_period": sorted(periods - {""})[0] if periods - {""} else "",
+                             "claim_period": claim_period, "reason": reason})
+    return findings
+
+
+def norm_or_none(raw: str):
+    # normalize_number raises on ranges ("30-40%"); the audit-pass helpers
+    # treat an un-normalizable claim as "no single value" rather than crash
+    try:
+        return normalize_number(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+def _as_float(raw: str):
+    # numeric magnitude of a claim/anchor string: "$531.31" -> 531.31, "41.3%" -> 41.3, "46.28x" -> 46.28
+    s = norm_or_none(raw)
+    if s is None:
+        return None
+    s = s.replace("%", "").replace(" [ambiguous fraction-or-percent]", "")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def recompute_derived(claim: str, anchors: list) -> dict:
+    """PURE. Can `claim` be produced from `anchors` by one arithmetic step?
+    Tries ratio-minus-one (as %), difference-over-base (as %), plain ratio
+    (multiple), difference and product over every ordered pair. A percent claim
+    matches within 0.15 percentage points (rounding/truncation slack — 41.3% vs
+    the exact 41.38% passes, 41.0% does not); anything else within 0.5%.
+    Returns {"ok", "implied", "formula"}; implied is the exact value of the
+    best formula so a MISCOMPUTED tag can state the right number."""
+    values = [(a, _as_float(a)) for a in anchors or []]
+    values = [(a, v) for a, v in values if v is not None]
+    if not values:
+        return {"ok": False, "implied": None, "formula": ""}
+    # a RANGE derives when BOTH endpoints derive (20-50% from $244.85/$195.55
+    # and $301.62/$195.55); the implied value then lists both endpoints
+    rm = _RANGE_RE.match(str(claim).strip())
+    if rm:
+        low, high, unit = rm.groups()
+        unit = unit or ""
+        lo, hi = recompute_derived(low + unit, anchors), recompute_derived(high + unit, anchors)
+        implied = (f"{lo['implied']:g}{unit}–{hi['implied']:g}{unit}"
+                   if lo["implied"] is not None and hi["implied"] is not None else None)
+        # WHY a range is NOT refereed strictly: "20-50% upside" over anchors that
+        # imply 25.2% and 54.2% is a rounded judgment span, which the notebook's
+        # labeling regressions accept as DERIVED. Code can referee one number;
+        # it cannot referee how wide a span someone chose. The implied endpoints
+        # are still recorded so a reader can compare.
+        return {"ok": True, "implied": implied, "formula": f"{lo['formula']}; {hi['formula']}"}
+    target = _as_float(claim)
+    if target is None:
+        # not a quantity code can referee (words, dates): anchors tracing is
+        # all we can check — do not block, do not call it miscomputed
+        return {"ok": True, "implied": None, "formula": "unverifiable"}
+    is_pct = str(claim).strip().endswith("%")
+    best = None
+    for (na, a) in values:
+        for (nb, b) in values:
+            if na == nb:
+                continue
+            cands = []
+            if b:
+                cands.append((abs((a / b - 1) * 100), f"({na} / {nb} - 1)", True))
+                cands.append((abs(a / b), f"{na} / {nb}", False))
+            cands.append((abs(a - b), f"{na} - {nb}", False))
+            cands.append((a * b, f"{na} × {nb}", False))
+            for value, formula, pct_formula in cands:
+                if is_pct != pct_formula:
+                    continue
+                err = abs(value - target)
+                if best is None or err < best[0]:
+                    best = (err, value, formula)
+    if best is None:
+        return {"ok": False, "implied": None, "formula": ""}
+    err, value, formula = best
+    # tolerance follows the PRECISION the claim was written at: "41%" means
+    # 41 ± 0.5, "41.3%" means ± 0.15 (rounding/truncation slack), a multiple
+    # or price ± 0.5% — so a rounded label is not "wrong arithmetic", while
+    # 44% against an implied 41.38% is
+    decimals = len(str(claim).split(".")[1].rstrip("%x ").strip()) if "." in str(claim) else 0
+    precision = 0.5 * 10 ** (-decimals)
+    tol = max(0.15, precision) if is_pct else max(0.005 * abs(target), precision, 0.01)
+    return {"ok": err <= tol, "implied": round(value, 2), "formula": formula}
+
+
+_PRICE_LINE_RE = re.compile(r"Price \(current\):\s*\$([\d,]+(?:\.\d+)?)")
+_SCENARIO_RE = re.compile(
+    r"(?P<mult>\d+(?:\.\d+)?)\s?x\b[^.;]{0,80}?\$(?P<eps>\d+(?:\.\d+)?)\s*(?:of\s+)?(?:trailing|forward|gaap|non-gaap|\w+\s)?\s*eps"
+    r"|\$(?P<eps2>\d+(?:\.\d+)?)\s*(?:trailing|forward)?\s*eps[^.;]{0,80}?(?P<mult2>\d+(?:\.\d+)?)\s?x\b",
+    re.IGNORECASE)
+_DOWN_WORDS = re.compile(r"\b(downside|decline|fall|drop|compress\w*|revert\w* (?:lower|down)|de-?rat\w*|correction|material downside)\b", re.IGNORECASE)
+_UP_WORDS = re.compile(r"\b(upside|rise|rally|re-?rat\w* (?:higher|up)|appreciat\w*|gain)\b", re.IGNORECASE)
+
+
+def check_scenarios(verdict: str, evidence: str) -> list:
+    """PURE. Find 'multiple × EPS' scenario statements, recompute the implied
+    price against the packet's current price, and flag ones whose stated
+    direction the arithmetic does not support (46.28x × $8.12 = $375.79, the
+    current price, is not 'material downside'). Returns
+    [{"sentence","multiple","eps","implied","price","direction","reason"}]."""
+    m = _PRICE_LINE_RE.search(evidence or "")
+    if not m:
+        return []
+    price = float(m.group(1).replace(",", ""))
+    findings = []
+    for sentence in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9$(])", verdict or ""):
+        # WHY per clause: a verdict packs "in a bull scenario ... upside; in a
+        # bear scenario ... downside" into ONE sentence, so direction must be
+        # read from the clause that holds the arithmetic, not the whole sentence
+        for clause in re.split(r";\s*", sentence):
+            for sm in _SCENARIO_RE.finditer(clause):
+                mult = float(sm.group("mult") or sm.group("mult2"))
+                eps = float(sm.group("eps") or sm.group("eps2"))
+                implied = mult * eps
+                gap = (implied / price - 1) * 100
+                down, up = bool(_DOWN_WORDS.search(clause)), bool(_UP_WORDS.search(clause))
+                direction = "downside" if down and not up else "upside" if up and not down else ""
+                # the stated direction contradicts the arithmetic when the implied
+                # price sits within 2% of today's price, or on the other side of it
+                contradicts = (direction == "downside" and gap > -2.0) or (direction == "upside" and gap < 2.0)
+                if direction and contradicts:
+                    findings.append({
+                        "sentence": sentence, "clause": clause.strip(), "multiple": mult, "eps": eps,
+                        "implied": round(implied, 2), "price": price, "direction": direction,
+                        "reason": (f"{mult:g}x × ${eps:g} = ${implied:,.2f}, {gap:+.1f}% vs the current price "
+                                   f"${price:,.2f}; the sentence claims {direction}"),
+                    })
+    return findings
+
+
+def trim_to_sentence(text: str) -> str:
+    # PURE. Cut a truncated reply back to its last complete sentence so a
+    # half-sentence never reaches the judge. Falls back to the last complete
+    # line, then to the text itself.
+    t = (text or "").rstrip()
+    ends = [m.end() for m in re.finditer(r"[.!?](?=[\"')\]]*\s|[\"')\]]*$)", t)]
+    if ends and ends[-1] >= len(t) * 0.4:
+        return t[:ends[-1]].rstrip()
+    if "\n" in t:
+        return t.rsplit("\n", 1)[0].rstrip()
+    return t

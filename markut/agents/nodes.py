@@ -3,8 +3,10 @@ cell, verbatim; prompts hoisted to markut.agents.prompts, call_claude and
 TOKENS module-qualified so tests can patch markut.agents.llm)."""
 from markut import config
 from markut.agents import llm, prompts
+from markut.agents.schemas import CLAIM_REVIEW_SCHEMA, JUDGE_SCHEMA
 from markut.agents.state import DebateState
 from markut.guardrails.parsing import parse_judge_json
+from markut.guardrails.tracer import trim_to_sentence
 from markut.evidence.news import (NEWS_TARGET_MAX_CLAIMS, get_related_leads,
     get_targeted_news_evidence, parse_news_review_json)
 
@@ -49,6 +51,26 @@ def research_node(state: DebateState) -> dict:
     from markut.mcp.client import call_evidence_tools
     return {"evidence": call_evidence_tools(state["ticker"])}
 
+def complete_argument(system_prompt: str, user_content: str, label: str) -> str:
+    """One analyst turn that NEVER hands the judge a half-sentence.
+    AUDIT FIX (run #2): check stop_reason; on max_tokens regenerate once with
+    an explicit word budget and a larger cap; if it still overruns, trim to the
+    last complete sentence and say so inline."""
+    case = llm.call_claude(system_prompt, user_content, max_tokens=config.ARGUMENT_MAX_TOKENS)
+    if llm.LAST_STOP_REASON != "max_tokens":
+        return case
+    print(f"{label}: reply hit the {config.ARGUMENT_MAX_TOKENS}-token cap — regenerating with a "
+          f"{config.ARGUMENT_WORD_BUDGET}-word budget")
+    budgeted = (user_content + f"\n\nHARD LENGTH LIMIT: the entire case must be under "
+                f"{config.ARGUMENT_WORD_BUDGET} words. Make at most 5 points, each one short paragraph. "
+                "Finish every sentence — an unfinished case is discarded.")
+    case = llm.call_claude(system_prompt, budgeted, max_tokens=config.ARGUMENT_RETRY_MAX_TOKENS)
+    if llm.LAST_STOP_REASON != "max_tokens":
+        return case
+    print(f"{label}: still truncated after the retry — trimming to the last complete sentence")
+    return trim_to_sentence(case) + "\n\n[argument trimmed to its last complete sentence after exceeding the output cap twice]"
+
+
 def bull_node(state: DebateState) -> dict:
     round_num = state["round"] + 1
     print(f"BULL  (round {round_num}): building the upside case")
@@ -60,7 +82,7 @@ def bull_node(state: DebateState) -> dict:
         )
     system_prompt = prompts.BULL_SYSTEM_PROMPT
     user_content = f"Ticker: {state['ticker']}\n\nEvidence:\n{state['evidence']}{rebuttal}"
-    case = llm.call_claude(system_prompt, user_content)
+    case = complete_argument(system_prompt, user_content, f"BULL  (round {round_num})")
     return {"bull_case": case, "bull_history": [case]}
 
 def bear_node(state: DebateState) -> dict:
@@ -74,7 +96,7 @@ def bear_node(state: DebateState) -> dict:
         )
     system_prompt = prompts.BEAR_SYSTEM_PROMPT
     user_content = f"Ticker: {state['ticker']}\n\nEvidence:\n{state['evidence']}{rebuttal}"
-    case = llm.call_claude(system_prompt, user_content)
+    case = complete_argument(system_prompt, user_content, f"BEAR  (round {round_num})")
     return {"bear_case": case, "bear_history": [case]}
 
 def judge_node(state: DebateState) -> dict:
@@ -112,7 +134,9 @@ def judge_node(state: DebateState) -> dict:
     # WHY 2000 (was 1500): unsupported_claims adds a whole list to the JSON, and a
     # truncated response is unparseable — it burns a full corrective retry. Headroom
     # is cheap; max_tokens is a cap, not a target.
-    raw = llm.call_claude(system_prompt, user_content, max_tokens=2000)
+    # AUDIT FIX (run #2): the schema makes the SHAPE a guarantee; the parser
+    # still checks substance and the one corrective retry stays as the net.
+    raw = llm.call_claude(system_prompt, user_content, max_tokens=2000, schema=JUDGE_SCHEMA)
     try:
         decision = parse_judge_json(raw)
     except Exception as first_error:
@@ -120,16 +144,18 @@ def judge_node(state: DebateState) -> dict:
         # the model its own invalid output and re-demanding pure JSON. We do this ONCE
         # to avoid burning tokens/latency on repeated failures.
         print(f"JUDGE: JSON parse failed ({first_error}); doing one corrective retry.")
+        print("JUDGE DEBUG raw reply:", (raw or "")[:400])
         retry_user_content = (
             user_content
             + "\n\nYour previous response was NOT valid JSON:\n"
             + raw
             + "\n\nRespond again with ONLY the JSON object described, and nothing else."
         )
-        raw_retry = llm.call_claude(system_prompt, retry_user_content, max_tokens=2000)
+        raw_retry = llm.call_claude(system_prompt, retry_user_content, max_tokens=2000, schema=JUDGE_SCHEMA)
         try:
             decision = parse_judge_json(raw_retry)
         except Exception as second_error:
+            print("JUDGE DEBUG raw retry reply:", (raw_retry or "")[:400])
             # WHY (fail closed): if the judge still won't produce parseable JSON, we
             # must NOT keep looping blindly. We force converged=True so the graph
             # terminates, and stash the raw text as the verdict so nothing is lost.
@@ -196,13 +222,30 @@ def news_verify_node(state: DebateState) -> dict:
         + "\n".join(f"- {claim}" for claim in claims[:NEWS_TARGET_MAX_CLAIMS])
         + f"\n\nEVIDENCE PACKET:\n{state['evidence']}"
     )
-    raw = llm.call_claude(system_prompt, user_content, max_tokens=1400)
+    # AUDIT FIX (run #2): every claim came back "invalid JSON". Shape is now
+    # schema-enforced; one repair retry shows the model its own reply and the
+    # exact validator error; the raw reply is logged on every failure.
+    raw = llm.call_claude(system_prompt, user_content, max_tokens=1400, schema=CLAIM_REVIEW_SCHEMA)
+    verification = None
     try:
         verification = parse_news_review_json(raw)
+    except Exception as first_error:
+        print(f"CLAIM REVIEW: review JSON invalid ({first_error}); one repair retry.")
+        print("CLAIM REVIEW DEBUG raw reply:", (raw or "")[:400])
+        try:
+            raw_retry = llm.call_claude(
+                system_prompt,
+                user_content + "\n\nYour previous response FAILED validation with this exact error:\n  "
+                + str(first_error) + "\n\nYour previous response was:\n" + (raw or "")
+                + "\n\nFix exactly that problem and respond again with the JSON object only.",
+                max_tokens=1400, schema=CLAIM_REVIEW_SCHEMA)
+            verification = parse_news_review_json(raw_retry)
+        except Exception as e:
+            print(f"CLAIM REVIEW: repair retry also failed ({e}); preserving verdict and failing unresolved.")
+    if verification is not None:
         verification.setdefault("reasoning", "")
         verification.setdefault("verdict_changed", False)
-    except Exception as e:
-        print(f"CLAIM REVIEW: review JSON invalid ({e}); preserving verdict and failing unresolved.")
+    else:
         verification = {
             "claim_reviews": [
                 {"claim": claim, "status": "unresolved",

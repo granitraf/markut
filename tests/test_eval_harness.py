@@ -105,7 +105,7 @@ def test_eval_suite_blocks():
         # None can fabricate nothing
         _js_saved_claude = llm.call_claude
         _js_calls = {"n": 0}
-        def _js_garbage(system_prompt, user_content, max_tokens=1000):
+        def _js_garbage(system_prompt, user_content, max_tokens=1000, **kw):
             _js_calls["n"] += 1
             return "not json at all"
         llm.call_claude = _js_garbage

@@ -18,15 +18,24 @@ from markut import config
 client = Anthropic()
 
 TOKENS = {"input": 0, "output": 0, "calls": 0}
+# stop_reason of the most recent successful call ("end_turn" | "max_tokens" |
+# ...). WHY a module global: the notebook-era nodes read call_claude's string
+# return; exposing the stop reason beside it lets bull/bear detect a reply cut
+# off at the output cap without changing the call signature every test stubs.
+LAST_STOP_REASON = "end_turn"
 
 
 class ModelRefusal(RuntimeError):
     """The model declined the request (stop_reason == "refusal")."""
 
 
-def _request_kwargs(system_prompt: str, user_content: str, max_tokens: int) -> dict:
+def _request_kwargs(system_prompt: str, user_content: str, max_tokens: int, schema: dict = None) -> dict:
     kwargs = {"model": config.MODEL_NAME, "max_tokens": max_tokens, "system": system_prompt,
               "messages": [{"role": "user", "content": user_content}]}
+    if schema is not None:
+        # structured output: the API guarantees the text block is JSON valid
+        # against this schema (shape); callers still validate substance
+        kwargs["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
     if config.THINKING_EFFORT:
         kwargs["thinking"] = {"type": "adaptive"}
         kwargs["output_config"] = {"effort": config.THINKING_EFFORT}
@@ -41,7 +50,7 @@ def _text_of(response) -> str:
     return "".join(block.text for block in response.content if getattr(block, "type", "") == "text")
 
 
-def call_claude(system_prompt: str, user_content: str, max_tokens: int = 1000) -> str:
+def call_claude(system_prompt: str, user_content: str, max_tokens: int = 1000, schema: dict = None) -> str:
     # HARD BACKSTOP (execution guardrail, belt-and-suspenders): even if graph
     # routing somehow kept looping past the soft budget check in
     # should_continue, no call may START once spend reaches 2x TOKEN_BUDGET.
@@ -60,12 +69,14 @@ def call_claude(system_prompt: str, user_content: str, max_tokens: int = 1000) -
     last_error = None
     for attempt in range(2):
         try:
-            response = client.messages.create(**_request_kwargs(system_prompt, user_content, max_tokens))
+            response = client.messages.create(**_request_kwargs(system_prompt, user_content, max_tokens, schema))
             # WHY: only count usage on SUCCESS, so a failed+retried call isn't
             # double-billed in our totals. usage is on the response object.
             TOKENS["input"] += response.usage.input_tokens
             TOKENS["output"] += response.usage.output_tokens
             TOKENS["calls"] += 1
+            global LAST_STOP_REASON
+            LAST_STOP_REASON = getattr(response, "stop_reason", "end_turn") or "end_turn"
             if response.stop_reason == "refusal":
                 details = getattr(response, "stop_details", None)
                 category = getattr(details, "category", None) if details else None

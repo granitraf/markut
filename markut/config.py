@@ -62,3 +62,11 @@ RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 TOKEN_BUDGET = 200_000
 
 DEFAULT_MAX_ROUNDS = 2
+
+# bull/bear reply budget (AUDIT FIX run #2: 3 of 4 arguments were cut off at the
+# cap and reached the judge mid-sentence). First attempt at ARGUMENT_MAX_TOKENS;
+# a reply that stops on max_tokens is regenerated ONCE with a word budget and a
+# larger cap; a second truncation is trimmed to the last complete sentence.
+ARGUMENT_MAX_TOKENS = 1000
+ARGUMENT_RETRY_MAX_TOKENS = 1600
+ARGUMENT_WORD_BUDGET = 450

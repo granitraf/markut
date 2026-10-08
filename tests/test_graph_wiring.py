@@ -28,7 +28,7 @@ def test_wiring_suite():
     # flagged claims annotated inline, disclaimer appended, status "annotated".
     _w_evidence = "Current price: $195.55 [source: yfinance]. DCF implies +25.2% upside."
     _real_call_claude = llm.call_claude
-    def _garbage_claude(system_prompt, user_content, max_tokens=1000):
+    def _garbage_claude(system_prompt, user_content, max_tokens=1000, **kw):
         return "not json at all"
     llm.call_claude = _garbage_claude
     try:
@@ -66,7 +66,7 @@ def test_wiring_suite():
                      'unquantified qualitative judgment. This is investment research, '
                      'not financial advice.", "resolutions": '
                      '[{"claim": "30-40%", "resolution": "LABELED", "anchors": []}]}')
-    def _retry_probe_claude(system_prompt, user_content, max_tokens=1000):
+    def _retry_probe_claude(system_prompt, user_content, max_tokens=1000, **kw):
         _e_calls.append(user_content)
         return _e_bad_reply if len(_e_calls) == 1 else _e_good_reply
     llm.call_claude = _retry_probe_claude
@@ -93,7 +93,7 @@ def test_wiring_suite():
                      "price $195.55 (+25.2%) [source: FMP]. Analyst mean target: "
                      "$301.62. Analyst low target: $180.00.")
     def _lab_run(reply_json, verdict):
-        llm.call_claude = lambda system_prompt, user_content, max_tokens=1000: reply_json
+        llm.call_claude = lambda system_prompt, user_content, max_tokens=1000, **kw: reply_json
         try:
             return review_node({"verdict": verdict, "evidence": _lab_evidence})
         finally:

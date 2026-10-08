@@ -74,11 +74,16 @@ def format_market_lines(info: dict) -> list:
     lo, hi = info.get("fiftyTwoWeekLow"), info.get("fiftyTwoWeekHigh")
     if lo is not None and hi is not None:
         add("52-week range", f"{fmt_price(lo)} / {fmt_price(hi)}")
-    add("P/E (trailing TTM)", fmt_ratio(info.get("trailingPE")))
-    add("P/E (forward)", fmt_ratio(info.get("forwardPE")))
+    # AUDIT FIX (run #2): every EPS and P/E line now names its PERIOD and its
+    # ACCOUNTING BASIS. yfinance's trailingEps is GAAP TTM; forwardEps is the
+    # analyst consensus for a FUTURE fiscal year and is non-GAAP for most
+    # companies. Unlabeled, the pair reads like "earnings will double" when it
+    # is really GAAP-vs-non-GAAP across different years.
+    add("P/E (trailing TTM, GAAP EPS)", fmt_ratio(info.get("trailingPE")))
+    add("P/E (forward, consensus non-GAAP EPS)", fmt_ratio(info.get("forwardPE")))
     add("Price/Book (mrq)", fmt_ratio(info.get("priceToBook")))
-    add("EPS (trailing TTM)", fmt_price(info.get("trailingEps")))
-    add("EPS (forward)", fmt_price(info.get("forwardEps")))
+    add("EPS (trailing TTM, GAAP)", fmt_price(info.get("trailingEps")))
+    add("EPS (forward, consensus non-GAAP, next 12 months)", fmt_price(info.get("forwardEps")))
 
     lines.append("\n[FUNDAMENTALS]")
     add("Profit margin (TTM)", fmt_pct(info.get("profitMargins")))
@@ -89,8 +94,71 @@ def format_market_lines(info: dict) -> list:
     # would print a wildly wrong figure the agents would happily argue about.
     add("Debt/Equity (mrq, %)", fmt_ratio(info.get("debtToEquity")))
     add("Free cash flow (TTM)", fmt_big(info.get("freeCashflow")))
-    add("Revenue growth (yoy)", fmt_pct(info.get("revenueGrowth")))
+    # AUDIT FIX (run #2): yfinance revenueGrowth is the MOST RECENT QUARTER vs
+    # the same quarter a year earlier — NOT annual growth. Labeled "(yoy)" it
+    # was quoted as "revenue grew 85.5% in FY2025". The annual figure is
+    # computed separately from the income statement (fy_growth_lines).
+    add("Revenue growth (MRQ YoY, most recent quarter vs year-ago quarter)", fmt_pct(info.get("revenueGrowth")))
+    add("Earnings growth (MRQ YoY)", fmt_pct(info.get("earningsGrowth")))
     return lines
+
+
+def fy_growth_lines(annuals: list) -> list:
+    # PURE. annuals = [(fiscal_year, revenue, net_income), ...] newest first,
+    # straight from income_stmt columns. Emits full-year growth with BOTH years
+    # named, so an annual growth claim has an annual anchor to trace to.
+    lines = []
+    if len(annuals) < 2:
+        return lines
+    (fy1, rev1, ni1), (fy0, rev0, ni0) = annuals[0], annuals[1]
+    def growth(a, b):
+        try:
+            if a is None or b is None or float(b) == 0 or a != a or b != b:
+                return None
+            return f"{(float(a) / float(b) - 1) * 100:+.2f}%"
+        except (TypeError, ValueError):
+            return None
+    g = growth(rev1, rev0)
+    if g is not None:
+        lines.append(f"- Revenue growth (FY{fy1} vs FY{fy0}, annual): {g}  [source: yfinance/income_stmt]")
+    g = growth(ni1, ni0)
+    if g is not None:
+        lines.append(f"- Net income growth (FY{fy1} vs FY{fy0}, annual): {g}  [source: yfinance/income_stmt]")
+    return lines
+
+
+def format_estimate_lines(estimates: dict, current_fy=None) -> list:
+    # PURE. estimates = {"0y": {"avg": 7.9, "numberOfAnalysts": 30}, "+1y": {...}}
+    # (yfinance earnings_estimate rows). Consensus EPS is non-GAAP for most
+    # issuers; each line says so and names the fiscal year it is for, so a
+    # reader can never mistake "next FY consensus" for a trailing GAAP figure.
+    lines = []
+    for key, label in (("0y", "current FY"), ("+1y", "next FY")):
+        row = estimates.get(key) or {}
+        avg = row.get("avg")
+        if avg is None or avg != avg:
+            continue
+        fy = ""
+        if current_fy:
+            fy = f"FY{int(current_fy) + (1 if key == '+1y' else 0)}, "
+        n = row.get("numberOfAnalysts")
+        n_txt = f", {int(n)} analysts" if n is not None and n == n else ""
+        lines.append(f"- EPS consensus ({fy}{label}, non-GAAP{n_txt}): {fmt_price(avg)}  [source: yfinance/earnings_estimate]")
+    return lines
+
+
+def basis_notes(info: dict) -> list:
+    # PURE. Packet-level warnings whenever a prompt-visible pair mixes GAAP with
+    # non-GAAP or mixes periods. The agents read these lines like any other
+    # evidence, and the governor's label check enforces them downstream.
+    notes = []
+    if info.get("trailingEps") is not None and info.get("forwardEps") is not None:
+        notes.append("- BASIS NOTE: trailing EPS is GAAP (TTM); forward EPS is non-GAAP analyst consensus for a future period. "
+                     "Their ratio is NOT an earnings growth rate, and trailing P/E vs forward P/E are not on the same basis.")
+    if info.get("revenueGrowth") is not None:
+        notes.append("- PERIOD NOTE: 'Revenue growth (MRQ YoY)' is one quarter against the year-ago quarter, not a fiscal-year rate; "
+                     "annual growth is the separate 'FY vs FY' line.")
+    return notes
 
 
 def market_snapshot(ticker: str) -> str:
@@ -139,8 +207,33 @@ def market_snapshot(ticker: str) -> str:
                     val = inc.loc[row, col]
                     if val == val:  # NaN check without importing pandas (NaN != NaN)
                         add_line(f"{nice} (FY{fy} annual)", fmt_big(val), "yfinance/income_stmt")
+            # annual growth, both years named (AUDIT FIX: the MRQ figure above
+            # must never be the only growth number in the packet)
+            annuals = []
+            for c in list(inc.columns)[:2]:
+                annuals.append((getattr(c, "year", c),
+                                inc.loc["Total Revenue", c] if "Total Revenue" in inc.index else None,
+                                inc.loc["Net Income", c] if "Net Income" in inc.index else None))
+            out.extend(fy_growth_lines(annuals))
     except Exception as e:
         out.append(f"[income_stmt unavailable: {e}]")
+
+    # Consensus EPS by fiscal year (non-GAAP), separately from trailing GAAP EPS.
+    try:
+        est = t.earnings_estimate
+        if est is not None and len(est.index) > 0:
+            rows = {str(k): {c: est.loc[k, c] for c in est.columns} for k in est.index}
+            current_fy = None
+            try:
+                nfe = info.get("nextFiscalYearEnd")
+                if nfe:
+                    current_fy = datetime.fromtimestamp(float(nfe)).year
+            except Exception:
+                current_fy = None
+            out.extend(format_estimate_lines(rows, current_fy))
+    except Exception as e:
+        out.append(f"[earnings_estimate unavailable: {e}]")
+    out.extend(basis_notes(info))
 
     # FMP adds intraday context yfinance/info does not expose in the current packet.
     try:
