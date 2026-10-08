@@ -165,3 +165,14 @@ the LangGraph topology is unchanged.
   checklist and a verdict format ending with the debates that move the stock,
   what would change the view, and the next catalyst. Notebook prompts remain
   byte-identical as `*_NOTEBOOK` constants; live prompts extend them.
+
+### Cost after the audit pass (measured, AVGO, two rounds, Sonnet 5.5)
+
+The packet is ~70% larger than before the audit, but the evidence now rides in
+a cached system prefix shared by every call of a run, so most input tokens
+are cache reads billed at a tenth of the input price. Run #8 (2026-10-08):
+8 calls, no retries, 87.6k input tokens of which 56.8k were cache reads and
+8.3k a cache write, 9.1k output — about $0.17 at list prices, against about
+$0.25 for the first AVGO run on a smaller packet. A cold cache (first run on
+a ticker) writes four prefixes (one per schema) and lands near $0.22.
+Per-call usage is printed as `CALL: in=... cache_w=... cache_r=... out=...`.
