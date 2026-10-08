@@ -355,14 +355,14 @@ def test_news_offline_suite():
         try:
             if os.path.exists(_t6_store_file):
                 os.remove(_t6_store_file)
-            _t6_old_iso = datetime.fromtimestamp(time.time() - 20 * 86400, tz=timezone.utc).isoformat()
+            _t6_old_iso = datetime.fromtimestamp(time.time() - 40 * 86400, tz=timezone.utc).isoformat()  # outside the 30-day window
             _batch1 = [{**_t6_item(0, "ZZ story alpha"), "link": "https://pub.example.com/alpha?tsrc=rss"},
                        _t6_item(1, "ZZ story beta"),
                        {**_t6_item(2, "ZZ story ancient"), "published": _t6_old_iso}]
             _batch2 = [{**_t6_item(0, "ZZ story alpha"), "link": "https://pub.example.com/alpha?tsrc=partner"},
                        _t6_item(3, "ZZ story gamma")]
             _after1 = _update_yahoo_store("ZZTEST", _batch1)
-            news_check("f: 20-day-old pubDate dropped by the window",
+            news_check("f: 40-day-old pubDate dropped by the 30-day window",
                        len(_after1) == 2 and all(i["title"] != "ZZ story ancient" for i in _after1))
             _after2 = _update_yahoo_store("ZZTEST", _batch2)
             news_check("f: two fetches, one overlapping story (tracking-param variant) -> deduped",

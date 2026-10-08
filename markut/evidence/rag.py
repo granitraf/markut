@@ -6,7 +6,9 @@ from markut import config
 from markut.evidence.edgar import (ticker_to_cik, get_filing_index,
     find_latest_filings, fetch_filing_html, extract_10k_sections,
     extract_10q_sections, extract_8k_press_release, extract_risk_titles,
-    extract_outlook)
+    extract_outlook, extract_10k_business, business_overview,
+    extract_10q_commitments)
+from markut.guardrails.tracer import extract_numeric_claims
 
 import re
 from sentence_transformers import SentenceTransformer, CrossEncoder
@@ -222,13 +224,29 @@ def build_filing_index(ticker: str):
                              "filing_date": doc["filing_date"], "url": doc["url"]},
             })
         all_chunks += chunk_sections(sections, "10-K", doc["filing_date"], doc["url"])
+        # AUDIT FIX (run #2): what the company SELLS — the head of Item 1,
+        # stored as a deterministic block so every debate opens with it
+        overview = business_overview(extract_10k_business(html))
+        if overview:
+            all_chunks.append({
+                "text": overview,
+                "metadata": {"form": "10-K", "section": "Item 1 overview",
+                             "filing_date": doc["filing_date"], "url": doc["url"]},
+            })
+        else:
+            print("RAG: Item 1 (Business) not located — business overview block will be absent")
     else:
         print(f"RAG: no recent 10-K for {symbol} — skipping")
 
     # ---- 10-Q: quarterly MD&A + risk updates, plain chunking.
     if latest["10-Q"]:
         doc = latest["10-Q"][0]
-        sections = extract_10q_sections(fetch_filing_html(doc["url"]))
+        q_html = fetch_filing_html(doc["url"])
+        sections = extract_10q_sections(q_html)
+        # AUDIT FIX (run #2): the newest 10-Q's Commitments and Contingencies
+        # note — guarantees, backstops, purchase obligations — indexed under
+        # its own section name so the obligations theme can fence to it
+        sections["Commitments (10-Q note)"] = extract_10q_commitments(q_html)
         all_chunks += chunk_sections(sections, "10-Q", doc["filing_date"], doc["url"])
     else:
         print(f"RAG: no recent 10-Q for {symbol} — skipping")
@@ -434,8 +452,13 @@ def retrieve_theme(collection, rerank_query: str, sub_queries: list,
         if any(windows_overlap(meta, prior["metadata"]) for prior in picked):
             continue
         words = set(cand["text"].lower().split())
-        if any(len(words & prior_words) > 0.9 * min(len(words), len(prior_words))
-               for prior_words in picked_word_sets):
+        dup_at = next((i for i, prior_words in enumerate(picked_word_sets)
+                       if len(words & prior_words) > 0.9 * min(len(words), len(prior_words))), None)
+        if dup_at is not None:
+            # AUDIT FIX (run #2): prefer the NEWEST filing when a passage is
+            # repeated — a 10-Q restating 10-K language supersedes it
+            if cand["metadata"].get("filing_date", "") > picked[dup_at]["metadata"].get("filing_date", ""):
+                picked[dup_at], picked_word_sets[dup_at] = cand, words
             continue
         picked.append(cand)
         picked_word_sets.append(words)
@@ -459,7 +482,7 @@ from datetime import date
 # model bills by), but Python only sees characters. ~4 chars/token is the
 # standard rough ratio for English prose — close enough for budget enforcement.
 CHARS_PER_TOKEN = 4
-GLOBAL_TOKEN_CAP = 2500  # hard ceiling for the whole [FILINGS] section
+GLOBAL_TOKEN_CAP = 3300  # hard ceiling for the whole [FILINGS] section (was 2500 before the audit pass added overview + obligations)
 
 # SEMANTIC themes: (title, rerank query, sub-queries, section fence, k, cap).
 # WHY sub-query FAN-OUT instead of one abstract query per theme: embeddings
@@ -493,6 +516,18 @@ THEMES = [
       "segment revenue grew to a record during the quarter",
       "operating expenses increased due to compensation and infrastructure"],
      ["Item 7", "Item 2 (10-Q MD&A)", "press release"], 4, 850),
+    # AUDIT FIX (run #2): targeted retrieval for guidance and OBLIGATIONS —
+    # the guarantee/backstop/residual-value language that a $29B maximum
+    # exposure lives in, plus forward guidance wherever it is stated.
+    ("Guidance, commitments & obligations",
+     "forward guidance, guarantees, backstops, purchase commitments and off-balance-sheet obligations",
+     ["we expect revenue for the next fiscal quarter to be approximately",
+      "guidance for the full fiscal year revenue and gross margin",
+      "we have guaranteed the obligations and our maximum exposure under the guarantee",
+      "backstop commitment and residual value guarantee",
+      "unconditional purchase obligations and contractual commitments",
+      "off-balance-sheet arrangements and contingent liabilities"],
+     ["press release", "Outlook", "Item 2 (10-Q MD&A)", "Commitments (10-Q note)", "Item 7"], 3, 600),
 ]
 
 # DETERMINISTIC blocks: (title, section name in the index, token cap).
@@ -504,6 +539,7 @@ THEMES = [
 DETERMINISTIC_BLOCKS = [
     ("Risk factor titles", "Item 1A titles", 300),
     ("Guidance & outlook", "Outlook", 400),
+    ("Business overview", "Item 1 overview", 350),   # what the company sells (10-K Item 1 head)
 ]
 
 # WHY these budgets: retrieved quotes carry the debate (850 + 850); the
@@ -724,10 +760,12 @@ def get_filings_evidence(ticker: str) -> str:
     # the caption list that summarizes ALL the risks; results quotes, then the
     # deterministic outlook.
     blocks = [
+        deterministic_block(coll, *DETERMINISTIC_BLOCKS[2]),  # Business overview — first: what the company sells
         semantic_block(coll, *THEMES[0]),            # Key risks (retrieved)
         deterministic_block(coll, *DETERMINISTIC_BLOCKS[0]),  # Risk factor titles
         semantic_block(coll, *THEMES[1]),            # Results & drivers (retrieved)
         deterministic_block(coll, *DETERMINISTIC_BLOCKS[1]),  # Guidance & outlook
+        semantic_block(coll, *THEMES[2]),            # Guidance, commitments & obligations (retrieved)
     ]
 
     blocks = enforce_global_cap(blocks, GLOBAL_TOKEN_CAP * CHARS_PER_TOKEN)
@@ -735,3 +773,79 @@ def get_filings_evidence(ticker: str) -> str:
         lines.append("")  # blank line between themes for readability
         lines.extend(b)
     return "\n\n" + "\n".join(lines)
+
+
+# ---------------- AUDIT PASS (run #2): corroborate news-sourced claims against the filings ----------------
+# WHY: the judge flagged "221% AI revenue growth" and "$29B maximum guarantee
+# exposure" as untrusted NEWS — both sit in the filings (8-K press release,
+# 10-Q note). Before a flagged number is discarded, look for it VERBATIM in
+# the indexed filings; a hit promotes it to filing-backed evidence.
+
+def number_variants(num: str) -> list:
+    # PURE. Spellings a filing may use for a packet-style number.
+    # "221%" -> ["221%", "221 %", "221 percent"]; "$29B" -> ["$29 billion", "$29.0 billion", "29 billion", "$29B"]
+    raw = num.strip()
+    out = [raw]
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s?%", raw)
+    if m:
+        n = m.group(1)
+        out += [f"{n} %", f"{n} percent", f"{n}percent"]
+    m = re.fullmatch(r"\$?\s?(\d[\d,]*(?:\.\d+)?)\s?([TBMKtbmk])\b", raw)
+    if m:
+        n, unit = m.group(1), m.group(2).lower()
+        word = {"t": "trillion", "b": "billion", "m": "million", "k": "thousand"}[unit]
+        base = n.rstrip("0").rstrip(".") if "." in n else n
+        out += [f"${base} {word}", f"${n} {word}", f"{base} {word}", f"${base}.0 {word}" if "." not in base else f"${base} {word}"]
+    seen, uniq = set(), []
+    for v in out:
+        if v not in seen:
+            seen.add(v); uniq.append(v)
+    return uniq
+
+
+def corroborate_claims(ticker: str, claims: list, coll=None, max_hits: int = 2) -> list:
+    """For each claim, find its numbers verbatim in the ticker's indexed
+    filings. Returns [{"claim","number","match","text","metadata"}]. coll= is
+    the test seam (anything with .get(where_document=...)); production uses
+    the session's cached collection."""
+    if coll is None:
+        coll = build_filing_index(ticker)
+    hits = []
+    for claim in claims:
+        for num in extract_numeric_claims(str(claim)):
+            found = None
+            for variant in number_variants(num):
+                try:
+                    got = coll.get(where_document={"$contains": variant},
+                                   include=["documents", "metadatas"], limit=max_hits)
+                except Exception as e:
+                    print(f"CORROBORATE: lookup failed for {variant!r} ({e})")
+                    continue
+                docs = got.get("documents") or []
+                if docs:
+                    found = {"claim": str(claim), "number": num, "match": variant,
+                             "text": docs[0], "metadata": (got.get("metadatas") or [{}])[0]}
+                    break
+            if found:
+                hits.append(found)
+    return hits
+
+
+def format_corroboration_addendum(hits: list) -> str:
+    # The packet addendum the governor traces against: one quoted passage per
+    # corroborated number, with its filing source tag, in the same shape as
+    # the [FILINGS] section. Appended to the evidence by the claim review node.
+    if not hits:
+        return ""
+    lines = ["[FILINGS ADDENDUM — numbers from flagged claims found verbatim in the indexed filings during claim review]"]
+    seen = set()
+    for h in hits:
+        key = (h["number"], h["metadata"].get("url"))
+        if key in seen:
+            continue
+        seen.add(key)
+        m = h["metadata"]
+        lines.append(f"- {h['number']} (from claim: {truncate_to_budget(h['claim'], 160)})")
+        lines.append(f'- "{truncate_to_budget(h["text"], 600)}"')
+        lines.append(f"  [source: EDGAR/{m.get('form', '?')} {m.get('section', '?')}, filed {m.get('filing_date', '?')}, {m.get('url', '')}]")
+    return "\n".join(lines)

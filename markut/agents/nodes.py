@@ -209,6 +209,41 @@ def news_verify_node(state: DebateState) -> dict:
         return {"news_checked": True, "targeted_news_evidence": leads,
                 "claim_verification": verification}
 
+    # AUDIT FIX (run #2): CORROBORATE BEFORE DISCARDING. A number the judge
+    # flagged as "untrusted news" may sit verbatim in the filings ("221%" in
+    # the 8-K release, "$29B" in the 10-Q note). Search the indexed filings
+    # first; a hit makes the claim filing-backed, is appended to the evidence
+    # as an addendum the governor can trace against, and is removed from the
+    # paid re-audit. Lazy import: the RAG module loads the local models.
+    evidence = state["evidence"]
+    corroborated = []
+    try:
+        from markut.evidence.rag import corroborate_claims, format_corroboration_addendum
+        hits = corroborate_claims(state["ticker"], claims[:NEWS_TARGET_MAX_CLAIMS])
+        if hits:
+            addendum = format_corroboration_addendum(hits)
+            evidence = evidence + "\n\n" + addendum
+            for h in hits:
+                if h["claim"] not in [c["claim"] for c in corroborated]:
+                    corroborated.append({
+                        "claim": h["claim"], "status": "supported",
+                        "evidence_summary": f"{h['number']} found verbatim in the filing: \"{h['text'][:200]}\"",
+                        "sources": [h["metadata"].get("url", "")]})
+            print(f"CLAIM REVIEW: {len(corroborated)} claim(s) corroborated in the filings — promoted, not re-audited")
+    except Exception as e:
+        print(f"CLAIM REVIEW: filing corroboration skipped ({e})")
+    corroborated_claims = {c["claim"] for c in corroborated}
+    remaining = [c for c in claims[:NEWS_TARGET_MAX_CLAIMS] if c not in corroborated_claims]
+    if not remaining:
+        verification = {
+            "claim_reviews": corroborated,
+            "reasoning": "Every flagged claim's numbers were found verbatim in the indexed filings.",
+            "verdict_changed": False,
+            "revised_verdict": state["verdict"],
+        }
+        return {"news_checked": True, "targeted_news_evidence": leads,
+                "claim_verification": verification, "evidence": evidence}
+
     # WHY a second look at the same packet: the judge flags claims while doing
     # five other jobs in one response. This re-audit examines ONLY the flagged
     # claims, so over-flagged ones can be rescued (supported), genuinely
@@ -219,8 +254,8 @@ def news_verify_node(state: DebateState) -> dict:
         f"Ticker: {state['ticker']}\n\n"
         f"ORIGINAL VERDICT:\n{state['verdict']}\n\n"
         "UNSUPPORTED CLAIMS (as flagged by the judge):\n"
-        + "\n".join(f"- {claim}" for claim in claims[:NEWS_TARGET_MAX_CLAIMS])
-        + f"\n\nEVIDENCE PACKET:\n{state['evidence']}"
+        + "\n".join(f"- {claim}" for claim in remaining)
+        + f"\n\nEVIDENCE PACKET:\n{evidence}"
     )
     # AUDIT FIX (run #2): every claim came back "invalid JSON". Shape is now
     # schema-enforced; one repair retry shows the model its own reply and the
@@ -250,12 +285,14 @@ def news_verify_node(state: DebateState) -> dict:
             "claim_reviews": [
                 {"claim": claim, "status": "unresolved",
                  "evidence_summary": "Claim-review response was invalid JSON.", "sources": []}
-                for claim in claims[:NEWS_TARGET_MAX_CLAIMS]
+                for claim in remaining
             ],
             "reasoning": f"Claim review could not be parsed: {e}",
             "verdict_changed": False,
             "revised_verdict": state["verdict"],
         }
+    # corroborated claims lead the record, then whatever the re-audit decided
+    verification["claim_reviews"] = corroborated + list(verification.get("claim_reviews") or [])
     revised = (verification.get("revised_verdict")
                if verification.get("verdict_changed") is True
                else state["verdict"])
@@ -264,4 +301,5 @@ def news_verify_node(state: DebateState) -> dict:
         "targeted_news_evidence": leads,
         "claim_verification": verification,
         "verdict": revised or state["verdict"],
+        "evidence": evidence,   # the packet plus any filings addendum — what the governor traces against
     }

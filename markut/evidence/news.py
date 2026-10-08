@@ -42,7 +42,7 @@ os.makedirs(NEWS_CACHE_DIR, exist_ok=True)
 NEWS_USER_AGENT = "MarkutResearch/1.0 (educational financial research)"
 NEWS_RSS_TTL_SECONDS = 6 * 60 * 60
 NEWS_ARTICLE_TTL_SECONDS = 24 * 60 * 60
-NEWS_BASELINE_DAYS = 14
+NEWS_BASELINE_DAYS = 30  # AUDIT FIX (run #2): 14 days missed the week's biggest story; ranking is by materiality, not recency
 # WHY 9 (was 5): a headline+status+source record costs ~25 tokens, so breadth
 # is cheap. Depth is capped by access walls (most bodies can't be fetched), so
 # breadth of INDEPENDENT signals is what the 800-token budget should buy.
@@ -340,6 +340,34 @@ def _published_timestamp(item: dict) -> float:
         return 0.0
 
 
+# AUDIT FIX (run #2): MATERIALITY. A per-ticker feed is dominated by listicles
+# ("What will $5,000 become..."); the Oct 1 Reuters report on a $42B loan was in
+# the window and lost on recency. Stories about financing, guidance, deals,
+# litigation and ratings moves carry the debate; each distinct term below adds
+# weight (capped), and recency decays over the whole window instead of a week.
+MATERIAL_TERMS = {
+    "loan": 1.5, "financing": 1.5, "debt": 1.0, "bond": 1.0, "credit": 0.75, "guarantee": 1.5,
+    "guidance": 1.5, "outlook": 1.0, "forecast": 1.0, "raises": 1.0, "cuts": 1.0, "misses": 1.0, "beats": 1.0,
+    "acquisition": 1.5, "acquire": 1.5, "acquires": 1.5, "merger": 1.5, "deal": 1.0, "contract": 1.0, "agreement": 1.0,
+    "downgrade": 1.5, "downgrades": 1.5, "upgrade": 1.0, "upgrades": 1.0, "lawsuit": 1.5, "sues": 1.5,
+    "investigation": 1.5, "probe": 1.0, "recall": 1.0, "layoffs": 1.0, "ceo": 1.0, "resigns": 1.0,
+    "buyback": 1.0, "dividend": 0.5, "earnings": 1.0, "revenue": 0.75, "billion": 0.75, "reuters": 0.5, "bloomberg": 0.5,
+}
+MATERIALITY_CAP = 4.0
+
+
+def materiality_score(item: dict) -> float:
+    # PURE. Sum of MATERIAL_TERMS weights for distinct terms in title+summary
+    # (title hits count double), capped so one dense headline cannot dominate.
+    tokens = _item_tokens(item)
+    title_tokens = set(re.findall(r"[a-z0-9]+", item.get("title", "").lower()))
+    score = 0.0
+    for term, w in MATERIAL_TERMS.items():
+        if term in tokens:
+            score += w * (2 if term in title_tokens else 1)
+    return min(MATERIALITY_CAP, score)
+
+
 def score_news_item(item: dict, identity: dict, context_query: str = "", now: float = None) -> float:
     # WHY the now parameter: recency reads the clock, so two calls microseconds
     # apart score the SAME item differently at the ~1e-10 level. True ties
@@ -370,8 +398,11 @@ def score_news_item(item: dict, identity: dict, context_query: str = "", now: fl
     score += sum(term.lower() in tokens for term in _FINANCE_TERMS) * 0.4
     query_terms = set(_claim_terms(context_query))
     score += len(query_terms & tokens) * 1.25
-    age_days = max(0, (now - _published_timestamp(item)) / 86400) if _published_timestamp(item) else 30
-    score += max(0, 2 - age_days / 7)
+    score += materiality_score(item)
+    age_days = max(0, (now - _published_timestamp(item)) / 86400) if _published_timestamp(item) else NEWS_BASELINE_DAYS
+    # gentle recency: 1.5 points at zero age, zero at the window edge — a
+    # material story from day 20 can outrank a fresh listicle
+    score += max(0, 1.5 * (1 - age_days / NEWS_BASELINE_DAYS))
     return score
 
 

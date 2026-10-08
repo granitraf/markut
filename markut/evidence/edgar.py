@@ -258,6 +258,30 @@ def extract_10q_sections(html: str) -> dict:
         else "[section unavailable: Item 1A (risk updates) not located in this 10-Q]",
     }
 
+# Preference order for the earnings exhibit inside an 8-K folder. Specific
+# 99.1 spellings first, then press-release-style names, then 99.2 / CFO
+# commentary, and LAST a bare "ex99" with no part number — AUDIT FIX (run #2):
+# Broadcom files "avgo-08022026x8kxex99.htm", which none of the earlier
+# patterns matched, so no 8-K was ever indexed and the guidance block came up
+# empty. iXBRL filers also write "ex99d1" for 99.1.
+EXHIBIT_PATTERNS = (
+    r"ex[-_]?99[._-]?1", r"99[._-]?1", r"ex99d1",
+    r"pressrelease", r"earningsrelease", r"pr\.html?$",
+    r"ex[-_]?99[._-]?2", r"99[._-]?2", r"ex99d2", r"cfocommentary",
+    r"ex[-_]?99(?![0-9])",
+)
+
+
+def pick_exhibit(names: list):
+    # PURE. First file name matching the earliest pattern in EXHIBIT_PATTERNS;
+    # index/primary documents never match. None when nothing fits.
+    for pat in EXHIBIT_PATTERNS:
+        hits = [n for n in names if re.search(pat, n.lower()) and "index" not in n.lower()]
+        if hits:
+            return hits[0]
+    return None
+
+
 def extract_8k_press_release(eightk_entries: list) -> dict:
     # WHY select by ITEM CODE first (added after LIVE testing): frequent filers
     # like NVDA push out 8-Ks constantly (debt offerings, votes, board changes)
@@ -286,19 +310,7 @@ def extract_8k_press_release(eightk_entries: list) -> dict:
                 for it in listing.get("directory", {}).get("item", [])
                 if it.get("name", "").lower().endswith((".htm", ".html"))
             ]
-            exhibit = None
-            # Preference order: standard EX-99.1 spellings first, then
-            # press-release-style names — LIVE testing showed NVDA attaches
-            # "q1fy27pr.htm" / "q4fy26pr.htm", never "ex99_1.htm" — and last
-            # the 99.2 / CFO-commentary fallbacks. Order encodes preference:
-            # the actual press release beats the commentary document.
-            for pat in (r"ex[-_]?99[._-]?1", r"99[._-]?1",
-                        r"pressrelease", r"pr\.html?$",
-                        r"ex[-_]?99[._-]?2", r"99[._-]?2", r"cfocommentary"):
-                hits = [n for n in names if re.search(pat, n.lower())]
-                if hits:
-                    exhibit = hits[0]
-                    break
+            exhibit = pick_exhibit(names)
             if not exhibit:
                 print(f"EDGAR: 8-K filed {entry['filing_date']} has no 99.1/99.2 exhibit — walking back")
                 continue
@@ -384,3 +396,62 @@ def extract_risk_titles(html: str, section_text: str) -> list:
         seen.add(t)
         titles.append(t)  # find_all walks in document order, so titles stay ordered
     return titles
+
+
+# ---------------- AUDIT PASS (run #2): what the company sells; what it has promised ----------------
+
+def extract_10k_business(html: str) -> str:
+    # Item 1 (Business): the section that says what the company actually sells
+    # and to whom. AUDIT FIX: the bear and the judge treated Google TPU as a
+    # Broadcom competitor; Broadcom DESIGNS the TPU. The agents never saw Item
+    # 1. Anchored like the other sections; "item 1" must not be followed by
+    # A/B/C (Item 1A is Risk Factors) and ends where Item 1A starts.
+    text = html_to_text(html)
+    item_1 = _find_section(
+        text,
+        r"(?m)^\s*item\s+1(?![0-9a-c])\b",
+        [r"(?m)^\s*item\s+1a\b", r"(?m)^\s*item\s+2\b"],
+    )
+    return item_1 if len(item_1) >= 500 else "[section unavailable: Item 1 (Business) not located in this 10-K]"
+
+
+def business_overview(item_1_text: str, char_limit: int = 1500) -> str:
+    # PURE. The opening paragraphs of Item 1 — the company's own description of
+    # its business — cut at a sentence boundary. Deterministic (no search): the
+    # overview is always the head of the section.
+    if item_1_text.startswith("[section unavailable"):
+        return ""
+    paras = [p.strip() for p in item_1_text.split("\n\n") if p.strip()]
+    # drop the heading line(s) themselves ("Item 1. Business", "Overview") —
+    # html_to_text stitches a heading onto the paragraph that follows it when
+    # the heading has no period, so strip a leading heading prefix as well
+    heading = re.compile(r"^(?:item\s+1\.?\s*)?(?:business\.?\s*)?(?:overview|general|introduction)?\.?\s*", re.IGNORECASE)
+    paras = [heading.sub("", p, count=1).strip() if heading.match(p) else p for p in paras]
+    body = [p for p in paras if len(p.split()) > 8]
+    out, total = [], 0
+    for p in body:
+        if total + len(p) > char_limit and out:
+            break
+        out.append(p)
+        total += len(p)
+    text = "\n\n".join(out)
+    if len(text) > char_limit:
+        cut = text[:char_limit]
+        ends = [m.end() for m in re.finditer(r"[.!?](?=\s|$)", cut)]
+        text = cut[:ends[-1]] if ends else cut
+    return text.strip()
+
+
+def extract_10q_commitments(html: str) -> str:
+    # The "Commitments and Contingencies" note of the newest 10-Q: guarantees,
+    # purchase obligations, backstops, residual-value guarantees, litigation —
+    # the place a $29B maximum guarantee exposure is disclosed. Notes are
+    # numbered ("Note 11.", "11.") so the heading is matched with an optional
+    # number and ends at the next numbered note or at Item 2.
+    text = html_to_text(html)
+    note = _find_section(
+        text,
+        r"(?m)^\s*(?:note\s+)?(?:\d{1,2}\.?\s*[\-—:]?\s*)?commitments and contingencies\b",
+        [r"(?m)^\s*(?:note\s+)?\d{1,2}\.\s+[A-Z][a-z]", r"(?m)^\s*item\s+2\b", r"(?m)^\s*item\s+4\b"],
+    )
+    return note if len(note) >= 300 else "[section unavailable: Commitments and Contingencies note not located in this 10-Q]"

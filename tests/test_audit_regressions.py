@@ -25,8 +25,8 @@ EVIDENCE_V2 = EVIDENCE.replace("Revenue growth (yoy): 85.50%",
 @pytest.fixture
 def stub_llm(monkeypatch):
     """Replace call_claude with a scripted stub; records every call's kwargs."""
-    calls = []
     def install(replies, stop_reasons=None):
+        calls = []   # a fresh log per install, so a second script starts at zero
         replies, stops = list(replies), list(stop_reasons or [])
         def fake(system_prompt, user_content, max_tokens=1000, schema=None):
             calls.append({"system": system_prompt, "user": user_content, "max_tokens": max_tokens, "schema": schema})
@@ -196,3 +196,149 @@ def test_no_truncated_turns_reach_the_judge(stub_llm):
     stub_llm(["half a case that stops", "Whole case. Complete."], ["max_tokens", "end_turn"])
     out = nodes.bull_node({"ticker": "AVGO", "evidence": EVIDENCE, "bear_case": "", "round": 0})
     assert out["bull_case"] == "Whole case. Complete." and out["bull_history"] == ["Whole case. Complete."]
+
+
+# ================================================================ P1 — evidence coverage
+from markut.evidence import edgar, news as news_mod
+
+
+def test_exhibit_picker_finds_broadcom_and_nvidia_releases():
+    # run #2: Broadcom's release is "...x8kxex99.htm" (no ".1") — never matched before
+    assert edgar.pick_exhibit(["0001730168-26-000076-index.html", "avgo-08022026x8kxex99.htm", "avgo-20260902.htm", "R1.htm"]) == "avgo-08022026x8kxex99.htm"
+    assert edgar.pick_exhibit(["nvda-20260528.htm", "q1fy27pr.htm", "q1fy27cfocommentary.htm"]) == "q1fy27pr.htm"
+    assert edgar.pick_exhibit(["a.htm", "ex99_2.htm", "ex99_1.htm"]) == "ex99_1.htm"       # 99.1 beats 99.2
+    assert edgar.pick_exhibit(["x-ex99d1.htm"]) == "x-ex99d1.htm"
+    assert edgar.pick_exhibit(["primary.htm", "0001-index.html"]) is None
+
+
+def test_8k_guidance_chain_outlook_block():
+    # the exhibit picker + outlook extractor: guidance appears once the release is indexed
+    release = ("<html><body><p>Broadcom Inc. today reported results.</p><p>Outlook</p>"
+               "<p>Fourth quarter fiscal year 2026 revenue guidance of approximately $21.0 billion is expected, "
+               "an increase of 24 percent from the prior year period.</p>"
+               "<p>Adjusted EBITDA guidance of approximately 67 percent of projected revenue is expected.</p>"
+               "<p>Conference call details follow.</p></body></html>")
+    text = edgar.html_to_text(release)
+    outlook = edgar.extract_outlook(text)
+    assert outlook.startswith("Outlook") and "$21.0 billion" in outlook and "Conference call" not in outlook
+
+
+def test_item_1_business_overview_and_10q_commitments_extractors():
+    tenk = "<html><body>" + "<p>Item 1. Business</p><p>Item 1A. Risk Factors</p><p>Item 7. MD&A</p>" + \
+        "<p>Item 1. Business</p><p>Overview</p>" + \
+        "<p>" + " ".join(["Broadcom designs, develops and supplies semiconductor and infrastructure software solutions, "
+                          "including custom AI accelerators (XPUs) designed for hyperscale customers."] * 6) + "</p>" + \
+        "<p>" + " ".join(["Our products are used in data center networking and custom silicon programs."] * 6) + "</p>" + \
+        "<p>Item 1A. Risk Factors</p><p>" + "Risks are many and varied in this business. " * 60 + "</p></body></html>"
+    item1 = edgar.extract_10k_business(tenk)
+    assert item1.startswith("Item 1. Business") and "Risks are many" not in item1
+    overview = edgar.business_overview(item1, char_limit=400)
+    assert overview.startswith("Broadcom designs") and len(overview) <= 420 and overview.endswith(".")
+    tenq = "<html><body><p>Note 10. Debt</p><p>" + "Debt details here. " * 20 + "</p>" + \
+        "<p>Note 11. Commitments and Contingencies</p><p>" + ("We have guaranteed certain obligations of a customer financing arrangement. "
+        "Our maximum exposure under the guarantee was $29 billion as of August 2, 2026. ") * 4 + "</p>" + \
+        "<p>Note 12. Segment Information</p><p>" + "Segments are described here. " * 20 + "</p></body></html>"
+    note = edgar.extract_10q_commitments(tenq)
+    assert note.startswith("Note 11. Commitments and Contingencies") and "$29 billion" in note and "Segment Information" not in note
+    assert edgar.extract_10q_commitments("<html><body><p>nothing here</p></body></html>").startswith("[section unavailable")
+
+
+class _FakeColl:
+    """A Chroma-like collection: .get(where_document={"$contains": s}) on stored docs."""
+    def __init__(self, docs):
+        self.docs = docs  # [(text, metadata)]
+    def get(self, where_document=None, include=None, limit=None, **_):
+        needle = (where_document or {}).get("$contains", "")
+        hits = [(t, m) for t, m in self.docs if needle in t][: (limit or 10)]
+        return {"documents": [t for t, _ in hits], "metadatas": [m for _, m in hits]}
+
+
+def test_filing_backed_number_from_news_is_promoted_to_cited():
+    from markut.evidence import rag
+    coll = _FakeColl([
+        ("AI semiconductor revenue grew 221 percent year-over-year to $5.2 billion in the quarter.",
+         {"form": "8-K", "section": "press release", "filing_date": "2026-09-02", "url": "https://sec.gov/x/ex99.htm"}),
+        ("Our maximum exposure under the guarantee was $29 billion as of August 2, 2026.",
+         {"form": "10-Q", "section": "Commitments (10-Q note)", "filing_date": "2026-09-10", "url": "https://sec.gov/y/10q.htm"}),
+    ])
+    claims = ["News article claim that 'Broadcom's AI semiconductor revenue grew 221% year-on-year last quarter'",
+              "News body claim of about $29B tied to that first tranche",
+              "Bull claim that hyperscalers have multi-year commitments"]
+    hits = rag.corroborate_claims("AVGO", claims, coll=coll)
+    assert [(h["number"], h["match"]) for h in hits] == [("221%", "221 percent"), ("$29B", "$29 billion")]
+    addendum = rag.format_corroboration_addendum(hits)
+    assert addendum.startswith("[FILINGS ADDENDUM") and "EDGAR/8-K press release" in addendum and "EDGAR/10-Q Commitments" in addendum
+    # the governor now traces the number: CITED, not rejected. Both figures
+    # reached run #2 only through untrusted NEWS text; against the market
+    # section alone they are FLAGGED, and the addendum gives them a FILING anchor.
+    market_only = EVIDENCE.split("[FILINGS]")[0]
+    assert tracer.trace_claim("$29B", market_only) == "FLAGGED" and tracer.trace_claim("221%", market_only) == "FLAGGED"
+    assert tracer.trace_claim("$29B", market_only + "\n\n" + addendum) == "CITED"
+    assert tracer.trace_claim("221%", market_only + "\n\n" + addendum) == "CITED"
+    assert addendum.index("EDGAR/8-K press release") < addendum.index("EDGAR/10-Q Commitments")   # one block per hit, in order
+
+
+def test_claim_review_corroborates_before_the_paid_reaudit(stub_llm, monkeypatch):
+    import markut.evidence.rag as rag
+    monkeypatch.setattr(nodes, "get_related_leads", lambda claims, ticker: "")
+    monkeypatch.setattr(rag, "corroborate_claims", lambda ticker, claims, coll=None, max_hits=2: [
+        {"claim": claims[0], "number": "221%", "match": "221 percent",
+         "text": "AI semiconductor revenue grew 221 percent.", "metadata": {"form": "8-K", "section": "press release",
+                                                                        "filing_date": "2026-09-02", "url": "u"}}])
+    good = json.dumps({"claim_reviews": [{"claim": "c2", "status": "unresolved", "evidence_summary": "", "sources": []}],
+                       "reasoning": "ok", "verdict_changed": False, "revised_verdict": "v"})
+    calls = stub_llm([good])
+    out = nodes.news_verify_node({"ticker": "AVGO", "evidence": EVIDENCE, "verdict": "v",
+                                  "judge_decision": {"unsupported_claims": ["c1 says 221% growth", "c2"]}})
+    reviews = out["claim_verification"]["claim_reviews"]
+    assert reviews[0]["status"] == "supported" and reviews[0]["claim"].startswith("c1") and reviews[0]["sources"] == ["u"]
+    assert reviews[1]["claim"] == "c2"
+    flagged_list = calls[0]["user"].split("EVIDENCE PACKET")[0]
+    assert "- c1 says 221% growth" not in flagged_list and "- c2" in flagged_list   # only the rest is re-audited
+    assert out["evidence"].rstrip().endswith("u]") and "[FILINGS ADDENDUM" in out["evidence"]
+    # all corroborated -> no paid call at all
+    calls = stub_llm([])
+    out = nodes.news_verify_node({"ticker": "AVGO", "evidence": EVIDENCE, "verdict": "v",
+                                  "judge_decision": {"unsupported_claims": ["only 221% here"]}})
+    assert calls == [] and out["claim_verification"]["claim_reviews"][0]["status"] == "supported"
+
+
+def test_news_window_and_materiality_ranking():
+    assert news_mod.NEWS_BASELINE_DAYS == 30
+    identity = {"ticker": "AVGO", "company": "Broadcom Inc."}
+    import time as _t
+    now = _t.time()
+    old_material = {"title": "Broadcom secures $42 billion loan for Anthropic chip financing, Reuters reports",
+                    "summary": "The debt deal backs custom accelerators.", "published": _iso_days_ago(now, 20), "publisher": "Reuters"}
+    fresh_fluff = {"title": "What Will $5,000 Invested in Broadcom Stock Be Worth in 5 Years?",
+                   "summary": "Three futures for this company.", "published": _iso_days_ago(now, 1), "publisher": "Motley"}
+    assert news_mod.score_news_item(old_material, identity, now=now) > news_mod.score_news_item(fresh_fluff, identity, now=now)
+    assert news_mod.materiality_score(old_material) == news_mod.MATERIALITY_CAP
+    assert news_mod.materiality_score(fresh_fluff) < 1.0
+
+
+def _iso_days_ago(now, days):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(now - days * 86400, tz=timezone.utc).isoformat()
+
+
+def test_market_context_lines():
+    from datetime import date, timedelta
+    closes = [((date(2025, 10, 1) + timedelta(days=i)).isoformat(), 300 + i) for i in range(300)]
+    text = "\n".join(market.format_context_lines(closes, {"fiftyTwoWeekHigh": 650}, ["2026-06-11"], 700))
+    assert "Return, 1 month" in text and "Return, 3 months" in text and "year to date" in text
+    assert "Price vs 52-week high: -7.8% (high $650.00)" in text
+    assert "Price vs all-time high (monthly closes): -14.4%" in text
+    assert "Move around last earnings (2026-06-11; close before → first close after): +0.4%" in text
+    assert market.format_context_lines([], {}, []) == []
+
+
+@pytest.mark.live
+def test_live_avgo_packet_has_guidance_block():
+    # free (EDGAR + local models, no model calls): the fixed exhibit picker indexes
+    # Broadcom's 8-K and the Outlook block is no longer "[not extracted ...]"
+    from markut.evidence.rag import get_filings_evidence
+    text = get_filings_evidence("AVGO")
+    assert "8-K press release filed" in text
+    assert "-- Guidance & outlook --\n[not extracted" not in text
+    assert "-- Business overview --" in text

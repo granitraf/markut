@@ -161,6 +161,56 @@ def basis_notes(info: dict) -> list:
     return notes
 
 
+def format_context_lines(closes: list, info: dict, earnings_dates: list = None, all_time_high=None) -> list:
+    """PURE. AUDIT FIX (run #2) — what 'sentiment' means to an analyst:
+    1M/3M/YTD returns, distance from the 52-week and all-time highs, and the
+    move around the last earnings report. closes = [(YYYY-MM-DD, close), ...]
+    ascending; earnings_dates = past report dates as YYYY-MM-DD strings.
+    (The last guide-vs-consensus comparison needs a source yfinance does not
+    expose; it is deliberately absent rather than approximated.)"""
+    lines = []
+    if not closes:
+        return lines
+    dates = [d for d, _ in closes]
+    vals = [float(c) for _, c in closes]
+    last_date, last = dates[-1], vals[-1]
+
+    def add(label, value, source="yfinance/history"):
+        if value is not None:
+            lines.append(f"- {label}: {value}  [source: {source}]")
+
+    def ret_from(index):
+        if index is None or index < 0 or index >= len(vals) or vals[index] == 0:
+            return None
+        return f"{(last / vals[index] - 1) * 100:+.1f}%"
+
+    n = len(vals)
+    add(f"Return, 1 month (≈21 sessions, to {last_date})", ret_from(n - 22) if n > 22 else None)
+    add(f"Return, 3 months (≈63 sessions, to {last_date})", ret_from(n - 64) if n > 64 else None)
+    year = last_date[:4]
+    ytd_idx = next((i for i, d in enumerate(dates) if d.startswith(year)), None)
+    if ytd_idx is not None and ytd_idx > 0:
+        add(f"Return, year to date (from the last {int(year) - 1} close)", ret_from(ytd_idx - 1))
+    hi52 = info.get("fiftyTwoWeekHigh")
+    if hi52:
+        add("Price vs 52-week high", f"{(last / float(hi52) - 1) * 100:+.1f}% (high {fmt_price(hi52)})", "yfinance/info")
+    if all_time_high:
+        add("Price vs all-time high (monthly closes)", f"{(last / float(all_time_high) - 1) * 100:+.1f}% (high {fmt_price(all_time_high)})")
+    # move around the last earnings report: last close strictly BEFORE the
+    # report date to the first close strictly AFTER it (a two-session window,
+    # because pre-market and after-close reports land on different sessions)
+    past = sorted(d for d in (earnings_dates or []) if d <= last_date)
+    if past:
+        d = past[-1]
+        before = next((i for i in range(n - 1, -1, -1) if dates[i] < d), None)
+        after = next((i for i in range(n) if dates[i] > d), None)
+        if before is not None and after is not None and vals[before]:
+            move = (vals[after] / vals[before] - 1) * 100
+            add(f"Move around last earnings ({d}; close before → first close after)", f"{move:+.1f}%",
+                "yfinance/history+earnings_dates")
+    return lines
+
+
 def market_snapshot(ticker: str) -> str:
     # WHY this function exists: yfinance replaces FMP as the evidence baseline
     # because it covers more of what the debate needs (forward estimates and analyst
@@ -289,7 +339,8 @@ def market_snapshot(ticker: str) -> str:
     except Exception as e:
         out.append(f"[analyst section unavailable: {e}]")
 
-    # ---- 4. EVENTS ----
+    # ---- 4. EVENTS + MARKET CONTEXT ----
+    past_dates = []
     try:
         ed = t.earnings_dates
         next_dt = None
@@ -299,11 +350,30 @@ def market_snapshot(ticker: str) -> str:
                 now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
                 if dt > now and (next_dt is None or dt < next_dt):
                     next_dt = dt
+                elif dt <= now:
+                    past_dates.append(dt.strftime("%Y-%m-%d"))
         if next_dt is not None:
             out.append("\n[EVENTS]")
             add_line("Next earnings date", next_dt.strftime("%Y-%m-%d"), "yfinance/earnings_dates")
     except Exception as e:
         out.append(f"[events section unavailable: {e}]")
+    try:
+        hist = t.history(period="1y", auto_adjust=False)
+        closes = [(ts.strftime("%Y-%m-%d"), float(c)) for ts, c in zip(hist.index, hist["Close"]) if c == c] \
+            if hist is not None and len(hist.index) else []
+        ath = None
+        try:
+            monthly = t.history(period="max", interval="1mo", auto_adjust=False)
+            if monthly is not None and len(monthly.index):
+                ath = float(monthly["Close"].max())
+        except Exception:
+            ath = None
+        ctx = format_context_lines(closes, info, past_dates, ath)
+        if ctx:
+            out.append("\n[MARKET CONTEXT]")
+            out.extend(ctx)
+    except Exception as e:
+        out.append(f"[market context unavailable: {e}]")
 
     # ---- 5. DCF (the one FMP holdover) ----
     try:
