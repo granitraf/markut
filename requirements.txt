@@ -14,3 +14,5 @@ fastapi<0.142
 uvicorn
 # hosted run log (Supabase Postgres); the SQLite fallback needs nothing extra
 psycopg[binary]
+# PDF report of a stored run (markut.report)
+reportlab

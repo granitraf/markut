@@ -104,6 +104,7 @@
     println("commands", "info");
     println("  <ticker>              start a debate on that symbol (then rounds, then run debate)");
     println("  replay <ticker> [date] replay a stored run — press Tab to cycle through that ticker's run dates");
+    println("  download <ticker> [date] download the run as a PDF equity report (same Tab cycling)");
     println("  runs [ticker]         list stored runs");
     println("  archive               open the archive table");
     println("  clear                 clear the screen");
@@ -139,14 +140,15 @@
 
     if (step === "ticker") {
       if (low === "runs") return listRuns(rest[0]);
-      if (low === "replay") {
+      if (low === "replay" || low === "download") {
         const t = (rest[0] || "").toUpperCase();
-        if (!t) return println("usage: replay <ticker> [date] — Tab cycles the dates", "err");
+        if (!t) return println(`usage: ${low} <ticker> [date] — Tab cycles the dates`, "err");
         const runs = await fetchRuns(t);
         if (!runs.length) return println(`no stored runs for ${esc(t)}`, "err");
         const date = rest.slice(1).join(" ");
         const run = date ? runs.find((r) => r.started_at.startsWith(date)) : runs[0];
         if (!run) return println(`no ${esc(t)} run on ${esc(date)} — Tab to see the dates`, "err");
+        if (low === "download") return downloadReport(run);
         return startStream(`/api/replay?run=${run.id}`, `replay ${t} · ${run.started_at}`);
       }
       const t = text.toUpperCase();
@@ -168,27 +170,35 @@
     if (step === "running") return println("a debate is in progress — wait for it to finish", "dim");
   }
 
+  function downloadReport(run) {
+    // the PDF is built from the stored run on request (~0.1s); an <a download> keeps the browser on this page
+    const url = `/api/runs/${run.id}/report.pdf`;
+    println(`» download ${esc(run.ticker)} · ${esc(run.started_at)} — <a href="${url}">markut-${esc(run.ticker)}-${esc(run.started_at.slice(0, 10))}.pdf</a>`, "info");
+    const a = document.createElement("a"); a.href = url; a.download = ""; document.body.appendChild(a); a.click(); a.remove();
+  }
+
   // ---- Tab completion ----
   async function complete() {
     const value = reader.value;
-    if (tab.options.length && value === tab.options[tab.idx]) {          // cycling
+    if (tab.options.length > 1 && value === tab.options[tab.idx]) {      // cycling (a single completion falls through to the next stage: ticker -> dates)
       tab.idx = (tab.idx + 1) % tab.options.length; reader.value = tab.options[tab.idx]; setPrompt(); return;
     }
     tab.options = []; tab.idx = -1;
     let m;
-    if ((m = value.match(/^(replay\s+)([A-Za-z.]+)\s*(.*)$/i))) {
-      const t = m[2].toUpperCase();
+    if ((m = value.match(/^(replay|download)\s+([A-Za-z.]+)\s*(.*)$/i))) {
+      const verb = m[1].toLowerCase(), t = m[2].toUpperCase();
       if (!tickers.length) await loadTickers();
       const exact = tickers.includes(t);
       if (!exact) {                                                       // complete the ticker first
-        tab.options = tickers.filter((x) => x.startsWith(t)).map((x) => `replay ${x} `);
+        tab.options = tickers.filter((x) => x.startsWith(t)).map((x) => `${verb} ${x} `);
       } else {                                                            // then cycle the run dates, newest first
         const runs = await fetchRuns(t);
-        tab.options = runs.map((r) => `replay ${t} ${r.started_at}`);
+        tab.options = runs.map((r) => `${verb} ${t} ${r.started_at}`);
       }
-    } else if ((m = value.match(/^(replay\s*)$/i))) {
+    } else if ((m = value.match(/^(replay|download)\s*$/i))) {
+      const verb = m[1].toLowerCase();
       if (!tickers.length) await loadTickers();
-      tab.options = tickers.map((x) => `replay ${x} `);
+      tab.options = tickers.map((x) => `${verb} ${x} `);
     } else if (step === "ticker" && /^[A-Za-z.]+$/.test(value)) {
       if (!tickers.length) await loadTickers();
       tab.options = tickers.filter((x) => x.startsWith(value.toUpperCase()));
@@ -213,7 +223,7 @@
       },
       onEnd() { stopClock(); finish(); },
       onSaved(d) {
-        if (d.run) { timeline.card("route", `logged as run #${d.run} — <a href="/console?run=${d.run}">read it</a> · replay ${esc(ticker)} to watch again`); delete runsCache[ticker]; delete runsCache[""]; }
+        if (d.run) { timeline.card("route", `logged as run #${d.run} — <a href="/console?run=${d.run}">read it</a> · <a href="/api/runs/${d.run}/report.pdf">download the PDF report</a> · replay ${esc(ticker)} to watch again`); delete runsCache[ticker]; delete runsCache[""]; }
         else if (d.error) timeline.card("route", "run finished but could not be logged: " + esc(d.error));
       },
     });
@@ -233,7 +243,7 @@
     const out = document.createElement("div"); out.className = "out"; term.appendChild(out);
     const tl = document.createElement("div"); tl.className = "timeline"; out.appendChild(tl);
     Timeline(tl, { autoscroll: false }).renderAll(run.events);
-    println(`replay ${esc(run.ticker)} ${esc(run.started_at)} — to watch it with pacing`, "dim");
+    println(`replay ${esc(run.ticker)} ${esc(run.started_at)} — to watch it with pacing · <a href="/api/runs/${run.id}/report.pdf">download the PDF report</a>`, "dim");
   }
 
   // ---- input plumbing: an off-screen input receives keys; the prompt line mirrors it ----

@@ -30,6 +30,7 @@
   .playbar { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); margin-bottom: 14px; min-height: 48px; color: var(--muted); font-size: 14px; }
   .playbar b { color: var(--ink); } .playbar .spacer { flex: 1; }
   .playbar select { padding: 5px 8px; font-size: 13px; }
+  .playbar .dl { color: var(--accent); text-decoration: none; font-size: 13px; }
   .empty { color: var(--muted); padding: 18px 0; }
   article { margin-top: 48px; font-family: var(--mono); font-size: 15px; line-height: 1.75; }
   article .md h1 { font-size: 26px; margin: 0 0 8px; line-height: 1.25; font-family: var(--mono); }
@@ -91,7 +92,8 @@
       (run.price ? `<span>price seen ${esc(run.price)}</span>` : "") +
       `<span class="pill">${state}</span><span class="spacer"></span>` +
       `<label>speed <select id="speed">${SPEEDS.map(([v, l]) => `<option value="${v}" ${String(speed) === v ? "selected" : ""}>${l}</option>`).join("")}</select></label>` +
-      `<button id="again" type="button">Play again</button>`;
+      `<button id="again" type="button">Play again</button>` +
+      (run.id ? ` <a class="dl" href="/api/runs/${run.id}/report.pdf" title="PDF equity-style report of this run">download report ↓</a>` : "");
     $("speed").addEventListener("change", (e) => { speed = Number(e.target.value); });
     $("again").addEventListener("click", () => start(current));
   }

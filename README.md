@@ -50,10 +50,18 @@ separate URLs (no login yet; the public page never links to the console):
   opens one as a full read.
 - **Archive `/console/library`** — every run ever made, by date and
   ticker, with price, rounds, convergence, grounding and token cost.
+- **PDF report** — any stored run as an equity-style report (title block,
+  key metrics, the governed verdict with UNGROUNDED tags as footnotes, the
+  debate round by round, judge scoreboards, appendix with the evidence and
+  method). Console: `download NVDA` (Tab cycles the run dates); public
+  player: "download report"; API: `/api/runs/{id}/report.pdf`. Built from
+  the store on request in ~0.1s (`markut/report.py`, ReportLab, IBM Plex
+  Serif + JetBrains Mono embedded).
 
 Shared front-end code lives in `static/debate.js` / `debate.css` (no CDN).
 API: `/api/health`, `/api/featured`, `/api/article`, `/api/runs[?ticker=]`,
-`/api/runs/{id}`, `/api/replay?run=ID[&speed]`, `/api/debate?ticker=&max_rounds=`.
+`/api/runs/{id}`, `/api/runs/{id}/report.pdf`, `/api/replay?run=ID[&speed]`,
+`/api/debate?ticker=&max_rounds=`.
 
 ## Run log
 

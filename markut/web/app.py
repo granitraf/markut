@@ -14,6 +14,7 @@ API
   GET /api/article               the public article (markdown; edit content/article.md)
   GET /api/runs[?ticker=NVDA]    OPERATOR: the run log (summary rows, newest first)
   GET /api/runs/{id}             one run: summary + every turn + every event
+  GET /api/runs/{id}/report.pdf  the run as an equity-style PDF report (built from the store, <1s)
   GET /api/replay?run=ID[&speed] SSE replay of a stored run (free)
   GET /api/debate?ticker=NVDA&max_rounds=2
                                  OPERATOR: SSE live debate (paid: 8-12 model calls); stored when done
@@ -38,12 +39,12 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import iterate_in_threadpool
 
-from markut import config, store
+from markut import config, report, store
 from markut.web import events as ev
 from markut.web import replay
 
@@ -216,6 +217,21 @@ def run_detail(run_id: int):
         return store.get_run(run_id, store.target())
     except KeyError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
+
+
+@app.get("/api/runs/{run_id}/report.pdf")
+def run_report(run_id: int):
+    # built on request from the stored run — no model calls, no cache needed
+    # at ~0.1s; the browser saves it as markut-<TICKER>-<date>.pdf
+    _ensure_store()
+    try:
+        run = store.get_run(run_id, store.target())
+    except KeyError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    pdf = report.build_report(run)
+    return Response(pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="{report.report_filename(run)}"',
+                             "Cache-Control": "private, max-age=300"})
 
 
 @app.get("/api/replay")

@@ -193,3 +193,12 @@ def test_live_stream_busy_refusal(monkeypatch):
     assert second[0]["event"] == "error" and second[0]["data"]["stage"] == "busy"
     release.set(); t.join(10)
     assert "saved" in first["text"] and not app_mod.live_busy()
+
+
+def test_report_endpoint_serves_pdf_attachment():
+    rid = client.get("/api/runs", params={}).json()["runs"][0]["id"] if False else 1
+    r = client.get(f"/api/runs/{rid}/report.pdf")
+    assert r.status_code == 200 and r.headers["content-type"] == "application/pdf"
+    assert r.headers["content-disposition"] == 'attachment; filename="markut-NVDA-2026-07-17.pdf"'
+    assert r.content.startswith(b"%PDF-")
+    assert client.get("/api/runs/999/report.pdf").status_code == 404
