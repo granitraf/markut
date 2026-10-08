@@ -347,7 +347,10 @@ def build_report(run: dict) -> bytes:
     # ---- 4. usage ----
     u = done.get("usage") or {}
     if u:
-        story.append(Paragraph(f"Run cost: {u.get('calls', '—')} model calls · {u.get('input', 0):,} input tokens · {u.get('output', 0):,} output tokens.", st["small"]))
+        cached = (u.get("cache_read") or 0) + (u.get("cache_write") or 0)
+        story.append(Paragraph(f"Run cost: {u.get('calls', '—')} model calls · {(u.get('input') or 0) + cached:,} input tokens"
+                               + (f" ({u.get('cache_read') or 0:,} read from cache)" if cached else "")
+                               + f" · {u.get('output', 0):,} output tokens.", st["small"]))
 
     # ---- 5. appendix ----
     story += [PageBreak(), Paragraph("Appendix A — evidence packet", st["h1"]),

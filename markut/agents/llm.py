@@ -17,7 +17,9 @@ from markut import config
 
 client = Anthropic()
 
-TOKENS = {"input": 0, "output": 0, "calls": 0}
+# input = uncached input tokens; cache_write/cache_read = the evidence prefix
+# written once per run (1.25x price) and read on every later call (0.1x).
+TOKENS = {"input": 0, "output": 0, "calls": 0, "cache_write": 0, "cache_read": 0}
 # stop_reason of the most recent successful call ("end_turn" | "max_tokens" |
 # ...). WHY a module global: the notebook-era nodes read call_claude's string
 # return; exposing the stop reason beside it lets bull/bear detect a reply cut
@@ -29,8 +31,19 @@ class ModelRefusal(RuntimeError):
     """The model declined the request (stop_reason == "refusal")."""
 
 
-def _request_kwargs(system_prompt: str, user_content: str, max_tokens: int, schema: dict = None) -> dict:
-    kwargs = {"model": config.MODEL_NAME, "max_tokens": max_tokens, "system": system_prompt,
+def _request_kwargs(system_prompt: str, user_content: str, max_tokens: int, schema: dict = None,
+                    cached_prefix: str = None) -> dict:
+    # PROMPT CACHING (cost fix after run #6): the evidence packet is identical
+    # for every call of a debate, so it goes FIRST in the system blocks with a
+    # cache marker; the agent's role prompt follows. Render order is tools ->
+    # system -> messages, so bull, bear, judge and governor all share one
+    # cached prefix — one write per run, reads at a tenth of the price after.
+    if cached_prefix:
+        system = [{"type": "text", "text": cached_prefix, "cache_control": {"type": "ephemeral"}},
+                  {"type": "text", "text": system_prompt}]
+    else:
+        system = system_prompt
+    kwargs = {"model": config.MODEL_NAME, "max_tokens": max_tokens, "system": system,
               "messages": [{"role": "user", "content": user_content}]}
     if schema is not None:
         # structured output: the API guarantees the text block is JSON valid
@@ -50,7 +63,8 @@ def _text_of(response) -> str:
     return "".join(block.text for block in response.content if getattr(block, "type", "") == "text")
 
 
-def call_claude(system_prompt: str, user_content: str, max_tokens: int = 1000, schema: dict = None) -> str:
+def call_claude(system_prompt: str, user_content: str, max_tokens: int = 1000, schema: dict = None,
+                cached_prefix: str = None) -> str:
     # HARD BACKSTOP (execution guardrail, belt-and-suspenders): even if graph
     # routing somehow kept looping past the soft budget check in
     # should_continue, no call may START once spend reaches 2x TOKEN_BUDGET.
@@ -58,7 +72,7 @@ def call_claude(system_prompt: str, user_content: str, max_tokens: int = 1000, s
     # less than an unbounded one. TOKEN_BUDGET lives in the RUN CONFIGURATION
     # cell; the name resolves at call time, and every real call happens after
     # that cell has run.
-    spent = TOKENS["input"] + TOKENS["output"]
+    spent = TOKENS["input"] + TOKENS["output"] + TOKENS["cache_write"] + TOKENS["cache_read"]
     if spent >= 2 * config.TOKEN_BUDGET:
         raise RuntimeError(
             f"call_claude hard-stop: {spent:,} tokens spent >= 2x TOKEN_BUDGET ({config.TOKEN_BUDGET:,})")
@@ -69,11 +83,13 @@ def call_claude(system_prompt: str, user_content: str, max_tokens: int = 1000, s
     last_error = None
     for attempt in range(2):
         try:
-            response = client.messages.create(**_request_kwargs(system_prompt, user_content, max_tokens, schema))
+            response = client.messages.create(**_request_kwargs(system_prompt, user_content, max_tokens, schema, cached_prefix))
             # WHY: only count usage on SUCCESS, so a failed+retried call isn't
             # double-billed in our totals. usage is on the response object.
             TOKENS["input"] += response.usage.input_tokens
             TOKENS["output"] += response.usage.output_tokens
+            TOKENS["cache_write"] += getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+            TOKENS["cache_read"] += getattr(response.usage, "cache_read_input_tokens", 0) or 0
             TOKENS["calls"] += 1
             global LAST_STOP_REASON
             LAST_STOP_REASON = getattr(response, "stop_reason", "end_turn") or "end_turn"
@@ -103,6 +119,5 @@ EVIDENCE = """
 def reset():
     # mirrors the notebook run cell: zero the accumulator before app.invoke
     # so the USAGE line reflects only the current run
-    TOKENS["input"] = 0
-    TOKENS["output"] = 0
-    TOKENS["calls"] = 0
+    for k in TOKENS:
+        TOKENS[k] = 0

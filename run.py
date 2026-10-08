@@ -45,8 +45,10 @@ def main():
     print("=" * 60)
     print("FINAL VERDICT:\n", review.get("verdict", "(no governed verdict — see error above)"))
     print("=" * 60)
+    cached = (usage.get("cache_read") or 0) + (usage.get("cache_write") or 0)
     print(f"USAGE: {usage.get('calls', 0)} API calls  |  "
-          f"input tokens: {usage.get('input', 0)}  |  output tokens: {usage.get('output', 0)}")
+          f"input tokens: {usage.get('input', 0) + cached} ({usage.get('cache_read') or 0} read from cache, "
+          f"{usage.get('cache_write') or 0} written)  |  output tokens: {usage.get('output', 0)}")
 
     if not args.no_log:
         run_id = store.record_run(events, mode="cli")

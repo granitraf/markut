@@ -80,7 +80,8 @@ def review_node(state: DebateState) -> dict:
     # Execution-layer bookkeeping lands here: conditional-edge functions
     # cannot write state in LangGraph, so the budget flag is RECORDED by the
     # node every exit path is guaranteed to reach.
-    budget_exceeded = llm.TOKENS["input"] + llm.TOKENS["output"] >= config.TOKEN_BUDGET
+    budget_exceeded = (llm.TOKENS["input"] + llm.TOKENS["output"] + llm.TOKENS.get("cache_write", 0)
+                       + llm.TOKENS.get("cache_read", 0)) >= config.TOKEN_BUDGET
 
     claims = extract_numeric_claims(verdict)
     flagged = [c for c in claims if trace_claim(c, evidence) == "FLAGGED"]
@@ -125,6 +126,9 @@ def review_node(state: DebateState) -> dict:
     # it, not a memory test.
     json_skeleton = prompts.REVIEW_JSON_SKELETON
     system_prompt = prompts.REVIEW_SYSTEM_PROMPT
+    from markut.agents.nodes import evidence_prefix, split_addendum
+    _addendum = split_addendum(evidence)[1]
+    _prefix = evidence_prefix(evidence)
     user_content = (
         f"YOUR VERDICT:\n{verdict}\n\n"
         "FLAGGED NUMBERS (no direct evidence anchor found):\n"
@@ -137,11 +141,12 @@ def review_node(state: DebateState) -> dict:
         + "\n\nSCENARIO ARITHMETIC CHECK (recomputed from your own numbers — the stated direction does not "
           "follow; fix the direction, use a different multiple from the evidence, or drop the scenario):\n"
         + ("\n".join(f"- {f['reason']}" for f in scenarios) or "- (none)")
-        + f"\n\nEVIDENCE PACKET (the only permissible source of numbers):\n{evidence}"
+        + "\n\nThe EVIDENCE PACKET (the only permissible source of numbers) is in your system context above."
+        + (("\n\n" + _addendum) if _addendum else "")
     )
 
     revision = None
-    raw = llm.call_claude(system_prompt, user_content, max_tokens=2000, schema=REVIEW_SCHEMA)
+    raw = llm.call_claude(system_prompt, user_content, max_tokens=2000, schema=REVIEW_SCHEMA, cached_prefix=_prefix)
     try:
         revision = parse_review_json(raw)
     except Exception as first_error:
@@ -164,7 +169,7 @@ def review_node(state: DebateState) -> dict:
         )
         raw_retry = ""  # pre-set so the except can print it even if call_claude raises
         try:
-            raw_retry = llm.call_claude(system_prompt, retry_content, max_tokens=2000, schema=REVIEW_SCHEMA)
+            raw_retry = llm.call_claude(system_prompt, retry_content, max_tokens=2000, schema=REVIEW_SCHEMA, cached_prefix=_prefix)
             revision = parse_review_json(raw_retry)
         except Exception as second_error:
             print(f"REVIEW: retry also failed ({second_error}); failing CLOSED — "

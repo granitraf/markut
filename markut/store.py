@@ -221,7 +221,12 @@ def summarize(events: list) -> dict:
         "claims": stats.get("claims"), "cited": stats.get("cited"), "flagged": stats.get("flagged"),
         "derived": stats.get("derived"), "labeled": stats.get("labeled"), "annotated": stats.get("annotated"),
         "review_status": stats.get("status"),
-        "calls": usage.get("calls"), "input_tokens": usage.get("input"), "output_tokens": usage.get("output"),
+        # input_tokens = every input token the run sent (uncached + cache write + cache read);
+        # the done event keeps the split
+        "calls": usage.get("calls"),
+        "input_tokens": (None if usage.get("input") is None else
+                         usage.get("input", 0) + (usage.get("cache_write") or 0) + (usage.get("cache_read") or 0)),
+        "output_tokens": usage.get("output"),
         "final_verdict": review.get("verdict") or (judges[-1]["verdict"] if judges else None),
         "evidence": evidence,
         "note": start.get("note") or "",

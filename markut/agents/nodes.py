@@ -5,8 +5,24 @@ from markut import config
 from markut.agents import llm, prompts
 from markut.agents.schemas import CLAIM_REVIEW_SCHEMA, JUDGE_SCHEMA
 from markut.agents.state import DebateState
-from markut.guardrails.parsing import parse_judge_json
+from markut.guardrails.parsing import parse_judge_json, salvage_judge_json
 from markut.guardrails.tracer import trim_to_sentence
+
+ADDENDUM_MARK = "\n\n[FILINGS ADDENDUM"
+
+
+def split_addendum(evidence: str) -> tuple:
+    """(base packet, addendum-or-"") — the base is byte-identical for every
+    call of a run and is what gets cached; the addendum (added at claim
+    review) rides in the user turn so it never breaks the cached prefix."""
+    text = evidence or ""
+    i = text.find(ADDENDUM_MARK)
+    return (text, "") if i < 0 else (text[:i], text[i + 2:])
+
+
+def evidence_prefix(evidence: str) -> str:
+    base, _ = split_addendum(evidence)
+    return "EVIDENCE PACKET (the exact source material every agent in this debate sees):\n" + base
 from markut.evidence.news import (NEWS_TARGET_MAX_CLAIMS, get_related_leads,
     get_targeted_news_evidence, parse_news_review_json)
 
@@ -51,12 +67,13 @@ def research_node(state: DebateState) -> dict:
     from markut.mcp.client import call_evidence_tools
     return {"evidence": call_evidence_tools(state["ticker"])}
 
-def complete_argument(system_prompt: str, user_content: str, label: str) -> str:
+def complete_argument(system_prompt: str, user_content: str, label: str, cached_prefix: str = None) -> str:
     """One analyst turn that NEVER hands the judge a half-sentence.
     AUDIT FIX (run #2): check stop_reason; on max_tokens regenerate once with
     an explicit word budget and a larger cap; if it still overruns, trim to the
     last complete sentence and say so inline."""
-    case = llm.call_claude(system_prompt, user_content, max_tokens=config.ARGUMENT_MAX_TOKENS)
+    case = llm.call_claude(system_prompt, user_content, max_tokens=config.ARGUMENT_MAX_TOKENS,
+                           cached_prefix=cached_prefix)
     if llm.LAST_STOP_REASON != "max_tokens":
         return case
     print(f"{label}: reply hit the {config.ARGUMENT_MAX_TOKENS}-token cap — regenerating with a "
@@ -64,7 +81,8 @@ def complete_argument(system_prompt: str, user_content: str, label: str) -> str:
     budgeted = (user_content + f"\n\nHARD LENGTH LIMIT: the entire case must be under "
                 f"{config.ARGUMENT_WORD_BUDGET} words. Make at most 5 points, each one short paragraph. "
                 "Finish every sentence — an unfinished case is discarded.")
-    case = llm.call_claude(system_prompt, budgeted, max_tokens=config.ARGUMENT_RETRY_MAX_TOKENS)
+    case = llm.call_claude(system_prompt, budgeted, max_tokens=config.ARGUMENT_RETRY_MAX_TOKENS,
+                           cached_prefix=cached_prefix)
     if llm.LAST_STOP_REASON != "max_tokens":
         return case
     print(f"{label}: still truncated after the retry — trimming to the last complete sentence")
@@ -81,8 +99,10 @@ def bull_node(state: DebateState) -> dict:
             "Directly rebut the Bear's strongest points wherever the evidence allows."
         )
     system_prompt = prompts.BULL_SYSTEM_PROMPT
-    user_content = f"Ticker: {state['ticker']}\n\nEvidence:\n{state['evidence']}{rebuttal}"
-    case = complete_argument(system_prompt, user_content, f"BULL  (round {round_num})")
+    user_content = (f"Ticker: {state['ticker']}\n\nThe EVIDENCE PACKET is in your system context above; "
+                    f"ground every claim in it.{rebuttal}")
+    case = complete_argument(system_prompt, user_content, f"BULL  (round {round_num})",
+                             cached_prefix=evidence_prefix(state["evidence"]))
     return {"bull_case": case, "bull_history": [case]}
 
 def bear_node(state: DebateState) -> dict:
@@ -95,8 +115,10 @@ def bear_node(state: DebateState) -> dict:
             "Directly rebut the Bull's strongest points wherever the evidence allows."
         )
     system_prompt = prompts.BEAR_SYSTEM_PROMPT
-    user_content = f"Ticker: {state['ticker']}\n\nEvidence:\n{state['evidence']}{rebuttal}"
-    case = complete_argument(system_prompt, user_content, f"BEAR  (round {round_num})")
+    user_content = (f"Ticker: {state['ticker']}\n\nThe EVIDENCE PACKET is in your system context above; "
+                    f"ground every claim in it.{rebuttal}")
+    case = complete_argument(system_prompt, user_content, f"BEAR  (round {round_num})",
+                             cached_prefix=evidence_prefix(state["evidence"]))
     return {"bear_case": case, "bear_history": [case]}
 
 def judge_node(state: DebateState) -> dict:
@@ -118,55 +140,74 @@ def judge_node(state: DebateState) -> dict:
         f"Ticker: {state['ticker']}\n\n"
         # WHY (grounded arbitration): the judge gets the SAME evidence packet the
         # debaters saw, so it can fact-check both sides' claims against the source
-        # material instead of taking the analysts' word for them — otherwise a
-        # confidently-worded hallucination can win the debate. COST: the packet is
-        # ~3k tokens and the judge runs EVERY round, so this adds ~3k input tokens
-        # x rounds (~9k on a 3-round debate). Accepted deliberately (2026-07-15):
-        # grounding the verdict is the point of having a judge at all.
-        f"EVIDENCE PACKET (the exact source material both analysts saw):\n"
-        f"{state['evidence']}\n\n"
+        # material instead of taking the analysts' word for them. The packet now
+        # rides in the CACHED system prefix (one write per run, cheap reads), so
+        # giving it to the judge every round no longer costs ~3k fresh tokens.
+        "The EVIDENCE PACKET (the exact source material both analysts saw) is in your system context above.\n\n"
         f"FULL DEBATE HISTORY (all rounds so far):\n{format_history(state)}\n\n"
         f"Latest Bull case:\n{state['bull_case']}\n\n"
         f"Latest Bear case:\n{state['bear_case']}\n\n"
         f"Rounds completed so far (including this one): {new_round}"
     )
+    prefix = evidence_prefix(state["evidence"])
 
-    # WHY 2000 (was 1500): unsupported_claims adds a whole list to the JSON, and a
-    # truncated response is unparseable — it burns a full corrective retry. Headroom
-    # is cheap; max_tokens is a cap, not a target.
     # AUDIT FIX (run #2): the schema makes the SHAPE a guarantee; the parser
-    # still checks substance and the one corrective retry stays as the net.
-    raw = llm.call_claude(system_prompt, user_content, max_tokens=2000, schema=JUDGE_SCHEMA)
+    # still checks substance. RUN #6 FIX: a reply cut off at the output cap is
+    # not malformed JSON to "repair" — it is too long. So: a larger cap
+    # (config.JUDGE_MAX_TOKENS), length limits in the prompt, and on
+    # max_tokens a SHORTER retry; the JSON-repair retry is kept for genuinely
+    # invalid replies. If both fail, salvage the completed fields and SAY the
+    # reply was truncated — never pass raw JSON on as the verdict.
+    raw = llm.call_claude(system_prompt, user_content, max_tokens=config.JUDGE_MAX_TOKENS,
+                          schema=JUDGE_SCHEMA, cached_prefix=prefix)
+    truncated_first = llm.LAST_STOP_REASON == "max_tokens"
+    decision = None
     try:
+        if truncated_first:
+            raise ValueError("reply cut off at the output cap")
         decision = parse_judge_json(raw)
     except Exception as first_error:
-        # WHY (corrective retry): one bad JSON response is usually fixable by showing
-        # the model its own invalid output and re-demanding pure JSON. We do this ONCE
-        # to avoid burning tokens/latency on repeated failures.
-        print(f"JUDGE: JSON parse failed ({first_error}); doing one corrective retry.")
+        print(f"JUDGE: {'reply truncated' if truncated_first else f'JSON parse failed ({first_error})'}; "
+              f"doing one {'shorter' if truncated_first else 'corrective'} retry.")
         print("JUDGE DEBUG raw reply:", (raw or "")[:400])
-        retry_user_content = (
-            user_content
-            + "\n\nYour previous response was NOT valid JSON:\n"
-            + raw
-            + "\n\nRespond again with ONLY the JSON object described, and nothing else."
-        )
-        raw_retry = llm.call_claude(system_prompt, retry_user_content, max_tokens=2000, schema=JUDGE_SCHEMA)
+        if truncated_first:
+            retry_user_content = (
+                user_content
+                + "\n\nYour previous reply exceeded the output limit and was cut off before the JSON closed. "
+                  "Reply again MUCH SHORTER: each strongest point under 40 words, reasoning under 80 words, "
+                  "at most 4 unsupported_claims of one short sentence each, verdict under 250 words including "
+                  "its three closing parts. Finish the JSON.")
+        else:
+            retry_user_content = (
+                user_content
+                + "\n\nYour previous response was NOT valid JSON:\n"
+                + raw
+                + "\n\nRespond again with ONLY the JSON object described, and nothing else."
+            )
+        raw_retry = llm.call_claude(system_prompt, retry_user_content, max_tokens=config.JUDGE_MAX_TOKENS,
+                                    schema=JUDGE_SCHEMA, cached_prefix=prefix)
         try:
+            if llm.LAST_STOP_REASON == "max_tokens":
+                raise ValueError("retry also cut off at the output cap")
             decision = parse_judge_json(raw_retry)
         except Exception as second_error:
+            print(f"JUDGE: retry also failed ({second_error}); salvaging the completed fields.")
             print("JUDGE DEBUG raw retry reply:", (raw_retry or "")[:400])
-            # WHY (fail closed): if the judge still won't produce parseable JSON, we
-            # must NOT keep looping blindly. We force converged=True so the graph
-            # terminates, and stash the raw text as the verdict so nothing is lost.
-            print(f"JUDGE: retry also failed ({second_error}); failing CLOSED to terminate.")
+            # WHY salvage instead of the old "fail closed with converged=True":
+            # the round cap and the token budget already guarantee termination,
+            # so convergence can come only from the judge's actual ruling. What
+            # the judge DID write (strongest points, flagged claims, most of the
+            # verdict) is kept and labeled truncated; nothing is invented.
+            salvaged = salvage_judge_json(raw_retry) or salvage_judge_json(raw)
             decision = {
-                "bull_strongest": "",
-                "bear_strongest": "",
-                "unsupported_claims": [],
-                "reasoning": "Judge failed to return valid JSON twice; failing closed.",
-                "verdict": raw_retry,
-                "converged": True,
+                "bull_strongest": salvaged.get("bull_strongest", ""),
+                "bear_strongest": salvaged.get("bear_strongest", ""),
+                "unsupported_claims": salvaged.get("unsupported_claims", []),
+                "reasoning": (salvaged.get("reasoning") or "")
+                             + " [Judge reply was cut off at the output cap twice; fields recovered from the partial reply.]",
+                "verdict": salvaged.get("verdict") or "[Judge reply truncated twice — no verdict text was recovered for this round.]",
+                "converged": bool(salvaged.get("converged", False)),
+                "truncated": True,
             }
 
     return {
@@ -255,12 +296,15 @@ def news_verify_node(state: DebateState) -> dict:
         f"ORIGINAL VERDICT:\n{state['verdict']}\n\n"
         "UNSUPPORTED CLAIMS (as flagged by the judge):\n"
         + "\n".join(f"- {claim}" for claim in remaining)
-        + f"\n\nEVIDENCE PACKET:\n{evidence}"
+        + "\n\nThe EVIDENCE PACKET is in your system context above."
+        + (("\n\n" + split_addendum(evidence)[1]) if split_addendum(evidence)[1] else "")
     )
+    prefix = evidence_prefix(evidence)
     # AUDIT FIX (run #2): every claim came back "invalid JSON". Shape is now
     # schema-enforced; one repair retry shows the model its own reply and the
     # exact validator error; the raw reply is logged on every failure.
-    raw = llm.call_claude(system_prompt, user_content, max_tokens=1400, schema=CLAIM_REVIEW_SCHEMA)
+    raw = llm.call_claude(system_prompt, user_content, max_tokens=1400, schema=CLAIM_REVIEW_SCHEMA,
+                          cached_prefix=prefix)
     verification = None
     try:
         verification = parse_news_review_json(raw)
@@ -273,7 +317,7 @@ def news_verify_node(state: DebateState) -> dict:
                 user_content + "\n\nYour previous response FAILED validation with this exact error:\n  "
                 + str(first_error) + "\n\nYour previous response was:\n" + (raw or "")
                 + "\n\nFix exactly that problem and respond again with the JSON object only.",
-                max_tokens=1400, schema=CLAIM_REVIEW_SCHEMA)
+                max_tokens=1400, schema=CLAIM_REVIEW_SCHEMA, cached_prefix=prefix)
             verification = parse_news_review_json(raw_retry)
         except Exception as e:
             print(f"CLAIM REVIEW: repair retry also failed ({e}); preserving verdict and failing unresolved.")

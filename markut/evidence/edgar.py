@@ -415,7 +415,7 @@ def extract_10k_business(html: str) -> str:
     return item_1 if len(item_1) >= 500 else "[section unavailable: Item 1 (Business) not located in this 10-K]"
 
 
-def business_overview(item_1_text: str, char_limit: int = 1500) -> str:
+def business_overview(item_1_text: str, char_limit: int = 1000) -> str:
     # PURE. The opening paragraphs of Item 1 — the company's own description of
     # its business — cut at a sentence boundary. Deterministic (no search): the
     # overview is always the head of the section.

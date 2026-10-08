@@ -67,9 +67,12 @@ DEFAULT_MAX_ROUNDS = 2
 # cap and reached the judge mid-sentence). First attempt at ARGUMENT_MAX_TOKENS;
 # a reply that stops on max_tokens is regenerated ONCE with a word budget and a
 # larger cap; a second truncation is trimmed to the last complete sentence.
-ARGUMENT_MAX_TOKENS = 1000
+ARGUMENT_MAX_TOKENS = 1500   # was 1000: with the word budget in the base prompt, a regeneration is now the exception
 ARGUMENT_RETRY_MAX_TOKENS = 1600
 ARGUMENT_WORD_BUDGET = 450
+# judge reply cap (run #6: the checklist + closing sections overran 2000 and the
+# JSON was cut mid-string twice). Length limits live in the prompt; the cap is headroom.
+JUDGE_MAX_TOKENS = 4000
 
 # peer comparison for the [VALUATION] block (configurable per ticker; a ticker
 # with no entry gets no peer rows, never a guess)

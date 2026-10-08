@@ -49,7 +49,7 @@ NEWS_BASELINE_DAYS = 30  # AUDIT FIX (run #2): 14 days missed the week's biggest
 # Selection stops early if the running estimate would blow the cap, so 9 is a
 # ceiling, not a promise.
 NEWS_BASELINE_MAX = 9
-NEWS_BASELINE_TOKEN_CAP = 1200
+NEWS_BASELINE_TOKEN_CAP = 1000  # trimmed with the 30-day window: materiality ranking means fewer, better stories
 # Snippet mining thresholds — a description only earns packet tokens when it
 # says meaningfully MORE than the headline (see derive_snippet).
 NEWS_SNIPPET_MIN_EXTRA = 40

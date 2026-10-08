@@ -46,7 +46,6 @@ def format_valuation_lines(info: dict, estimates: dict, peers: dict, current_fy=
             lines.append(f"- {label}: {value}  [source: {source}]")
 
     add("EV/EBITDA (TTM)", fmt_ratio(_num(info.get("enterpriseToEbitda"))))
-    add("EV/Revenue (TTM)", fmt_ratio(_num(info.get("enterpriseToRevenue"))))
     mc, fcf = _num(info.get("marketCap")), _num(info.get("freeCashflow"))
     if mc and fcf is not None:
         add("FCF yield (TTM FCF / market cap)", fmt_pct(fcf / mc), "computed")
@@ -99,7 +98,7 @@ def format_valuation_lines(info: dict, estimates: dict, peers: dict, current_fy=
                 implied = eps * m
                 cells.append(f"{name} {m:.1f}x = {fmt_price(implied)} ({(implied / price - 1) * 100:+.1f}% vs price)")
             lines.append(f"- Implied price from {label}{fy} consensus EPS {fmt_price(eps)} (non-GAAP): " + " | ".join(cells) + "  [source: computed]")
-            if peer_median is not None:
+            if peer_median is not None and key == "+1y":   # one peer-median row (next FY) is enough
                 implied = eps * peer_median
                 lines.append(f"- Implied price from {label}{fy} EPS at the peer median {peer_median:.1f}x: {fmt_price(implied)} "
                              f"({(implied / price - 1) * 100:+.1f}% vs price)  [source: computed]")

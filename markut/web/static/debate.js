@@ -177,7 +177,7 @@ window.Markut = (function () {
           if (d.reasoning) body += `<details class="pt"><summary>judge's reasoning</summary><p class="md">${highlightNums(esc(d.reasoning))}</p></details>`;
           if (d.verdict) body += `<details class="pt"><summary>interim verdict (before review)</summary><div class="verdict">${verdictHtml(d.verdict)}</div></details>`;
         }
-        return card("judge", `<h3><span class="who">judge</span> ${roundTag(d)} <span class="pill ${d.converged ? "yes" : ""}">${d.converged ? "converged" : "not converged"}</span></h3>${body}`);
+        return card("judge", `<h3><span class="who">judge</span> ${roundTag(d)} <span class="pill ${d.converged ? "yes" : ""}">${d.converged ? "converged" : "not converged"}</span>${d.truncated ? ' <span class="pill live" title="the judge reply hit the output cap twice; fields recovered from the partial reply">reply truncated</span>' : ""}</h3>${body}`);
       },
       route(d) {
         card("route", (d.decision === "continue" ? "↻ " : "→ ") + esc(d.reason));
@@ -206,7 +206,8 @@ window.Markut = (function () {
       done(d) {
         clearPending();
         const u = d.usage || {};
-        card("route", `done — ${d.rounds} round(s), ${d.converged ? "converged" : "not converged"}. ${num(u.calls)} model calls · ${num(u.input)} input tokens · ${num(u.output)} output tokens.`);
+        const cached = (u.cache_read || 0) + (u.cache_write || 0);
+        card("route", `done — ${d.rounds} round(s), ${d.converged ? "converged" : "not converged"}. ${num(u.calls)} model calls · ${num((u.input || 0) + cached)} input tokens${cached ? ` (${num(u.cache_read || 0)} read from cache)` : ""} · ${num(u.output)} output tokens.`);
         if (hooks.onEnd) hooks.onEnd("done", d);
       },
       saved(d) { if (hooks.onSaved) hooks.onSaved(d); },

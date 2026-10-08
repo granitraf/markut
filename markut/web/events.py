@@ -93,8 +93,10 @@ def review_stats(pre_verdict: str, evidence: str, final_verdict: str, report: di
 
 
 def usage() -> dict:
-    return {"calls": llm.TOKENS["calls"], "input": llm.TOKENS["input"],
-            "output": llm.TOKENS["output"]}
+    # input = uncached; cached reads/writes reported beside it so a cost line
+    # can say "N input tokens (M served from cache)"
+    return {"calls": llm.TOKENS["calls"], "input": llm.TOKENS["input"], "output": llm.TOKENS["output"],
+            "cache_write": llm.TOKENS.get("cache_write", 0), "cache_read": llm.TOKENS.get("cache_read", 0)}
 
 
 def event_for(node: str, update: dict, before: dict, after: dict) -> dict:

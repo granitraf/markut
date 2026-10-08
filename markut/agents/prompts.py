@@ -111,6 +111,8 @@ BASELINE_SYSTEM_PROMPT = (
 
 # ---------------- AUDIT PASS (run #2): live prompts = notebook text + checklist/format ----------------
 ANALYST_ADDENDUM = (
+    " LENGTH: the entire case must stay under 450 words — at most 5 points, each one short "
+    "paragraph; finish every sentence (an unfinished case is discarded)."
     " Read the [FILINGS] 'Business overview' and the [VALUATION] block first: never call a "
     "company's own product, or one of its customers, a competitor; state every growth rate "
     "with its period (quarter vs fiscal year) and every EPS with its basis (GAAP vs non-GAAP) "
@@ -135,6 +137,9 @@ JUDGE_CHECKLIST = (
     "basis it uses; say which.\n"
     "  5. Implied prices: use the [VALUATION] scenario table (consensus EPS × stated multiples) "
     "and cite its rows; do not compute your own multiple × EPS.\n"
+    "\nLENGTH LIMITS (hard — a reply that overruns is cut off and discarded): bull_strongest and "
+    "bear_strongest under 60 words each; reasoning under 120 words; unsupported_claims at most 6 "
+    "entries of one sentence each; verdict under 350 words INCLUDING the three closing parts.\n"
     "\nVERDICT FORMAT: keep research framing (findings, scenarios, sensitivities — never "
     "instructions to investors) and END the verdict with three short labeled parts:\n"
     "  'Debates that move the stock:' the 2-3 unresolved questions that actually drive the "

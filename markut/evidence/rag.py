@@ -527,7 +527,7 @@ THEMES = [
       "backstop commitment and residual value guarantee",
       "unconditional purchase obligations and contractual commitments",
       "off-balance-sheet arrangements and contingent liabilities"],
-     ["press release", "Outlook", "Item 2 (10-Q MD&A)", "Commitments (10-Q note)", "Item 7"], 3, 600),
+     ["press release", "Outlook", "Commitments (10-Q note)"], 2, 400),   # trimmed after run #6 (was 3 quotes/600 over MD&A too)
 ]
 
 # DETERMINISTIC blocks: (title, section name in the index, token cap).

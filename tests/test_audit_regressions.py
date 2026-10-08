@@ -28,8 +28,9 @@ def stub_llm(monkeypatch):
     def install(replies, stop_reasons=None):
         calls = []   # a fresh log per install, so a second script starts at zero
         replies, stops = list(replies), list(stop_reasons or [])
-        def fake(system_prompt, user_content, max_tokens=1000, schema=None):
-            calls.append({"system": system_prompt, "user": user_content, "max_tokens": max_tokens, "schema": schema})
+        def fake(system_prompt, user_content, max_tokens=1000, schema=None, cached_prefix=None):
+            calls.append({"system": system_prompt, "user": user_content, "max_tokens": max_tokens, "schema": schema,
+                          "cached_prefix": cached_prefix})
             llm.LAST_STOP_REASON = stops.pop(0) if stops else "end_turn"
             return replies.pop(0) if replies else "{}"
         monkeypatch.setattr(llm, "call_claude", fake)
@@ -378,3 +379,103 @@ def test_judge_prompt_has_checklist_and_verdict_format():
     assert "do not compute your own multiple" in j
     assert prompts.BULL_SYSTEM_PROMPT.endswith(prompts.ANALYST_ADDENDUM) and "never call a" in prompts.BEAR_SYSTEM_PROMPT
     assert "[FILINGS ADDENDUM" in prompts.NEWS_VERIFY_SYSTEM_PROMPT
+
+
+# ================================================================ run #6 (AVGO, 2026-10-08): truncated judge, over-firing labels, cost
+from markut.guardrails.parsing import salvage_judge_json
+
+_FIX6 = os.path.join(os.path.dirname(__file__), "fixtures", "avgo_run6_2026-10-08.json")
+RUN6 = json.load(open(_FIX6, encoding="utf-8"))["events"]
+EVIDENCE6 = next(e for e in RUN6 if e["event"] == "research")["data"]["evidence"]
+JUDGE6_RAW = next(e for e in RUN6 if e["event"] == "judge")["data"]["verdict"]   # the raw cut-off JSON the old path passed on
+VERDICT6 = next(e for e in RUN6 if e["event"] == "review")["data"]["verdict"]
+
+
+def test_run6_salvage_recovers_the_truncated_judge_reply():
+    out = salvage_judge_json(JUDGE6_RAW)
+    assert out["truncated"] is True
+    assert out["bull_strongest"].startswith("Reported momentum is strong") and out["bear_strongest"].startswith("The 19.4x forward P/E")
+    assert out["verdict"].startswith("Research findings:") and out["verdict"].endswith("[truncated]")
+    assert len(out["unsupported_claims"]) == 10 and "converged" not in out        # cut before converged was written
+    assert salvage_judge_json("no json here") == {} and salvage_judge_json('{"verdict": "v", "converged": true}') == {"verdict": "v", "converged": True}
+
+
+def test_run6_label_check_no_longer_over_fires():
+    # the old classifier flagged 21 numbers in this text (5 survived revision); none are real mislabels
+    assert tracer.find_mislabeled(JUDGE6_RAW, EVIDENCE6) == []
+    assert tracer.find_mislabeled(VERDICT6, EVIDENCE6) == []
+    # the three patterns that caused them, individually
+    assert tracer.find_mislabeled("On FY2027 consensus EPS of $19.39 the stock trades at 19.4x.", EVIDENCE6) == []     # forward ⟂ annual
+    assert tracer.find_mislabeled("Reported fundamentals (85.5% MRQ revenue growth, 75.52% gross margin, $30.6B TTM FCF, $34.8B Q4 guide) support execution", EVIDENCE6) == []  # nearest marker, clause-scoped
+    assert tracer.find_mislabeled("given TTM GAAP profit margin of 42.94% and FY2025 net income growth of +292.3%", EVIDENCE6) == []    # modifier before the number wins
+    # and the real mislabel is still caught
+    assert [f["claim"] for f in tracer.find_mislabeled("Revenue grew 85.5% in fiscal year 2025.", EVIDENCE6)] == ["85.5%"]
+    assert tracer.find_mislabeled("Trailing EPS of $19.39 supports the multiple.", EVIDENCE6)[0]["reason"].endswith("not ttm")
+
+
+def test_judge_truncation_gets_a_shorter_retry_then_salvage(stub_llm):
+    good = json.dumps({"bull_strongest": "b", "bear_strongest": "r", "unsupported_claims": [], "reasoning": "x",
+                       "verdict": "v. Not financial advice.", "converged": False})
+    state = {"ticker": "AVGO", "evidence": EVIDENCE6, "bull_case": "b", "bear_case": "r",
+             "bull_history": ["b"], "bear_history": ["r"], "round": 0, "verdict": ""}
+    # 1. first reply cut off -> the retry asks for a SHORTER reply (not a JSON repair) and succeeds
+    calls = stub_llm([JUDGE6_RAW, good], ["max_tokens", "end_turn"])
+    out = nodes.judge_node(dict(state))
+    assert len(calls) == 2 and "MUCH SHORTER" in calls[1]["user"] and "NOT valid JSON" not in calls[1]["user"]
+    assert calls[0]["max_tokens"] == config.JUDGE_MAX_TOKENS == 4000
+    assert out["converged"] is False and out["judge_decision"]["bull_strongest"] == "b" and "truncated" not in out["judge_decision"]
+    # 2. both replies cut off -> salvage: real strongest points, truncated flag, NO fake convergence, no raw JSON verdict
+    stub_llm([JUDGE6_RAW, JUDGE6_RAW], ["max_tokens", "max_tokens"])
+    out = nodes.judge_node(dict(state))
+    d = out["judge_decision"]
+    assert d["truncated"] is True and out["converged"] is False
+    assert d["bull_strongest"].startswith("Reported momentum") and len(d["unsupported_claims"]) == 10
+    assert out["verdict"].startswith("Research findings:") and not out["verdict"].startswith("{")
+    assert "cut off at the output cap twice" in d["reasoning"]
+
+
+def test_evidence_rides_in_a_cached_system_prefix(stub_llm):
+    calls = stub_llm([json.dumps({"bull_strongest": "b", "bear_strongest": "r", "unsupported_claims": [], "reasoning": "x",
+                                  "verdict": "v. Not financial advice.", "converged": True})])
+    state = {"ticker": "AVGO", "evidence": EVIDENCE6, "bull_case": "b", "bear_case": "r",
+             "bull_history": ["b"], "bear_history": ["r"], "round": 0, "verdict": ""}
+    nodes.judge_node(state)
+    assert calls[0]["cached_prefix"].startswith("EVIDENCE PACKET") and EVIDENCE6 in calls[0]["cached_prefix"]
+    assert EVIDENCE6 not in calls[0]["user"]          # not duplicated in the user turn
+    # the addendum never enters the cached prefix: base stays byte-identical across the run
+    base, add = nodes.split_addendum(EVIDENCE6 + "\n\n[FILINGS ADDENDUM — x]\n- 221%")
+    assert base == EVIDENCE6 and add.startswith("[FILINGS ADDENDUM")
+    assert nodes.evidence_prefix(EVIDENCE6 + "\n\n[FILINGS ADDENDUM — x]") == nodes.evidence_prefix(EVIDENCE6)
+
+
+def test_request_kwargs_cache_control_and_accounting(monkeypatch):
+    kw = llm._request_kwargs("role prompt", "user", 100, None, cached_prefix="EVIDENCE PACKET ...")
+    assert kw["system"][0] == {"type": "text", "text": "EVIDENCE PACKET ...", "cache_control": {"type": "ephemeral"}}
+    assert kw["system"][1] == {"type": "text", "text": "role prompt"}
+    assert llm._request_kwargs("role", "user", 100)["system"] == "role"       # no prefix -> plain string, unchanged
+    # usage accounting keeps cached reads/writes apart from uncached input
+    from types import SimpleNamespace
+    class Fake:
+        def create(self, **k):
+            return SimpleNamespace(content=[SimpleNamespace(type="text", text="ok")], stop_reason="end_turn",
+                                   usage=SimpleNamespace(input_tokens=100, output_tokens=5, cache_creation_input_tokens=7000, cache_read_input_tokens=0))
+    monkeypatch.setattr(llm, "client", SimpleNamespace(messages=Fake()))
+    llm.reset(); llm.call_claude("s", "u", cached_prefix="p")
+    assert llm.TOKENS == {"input": 100, "output": 5, "calls": 1, "cache_write": 7000, "cache_read": 0}
+    from markut import store
+    row = store.summarize([{"event": "start", "data": {"ticker": "X"}},
+                           {"event": "done", "data": {"rounds": 1, "converged": True, "usage": {"calls": 8, "input": 9000, "output": 900, "cache_write": 7000, "cache_read": 49000}}}])
+    assert row["input_tokens"] == 65000 and row["output_tokens"] == 900      # every input token the run sent
+    llm.reset()
+
+
+def test_trims_after_run6():
+    from markut.evidence import rag
+    title, _, _, fence, k, cap = rag.THEMES[2]
+    assert title.startswith("Guidance, commitments") and k == 2 and cap == 400 and "Item 7" not in fence
+    assert config.ARGUMENT_MAX_TOKENS == 1500 and news_mod.NEWS_BASELINE_TOKEN_CAP == 1000
+    assert "under 450 words" in prompts.BULL_SYSTEM_PROMPT and "LENGTH LIMITS" in prompts.JUDGE_SYSTEM_PROMPT
+    text = "\n".join(valuation.format_valuation_lines(
+        {"currentPrice": 100.0, "forwardPE": 20.0, "marketCap": 1e9, "freeCashflow": 5e7},
+        {"0y": {"avg": 4.0}, "+1y": {"avg": 5.0}}, {"A": {"forwardPE": 30.0}}, 2026))
+    assert text.count("at the peer median") == 1 and "EV/Revenue" not in text

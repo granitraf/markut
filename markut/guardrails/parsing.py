@@ -81,3 +81,48 @@ def parse_review_json(text: str) -> dict:
     data["resolutions"] = resolutions
     data["verdict"] = str(data["verdict"])
     return data
+
+
+def salvage_judge_json(text: str) -> dict:
+    """Best-effort recovery of a judge reply cut off mid-JSON (run #6: both
+    replies ended inside a string at the output cap). Completed string fields
+    are recovered whole; the field that was cut keeps its text with a
+    [truncated] marker; `converged` is recovered only if it was written.
+    Returns {} when nothing recognizable is present. Never raises."""
+    raw = (text or "").strip()
+    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```?$", raw, re.DOTALL)
+    if fence:
+        raw = fence.group(1).strip()
+    out = {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    string_keys = ("bull_strongest", "bear_strongest", "reasoning", "verdict")
+    for key in string_keys:
+        m = re.search(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)"' % key, raw)
+        if m:
+            try:
+                out[key] = json.loads('"' + m.group(1) + '"')
+            except Exception:
+                out[key] = m.group(1)
+    # the field the cap landed in: an opening quote with no closing one
+    for key in string_keys:
+        if key in out:
+            continue
+        m = re.search(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)$' % key, raw, re.DOTALL)
+        if m and m.group(1).strip():
+            out[key] = m.group(1).rstrip() + " [truncated]"
+    m = re.search(r'"unsupported_claims"\s*:\s*\[(.*?)\]', raw, re.DOTALL)
+    if m:
+        try:
+            out["unsupported_claims"] = json.loads("[" + m.group(1) + "]")
+        except Exception:
+            out["unsupported_claims"] = [c for c in re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1))]
+    m = re.search(r'"converged"\s*:\s*(true|false)', raw)
+    if m:
+        out["converged"] = (m.group(1) == "true")
+    if out:
+        out["truncated"] = True
+    return out

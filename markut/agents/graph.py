@@ -24,7 +24,8 @@ def should_continue(state: DebateState) -> str:
     # normal done path, so even a budget-killed run exits GOVERNED — with a
     # reviewed, disclaimed verdict. (Conditional-edge functions cannot write
     # state in LangGraph, so review_node is what records budget_exceeded.)
-    spent = llm.TOKENS["input"] + llm.TOKENS["output"]
+    spent = (llm.TOKENS["input"] + llm.TOKENS["output"]
+             + llm.TOKENS.get("cache_write", 0) + llm.TOKENS.get("cache_read", 0))
     if spent >= config.TOKEN_BUDGET:
         print(f"TOKEN BUDGET EXCEEDED — closing debate ({spent:,} >= {config.TOKEN_BUDGET:,} tokens)\n")
         return "done"

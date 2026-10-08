@@ -45,7 +45,7 @@ def test_reads_text_block_not_first_block(monkeypatch):
     assert req["model"] == config.MODEL_NAME == "claude-sonnet-5-5"
     assert req["thinking"] == {"type": "between_tools"} and "output_config" not in req
     assert req["max_tokens"] == 1000 and req["system"] == "sys"
-    assert llm.TOKENS == {"input": 10, "output": 5, "calls": 1}
+    assert llm.TOKENS == {"input": 10, "output": 5, "calls": 1, "cache_write": 0, "cache_read": 0}
 
 
 def test_effort_setting_switches_to_adaptive_thinking(monkeypatch):

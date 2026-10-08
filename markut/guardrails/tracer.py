@@ -175,24 +175,63 @@ def has_disclaimer(text: str) -> bool:
 # downside" passed because both numbers exist, although 46.28 × 8.12 is the
 # current price. Everything below is deterministic and runs offline.
 
-# Period vocabulary. A label or a claim context is classified by the FIRST
-# class whose markers it contains, checked in this order (most specific first).
-PERIOD_CLASSES = [
+# Period vocabulary. Two axes that the first version conflated: the measurement
+# WINDOW (quarter / TTM / fiscal year) and the ORIENTATION (forward estimate).
+# A consensus estimate FOR FY2027 is both "forward" and "annual" — not a
+# conflict — while a quarterly rate presented as a fiscal-year rate is.
+PERIOD_MARKERS = [
     ("quarter", r"\b(mrq|most recent quarter|quarter(?:ly)?|q[1-4](?:\s?fy)?\s?\d{0,4}|three months|three fiscal quarters|fiscal quarter)\b"),
     ("ttm",     r"\b(ttm|trailing(?:[- ]twelve[- ]months)?|last twelve months)\b"),
-    ("forward", r"\b(forward|consensus|estimate[sd]?|expected|next (?:12 months|year|fy)|current fy|next fy|fy\s?\d{4}e)\b"),
-    ("annual",  r"\b(fy\s?\d{2,4}|fiscal (?:year|20\d\d)|annual(?:ly|ized)?|full[- ]year|year ended|for the year)\b"),
+    ("annual",  r"\b(fy\s?\d{2,4}|fiscal (?:year|20\d\d)|annual(?:ly|ized)?|full[- ]year|year ended|for the year|current[- ]fy|next[- ]fy)\b"),
+    ("forward", r"\b(forward|consensus|estimate[sd]?|expected|guidance|guide|outlook|next (?:12 months|year)|fy\s?\d{4}e)\b"),
 ]
-BASIS_CLASSES = [("gaap", r"\bgaap\b(?!\s*-?\s*non)"), ("non-gaap", r"\bnon[- ]gaap\b")]
+# pairs that CANNOT describe the same number; everything else is compatible
+_CONFLICTS = {frozenset(p) for p in (("quarter", "ttm"), ("quarter", "annual"), ("quarter", "forward"),
+                                     ("ttm", "annual"), ("ttm", "forward"))}
+PERIOD_CLASSES = PERIOD_MARKERS   # name kept for callers of the first version
+
+
+def period_markers(text: str) -> list:
+    # PURE. Every period marker in text with its class and position.
+    low = (text or "").lower()
+    found = []
+    for name, pat in PERIOD_MARKERS:
+        for m in re.finditer(pat, low):
+            found.append((name, m.start(), m.end()))
+    return sorted(found, key=lambda t: t[1])
 
 
 def classify_period(text: str) -> str:
-    low = (text or "").lower()
-    # "non-GAAP" contains "gaap"; period classes are independent of basis
-    for name, pat in PERIOD_CLASSES:
-        if re.search(pat, low):
-            return name
-    return ""
+    # first marker by position (labels are short; for claims use nearest_period)
+    found = period_markers(text)
+    return found[0][0] if found else ""
+
+
+def label_periods(label: str) -> set:
+    return {name for name, _, _ in period_markers(label)}
+
+
+def nearest_period(clause: str, start: int, end: int) -> str:
+    # PURE. The period marker that describes the claim inside ITS clause.
+    # English puts the modifier BEFORE the figure ("TTM gross margin of
+    # 42.94%", "FY2025 net income growth of +292.3%"), so the nearest marker
+    # before the number wins; only when nothing precedes it does the nearest
+    # marker after count ("85.5% ... in FY2025", "75.52% TTM gross margin").
+    before, after = None, None
+    for name, a, b in period_markers(clause):
+        if b <= start:
+            d = start - b
+            if before is None or d < before[0]:
+                before = (d, name)
+        elif a >= end:
+            d = a - end
+            if after is None or d < after[0]:
+                after = (d, name)
+        else:
+            return name  # marker overlaps the span itself
+    if before:
+        return before[1]
+    return after[1] if after else ""
 
 
 def classify_basis(text: str) -> str:
@@ -202,6 +241,14 @@ def classify_basis(text: str) -> str:
     if re.search(r"\bgaap\b", low):
         return "gaap"
     return ""
+
+
+def compatible(claim_period: str, label_periods_: set) -> bool:
+    # a claim period is fine if it does not conflict with at least one of the
+    # label's periods (a label can carry two, e.g. "FY2027 consensus")
+    if not claim_period or not label_periods_:
+        return True
+    return any(frozenset((claim_period, lp)) not in _CONFLICTS for lp in label_periods_)
 
 
 def packet_labels(evidence: str) -> dict:
@@ -222,23 +269,31 @@ def packet_labels(evidence: str) -> dict:
     return labels
 
 
-def claim_contexts(text: str, window: int = 90) -> list:
-    # PURE. Each numeric claim with the text around it (same sentence, capped),
-    # so period words like "in FY2025" or "trailing" can be read next to it.
+_CLAUSE_SPLIT = re.compile(r"[;:()\"\[\]]|,\s|\s[—–-]\s")
+
+
+def claim_contexts(text: str) -> list:
+    # PURE. Each numeric claim with the CLAUSE it sits in (bounded by ; : , ( )
+    # quotes, brackets and dashes) so period words from a neighbouring clause —
+    # or the next JSON field — can never be read as describing it.
     out = []
     sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9$(])", text or "")
     for sentence in sentences:
+        bounds = [0] + [m.end() for m in _CLAUSE_SPLIT.finditer(sentence)] + [len(sentence)]
         for m in _CLAIM_RE.finditer(sentence):
             claim = re.sub(r"\s+", " ", m.group(0)).strip()
-            lo, hi = max(0, m.start() - window), min(len(sentence), m.end() + window)
-            out.append({"claim": claim, "context": sentence[lo:hi], "sentence": sentence})
+            lo = max(b for b in bounds if b <= m.start())
+            hi = min(b for b in bounds if b >= m.end()) if any(b >= m.end() for b in bounds) else len(sentence)
+            clause = sentence[lo:hi]
+            out.append({"claim": claim, "context": clause, "sentence": sentence,
+                        "period": nearest_period(clause, m.start() - lo, m.end() - lo)})
     return out
 
 
 def find_mislabeled(verdict: str, evidence: str) -> list:
-    """PURE. Numbers that trace to the packet but under a DIFFERENT period or
-    accounting basis than the verdict asserts. Returns
-    [{"claim","packet_label","packet_period","claim_period","reason"}]."""
+    """PURE. Numbers that trace to the packet but under an INCOMPATIBLE period
+    or accounting basis. Returns [{"claim","packet_label","packet_period",
+    "claim_period","reason","sentence"}]."""
     labels = packet_labels(evidence)
     findings, seen = [], set()
     for item in claim_contexts(verdict):
@@ -246,25 +301,23 @@ def find_mislabeled(verdict: str, evidence: str) -> list:
         key = norm_or_none(claim)
         if key is None or key not in labels or claim.lower() in seen:
             continue
-        claim_period = classify_period(item["context"])
+        claim_period = item["period"]
         claim_basis = classify_basis(item["context"])
-        # a number may appear under several labels (e.g. the same % twice);
-        # it is mislabeled only if NO packet label agrees with the claim
-        periods = {classify_period(l) for l in labels[key]}
-        bases = {classify_basis(l) for l in labels[key]}
         reason = None
-        if claim_period and periods - {""} and claim_period not in periods:
-            packet_period = sorted(periods - {""})[0]
-            reason = (f"{claim} is {packet_period} in the evidence "
-                      f"({labels[key][0]}), not {claim_period}")
-        elif claim_basis and bases - {""} and claim_basis not in bases:
-            packet_basis = sorted(bases - {""})[0]
-            reason = f"{claim} is {packet_basis} in the evidence ({labels[key][0]}), not {claim_basis}"
+        # period: the claim must be compatible with at least ONE label it could come from
+        if claim_period and any(label_periods(l) for l in labels[key]) \
+                and not any(compatible(claim_period, label_periods(l)) for l in labels[key]):
+            packet_period = "/".join(sorted(label_periods(labels[key][0])))
+            reason = f"{claim} is {packet_period} in the evidence ({labels[key][0]}), not {claim_period}"
+        else:
+            bases = {classify_basis(l) for l in labels[key]} - {""}
+            if claim_basis and bases and claim_basis not in bases:
+                reason = f"{claim} is {sorted(bases)[0]} in the evidence ({labels[key][0]}), not {claim_basis}"
         if reason:
             seen.add(claim.lower())
             findings.append({"claim": claim, "packet_label": labels[key][0],
-                             "packet_period": sorted(periods - {""})[0] if periods - {""} else "",
-                             "claim_period": claim_period, "reason": reason})
+                             "packet_period": "/".join(sorted(label_periods(labels[key][0]))),
+                             "claim_period": claim_period, "reason": reason, "sentence": item["sentence"]})
     return findings
 
 
