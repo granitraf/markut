@@ -132,3 +132,36 @@ the run log is in Supabase.
 Production behaviour (`MARKUT_PRODUCTION=1` in the image, or Railway's own
 `RAILWAY_ENVIRONMENT`): binds 0.0.0.0:$PORT, warms the models on startup,
 and the console fails closed without `CONSOLE_PASSWORD`.
+
+## Output-quality audit (run #2, AVGO, 2026-10-06)
+
+An audit of the first live run drove a three-tier pass. Each item has a
+regression test on the stored AVGO run (`tests/test_audit_regressions.py`);
+the LangGraph topology is unchanged.
+
+- **Evidence labels.** Every EPS/P-E line names period and basis (GAAP TTM vs
+  non-GAAP consensus); `revenueGrowth` is labeled MRQ YoY with a separate
+  FY-vs-FY line; consensus EPS by fiscal year; packet-level BASIS/PERIOD notes.
+- **Governor.** Label binding (`MISLABELED` when a number traces under a
+  different period/basis), derived arithmetic recomputed from the cited
+  anchors (`MISCOMPUTED` with the implied value; precision-aware tolerance,
+  which also fixed the "DERIVED but footnoted" bug), and a `SCENARIO CHECK`
+  for multiple × EPS statements whose direction the arithmetic contradicts.
+- **Structured replies.** Judge, claim review and revision use schema-enforced
+  output with one repair retry and raw-reply logging. Bull/bear turns that hit
+  the token cap are regenerated with a word budget, then trimmed to the last
+  complete sentence — a truncated argument never reaches the judge.
+- **Evidence coverage.** 8-K exhibit matcher fixed (Broadcom's `...xex99.htm`
+  release was never indexed, hence the empty guidance block); 10-K Item 1
+  business overview and the 10-Q commitments/contingencies note indexed; an
+  obligations/guidance retrieval theme; newest filing wins duplicated text;
+  claim review corroborates flagged numbers against the filings before the
+  paid re-audit and appends a traceable addendum; news window 30 days ranked
+  by materiality; a market-context block (returns, distance from highs,
+  earnings reaction).
+- **Analytical depth.** A deterministic `[VALUATION]` block (EV/EBITDA, FCF
+  yield, PEG, configurable peers in `config.PEERS`, consensus EPS × multiple
+  bear/base/bull table) that agents cite instead of computing; a judge
+  checklist and a verdict format ending with the debates that move the stock,
+  what would change the view, and the next catalyst. Notebook prompts remain
+  byte-identical as `*_NOTEBOOK` constants; live prompts extend them.
