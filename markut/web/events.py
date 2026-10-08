@@ -89,6 +89,7 @@ def review_stats(pre_verdict: str, evidence: str, final_verdict: str, report: di
         "labeled": sum(1 for r in resolutions if r.get("qualified") and r.get("resolution") == "LABELED"),
         "annotated": (final_verdict or "").count("[UNGROUNDED"),
         "status": report.get("final_status", "unknown"),
+        "sources_unavailable": report.get("sources_unavailable", 0),
     }
 
 

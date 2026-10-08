@@ -12,6 +12,13 @@ def fmp_get_json(endpoint: str, symbol: str, **extra_params):
     key = config.FMP_API_KEY
     params = {"symbol": symbol, "apikey": key, **extra_params}
     response = requests.get(f"{FMP_BASE}/{endpoint}", params=params, timeout=15)
+    # AUDIT (run #9, item 5): FMP answers plan limits with HTTP 402 and a bare
+    # text body; json() then failed with "Expecting value", which told nobody
+    # anything. Name the real reason so the DATA GAPS block can say it.
+    if response.status_code == 402:
+        raise RuntimeError(f"FMP HTTP 402: endpoint '{endpoint}' is not covered by the current FMP subscription")
+    if response.status_code != 200:
+        raise RuntimeError(f"FMP HTTP {response.status_code} on '{endpoint}'")
     return response.json()
 
 
@@ -198,7 +205,7 @@ def format_context_lines(closes: list, info: dict, earnings_dates: list = None, 
     if hi52:
         add("Price vs 52-week high", f"{(last / float(hi52) - 1) * 100:+.1f}% (high {fmt_price(hi52)})", "yfinance/info")
     if all_time_high:
-        add("Price vs all-time high (monthly closes)", f"{(last / float(all_time_high) - 1) * 100:+.1f}% (high {fmt_price(all_time_high)})")
+        add("Price vs all-time high (daily closes)", f"{(last / float(all_time_high) - 1) * 100:+.1f}% (high {fmt_price(all_time_high)})")
     # move around the last earnings report: last close strictly BEFORE the
     # report date to the first close strictly AFTER it (a two-session window,
     # because pre-market and after-close reports land on different sessions)
@@ -212,6 +219,35 @@ def format_context_lines(closes: list, info: dict, earnings_dates: list = None, 
             add(f"Move around last earnings ({d}; close before → first close after)", f"{move:+.1f}%",
                 "yfinance/history+earnings_dates")
     return lines
+
+
+def all_time_high_close(all_closes: list):
+    # PURE. Highest DAILY close on record; None (with a loud log line) if the
+    # series contradicts itself — the all-time high can never be below the
+    # 52-week high close drawn from the same series.
+    if not all_closes:
+        return None
+    ath = max(c for _, c in all_closes)
+    hi52 = max(c for _, c in all_closes[-252:])
+    if ath + 1e-9 < hi52:
+        print(f"MARKET: all-time-high sanity check FAILED (ATH close {ath:.2f} < 52-week high close {hi52:.2f}) — omitting the line")
+        return None
+    return ath
+
+
+def annual_diluted_eps(inc) -> list:
+    # PURE over a yfinance income_stmt frame: [(fiscal-year-end YYYY-MM-DD, diluted EPS)] newest first
+    out = []
+    try:
+        if inc is None or "Diluted EPS" not in inc.index:
+            return out
+        for col in inc.columns:
+            v = inc.loc["Diluted EPS", col]
+            if v == v and v is not None:
+                out.append((col.strftime("%Y-%m-%d") if hasattr(col, "strftime") else str(col)[:10], float(v)))
+    except Exception:
+        return out
+    return out
 
 
 def market_snapshot(ticker: str) -> str:
@@ -239,6 +275,15 @@ def market_snapshot(ticker: str) -> str:
     except Exception as e:
         info = {}
         out.append(f"[info unavailable: {e}]")
+
+    # one daily price series for the run (all-time high, returns, P/E band)
+    try:
+        _full = t.history(period="max", auto_adjust=False)
+        all_closes = [(ts.strftime("%Y-%m-%d"), float(c)) for ts, c in zip(_full.index, _full["Close"]) if c == c] \
+            if _full is not None and len(_full.index) else []
+    except Exception as e:
+        all_closes = []
+        out.append(f"[price history unavailable: {e}]")
 
     # ---- 1 & 2. QUOTE & VALUATION + FUNDAMENTALS (info-derived, pure part) ----
     try:
@@ -304,7 +349,12 @@ def market_snapshot(ticker: str) -> str:
                 cur_fy = datetime.fromtimestamp(float(info["nextFiscalYearEnd"])).year
         except Exception:
             cur_fy = None
-        val = format_valuation_lines(info, est_rows, cur_fy)
+        band_inputs = {}
+        try:
+            band_inputs = {"closes": all_closes, "annual_eps": annual_diluted_eps(t.income_stmt)}
+        except Exception:
+            band_inputs = {}
+        val = format_valuation_lines(info, est_rows, cur_fy, band_inputs)
         if val:
             out.append("")
             out.extend(val)
@@ -320,9 +370,9 @@ def market_snapshot(ticker: str) -> str:
             if day_low is not None and day_high is not None:
                 add_line("Day range", f"{fmt_price(day_low)} / {fmt_price(day_high)}", "FMP/quote")
         elif isinstance(quote, dict):
-            out.append(f"[quote response: {quote}]")
+            out.append(f"[FMP quote section unavailable: {quote}]")
     except Exception as e:
-        out.append(f"[quote section unavailable: {e}]")
+        out.append(f"[FMP quote section unavailable: {e}]")
 
     # FMP adds latest fiscal-year EPS labels to distinguish them from yfinance TTM/forward EPS.
     try:
@@ -334,9 +384,9 @@ def market_snapshot(ticker: str) -> str:
             add_line(f"EPS (latest fiscal year{suffix})", fmt_price(d.get("eps")), "FMP/income-statement")
             add_line(f"EPS diluted (latest fiscal year{suffix})", fmt_price(d.get("epsDiluted")), "FMP/income-statement")
         elif isinstance(income, dict):
-            out.append(f"[income-statement response: {income}]")
+            out.append(f"[FMP income statement section unavailable: {income}]")
     except Exception as e:
-        out.append(f"[income-statement section unavailable: {e}]")
+        out.append(f"[FMP income statement section unavailable: {e}]")
 
     # FMP adds valuation efficiency ratios yfinance does not expose cleanly.
     try:
@@ -347,9 +397,9 @@ def market_snapshot(ticker: str) -> str:
             add_line("Price/FCF (TTM)", fmt_ratio(d.get("priceToFreeCashFlowRatioTTM")), "FMP/ratios")
             add_line("Free cash flow yield (TTM)", fmt_pct(d.get("freeCashFlowYieldTTM")), "FMP/ratios")
         elif isinstance(ratios, dict):
-            out.append(f"[ratios response: {ratios}]")
+            out.append(f"[FMP ratios section unavailable: {ratios}]")
     except Exception as e:
-        out.append(f"[ratios section unavailable: {e}]")
+        out.append(f"[FMP ratios section unavailable: {e}]")
 
     # ---- 3. ANALYST VIEW ----
     try:
@@ -384,16 +434,11 @@ def market_snapshot(ticker: str) -> str:
     except Exception as e:
         out.append(f"[events section unavailable: {e}]")
     try:
-        hist = t.history(period="1y", auto_adjust=False)
-        closes = [(ts.strftime("%Y-%m-%d"), float(c)) for ts, c in zip(hist.index, hist["Close"]) if c == c] \
-            if hist is not None and len(hist.index) else []
-        ath = None
-        try:
-            monthly = t.history(period="max", interval="1mo", auto_adjust=False)
-            if monthly is not None and len(monthly.index):
-                ath = float(monthly["Close"].max())
-        except Exception:
-            ath = None
+        # AUDIT (run #9, item 4): ONE daily series for everything — the 1y
+        # window for returns, the full history for the all-time-high CLOSE,
+        # checked like-for-like against the highest close of the last 52 weeks
+        closes = all_closes[-252:]
+        ath = all_time_high_close(all_closes)
         ctx = format_context_lines(closes, info, past_dates, ath)
         if ctx:
             out.append("\n[MARKET CONTEXT]")
@@ -421,8 +466,8 @@ def market_snapshot(ticker: str) -> str:
                          f"fair value is {direction} current price ({gap:+.1f}%)",
                          "FMP/dcf")
         elif isinstance(dcf, dict):
-            out.append(f"[dcf response: {dcf}]")
+            out.append(f"[FMP DCF section unavailable: {dcf}]")
     except Exception as e:
-        out.append(f"[dcf section unavailable: {e}]")
+        out.append(f"[FMP DCF section unavailable: {e}]")
 
     return "\n".join(out) if out else "[No data returned — check ticker/network]"

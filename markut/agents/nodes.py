@@ -65,7 +65,13 @@ def research_node(state: DebateState) -> dict:
     # lazy import: the MCP client spins its worker-thread event loop —
     # keep module import free of that machinery
     from markut.mcp.client import call_evidence_tools
-    return {"evidence": call_evidence_tools(state["ticker"])}
+    from markut.evidence.gaps import summarize_gaps
+    # AUDIT (run #9, item 5): one clean DATA GAPS block up front; raw parser
+    # errors never reach the agents, the page or the report
+    packet, gaps = summarize_gaps(call_evidence_tools(state["ticker"]))
+    if gaps:
+        print("RESEARCH: data gaps — " + "; ".join(f"{g['source']} ({g['reason']})" for g in gaps))
+    return {"evidence": packet}
 
 def complete_argument(system_prompt: str, user_content: str, label: str, cached_prefix: str = None) -> str:
     """One analyst turn that NEVER hands the judge a half-sentence.

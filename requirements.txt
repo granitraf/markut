@@ -3,6 +3,7 @@ anthropic
 python-dotenv
 requests
 yfinance
+lxml           # yfinance earnings_dates (next earnings date) needs it; without it the EVENTS block is a data gap
 sentence-transformers
 chromadb
 beautifulsoup4

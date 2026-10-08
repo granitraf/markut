@@ -40,7 +40,7 @@ def test_review_stats_recomputes_the_stats_line():
         {"resolution": "DERIVED", "qualified": True}, {"resolution": "LABELED", "qualified": False}]}
     s = ev.review_stats(pre, EVIDENCE, final, report)
     assert s == {"claims": 2, "cited": 1, "flagged": 1, "derived": 1, "labeled": 0,
-                 "annotated": 1, "status": "annotated"}
+                 "annotated": 1, "status": "annotated", "sources_unavailable": 0}
 
 
 class _FakeApp:

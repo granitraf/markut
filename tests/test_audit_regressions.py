@@ -329,7 +329,7 @@ def test_market_context_lines():
     text = "\n".join(market.format_context_lines(closes, {"fiftyTwoWeekHigh": 650}, ["2026-06-11"], 700))
     assert "Return, 1 month" in text and "Return, 3 months" in text and "year to date" in text
     assert "Price vs 52-week high: -7.8% (high $650.00)" in text
-    assert "Price vs all-time high (monthly closes): -14.4%" in text
+    assert "Price vs all-time high (daily closes): -14.4%" in text
     assert "Move around last earnings (2026-06-11; close before → first close after): +0.4%" in text
     assert market.format_context_lines([], {}, []) == []
 
@@ -351,20 +351,33 @@ from markut.evidence import valuation
 
 
 def test_valuation_block_is_deterministic_and_labeled():
-    info = {"currentPrice": 375.81, "forwardPE": 19.38, "trailingPE": 46.28, "enterpriseToEbitda": 30.2,
-            "marketCap": 1.79e12, "freeCashflow": 30.6e9, "trailingPegRatio": 1.1}
-    est = {"0y": {"avg": 11.57}, "+1y": {"avg": 19.39}}
-    text = "\n".join(valuation.format_valuation_lines(info, est, 2026))
+    import datetime as dt
+    info = {"currentPrice": 376.51, "forwardPE": 19.41, "enterpriseToEbitda": 35.07, "marketCap": 1.8e12, "freeCashflow": 30.6e9, "trailingPegRatio": 0.36}
+    est = {"0y": {"avg": 11.66}, "+1y": {"avg": 19.39}}
+    closes = [((dt.date(2021, 1, 1) + dt.timedelta(days=i)).isoformat(), 200 + (i % 300)) for i in range(2100)]
+    eps = [("2022-10-30", 10.0), ("2023-10-29", 12.0), ("2024-11-03", 14.0), ("2025-11-02", 16.0)]
+    text = "\n".join(valuation.format_valuation_lines(info, est, 2026, {"closes": closes, "annual_eps": eps}))
     assert text.startswith("[VALUATION] (computed by code")
-    assert "FCF yield (TTM FCF / market cap): 1.71%" in text
-    # no peer rows anywhere — there is no per-ticker peer table by design
-    assert "Peer" not in text and "peer" not in text
-    # base case at today's forward multiple reproduces the current price, by construction
-    assert "next-FY FY2027 consensus EPS $19.39 (non-GAAP): bear 15.5x = $300.62 (-20.0% vs price) | base 19.4x = $375.78 (-0.0% vs price)" in text
-    # every implied price in the table traces as a packet number
-    assert tracer.trace_claim("$300.62", text) == "CITED"
+    # run #9 item 1: P/E on EACH fiscal year's consensus, side by side
+    assert "P/E on current-FY FY2026 consensus EPS ($11.66, non-GAAP): 32.29x" in text
+    assert "P/E on next-FY FY2027 consensus EPS ($19.39, non-GAAP): 19.42x" in text
+    # the multiple band comes from the company's own history, and the grid crosses EPS cases with it
+    assert "Trailing P/E band (company's own history" in text and "p25 22.2x | median 28.5x | p75 32.5x" in text
+    rows = [l for l in text.splitlines() if l.startswith("- Implied price, EPS")]
+    assert [r.split(":")[0] for r in rows] == ["- Implied price, EPS -15% $16.48", "- Implied price, EPS consensus $19.39", "- Implied price, EPS +10% $21.33"]
+    # no cell equals today's price by construction, and the old "today's multiple × current-FY EPS" rows are gone
+    assert "$376.51 (" not in "\n".join(rows) and "Implied price from current-FY" not in text
+    assert "peer" not in text.lower()
+    assert tracer.trace_claim("$430.46", text) == "CITED"          # every implied price traces as a packet number
+    # fallback without history: today's forward multiple ±20%, and the packet SAYS the center equals the price
+    fb = "\n".join(valuation.format_valuation_lines(info, est, 2026, {}))
+    assert "equals today's price by construction" in fb and "fwd 19.4x = $376.17" in fb
     assert valuation.format_valuation_lines({}, {}) == []
     assert not hasattr(config, "PEERS")
+
+
+def test_pe_band_needs_real_history():
+    assert valuation.pe_band([], []) == {} and valuation.pe_band([("2026-01-01", 10.0)], [("2025-01-01", 1.0)]) == {}
 
 
 def test_judge_prompt_has_checklist_and_verdict_format():
@@ -475,7 +488,7 @@ def test_trims_after_run6():
     assert "under 450 words" in prompts.BULL_SYSTEM_PROMPT and "LENGTH LIMITS" in prompts.JUDGE_SYSTEM_PROMPT
     text = "\n".join(valuation.format_valuation_lines(
         {"currentPrice": 100.0, "forwardPE": 20.0, "marketCap": 1e9, "freeCashflow": 5e7},
-        {"0y": {"avg": 4.0}, "+1y": {"avg": 5.0}}, 2026))
+        {"0y": {"avg": 4.0}, "+1y": {"avg": 5.0}}, 2026, {}))
     assert "peer" not in text.lower() and "EV/Revenue" not in text
 
 
@@ -502,3 +515,117 @@ def test_claim_review_truncation_shorter_retry_and_no_crash(stub_llm, monkeypatc
     assert "could not be parsed: retry also cut off" in out["claim_verification"]["reasoning"]
     assert "CLAIM REVIEW DEBUG raw retry reply" in capsys.readouterr().out
     assert "revised_verdict must be an EMPTY string unless verdict_changed" in prompts.NEWS_VERIFY_SYSTEM_PROMPT
+
+
+# ================================================================ run #9 audit items 2-6
+from markut.evidence import gaps as gaps_mod
+
+
+def test_data_gaps_block_names_sources_and_hides_raw_errors():
+    clean, found = gaps_mod.summarize_gaps(EVIDENCE6)                 # run #6 packet: four FMP sections failed
+    assert clean.startswith("[DATA GAPS]\n- quote: upstream returned a non-JSON response")
+    assert [g["source"] for g in found] == ["quote", "income-statement", "ratios", "dcf"]
+    assert "Expecting value" not in clean and "char 0" not in clean
+    assert "- known gap (always): earnings-call transcript" in clean
+    assert gaps_mod.count_gaps(clean) == 4
+    # a clean packet says so; summarizing twice is idempotent
+    ok, none = gaps_mod.summarize_gaps("[QUOTE & VALUATION]\n- Price (current): $1.00  [source: x]")
+    assert none == [] and "- none — every evidence source responded" in ok and gaps_mod.count_gaps(ok) == 0
+    assert gaps_mod.summarize_gaps(ok)[0] == ok
+    # new FMP marker names + the 402 reason
+    assert gaps_mod.clean_reason("FMP HTTP 402: endpoint 'quote' is not covered by the current FMP subscription") == "not covered by the FMP subscription (HTTP 402)"
+    c2, g2 = gaps_mod.summarize_gaps("[FMP DCF section unavailable: FMP HTTP 402: endpoint 'discounted-cash-flow' is not covered]\n[QUOTE & VALUATION]\n- Price (current): $1.00  [source: x]")
+    assert g2 == [{"source": "FMP DCF", "reason": "not covered by the FMP subscription (HTTP 402)"}]
+
+
+def test_governor_reports_unavailable_sources(stub_llm):
+    verdict = "Price is $376.51. This is research, not investment advice."
+    clean, _ = gaps_mod.summarize_gaps(EVIDENCE6)
+    out = review_node({"verdict": verdict, "evidence": clean})
+    assert out["review_report"]["sources_unavailable"] == 4 and out["review_report"]["final_status"] == "clean"
+    from markut.web.events import review_stats
+    assert review_stats(verdict, clean, verdict, out["review_report"])["sources_unavailable"] == 4
+
+
+def test_commitments_dollar_lines_and_no_truncation_before_dollars():
+    note = ("Note 11. Commitments and Contingencies. We make purchase commitments in the ordinary course. " * 3 +
+            "During the quarter we entered into a backstop agreement with a financial partner for a customer's lease obligations. "
+            "Our maximum potential liability under the Backstop upon the deployment of all AI racks, on an undiscounted basis, was approximately $ 29 billion. "
+            "Therefore, $1,755 million of unrecognized tax benefits have been excluded from the table above. "
+            "Litigation is described below.")
+    lines = edgar.dollar_sentences(note)
+    assert lines[0].startswith("Our maximum potential liability under the Backstop") and "$29 billion" in lines[0]   # "$ 29" normalized, ranked first
+    assert any("$1,755 million" in l for l in lines) and len(lines) == 2
+    assert edgar.dollar_sentences("[section unavailable: x]") == []
+    # the theme formatter never cuts a commitments quote before its first dollar figure
+    from markut.evidence import rag
+    long_quote = ("We make significant decisions about purchase commitments and contractual obligations in the ordinary course of business. " * 4
+                  + "Our maximum potential liability under the Backstop was approximately $ 29 billion.")
+    block = rag.format_theme_block("t", [{"text": long_quote, "metadata": {"form": "10-Q", "section": "Commitments (10-Q note)", "filing_date": "2026-09-10", "url": "u"}}], 120)
+    assert "$29 billion" in block[1]
+    assert "$ 29 billion" in rag.number_variants("$29B")               # corroboration accepts the filing's spelling
+
+
+def test_8k_highlights_extraction():
+    release = ("EX-99.1 Document Exhibit 99.1 Broadcom Inc. Announces Third Quarter Fiscal Year 2026 Financial Results\n\n"
+               "• Revenue of $ 29.6 billion for the third quarter, up 86 percent from the prior year period\n\n"
+               "• AI semiconductor revenue grew 221 percent year-on-year to $5.2 billion\n\n"
+               "\u201cWe delivered record results,\u201d said Hock Tan, President and CEO.\n\n"
+               "Fourth Quarter Fiscal Year 2026 Business Outlook\n\nFourth quarter revenue guidance of approximately $34.8 billion is expected.\n\n"
+               "About Broadcom\n\nBroadcom Inc. is a global technology leader.")
+    h = edgar.extract_highlights(release)
+    assert h.startswith("Broadcom Inc. Announces") and "EX-99.1" not in h
+    assert "$29.6 billion" in h and "221 percent" in h and "said Hock Tan" in h
+    assert "Outlook" not in h and "$34.8 billion" not in h and "About Broadcom" not in h   # outlook has its own block; boilerplate stops it
+
+
+def test_concentration_sentences_are_dated_facts():
+    tenq = ("Financial Guarantee During the fiscal quarter ended August 2, 2026, we arranged for a financial partner to take on certain agreements to purchase AI racks for a customer. "
+            "In connection with this arrangement, we entered into a backstop agreement with the financial partner for the customer's lease obligations over the 5-year lease terms. "
+            "Gross margin was approximately flat sequentially. "
+            "We believe aggregate sales to our top five end customers accounted for approximately 40% of our net revenue for fiscal year 2025.")
+    got = edgar.concentration_sentences(tenq)
+    assert len(got) == 3 and got[0].startswith("Financial Guarantee") and got[-1].endswith("fiscal year 2025.")
+    assert all("customer" in s.lower() for s in got) and not any("Gross margin" in s for s in got)
+    assert edgar.concentration_sentences("Nothing about buyers here. Sales rose 10%.") == []
+
+
+def test_all_time_high_from_daily_closes_with_sanity_check(capsys):
+    closes = [(f"2026-01-{d:02d}", 100.0 + d) for d in range(1, 29)]
+    assert market.all_time_high_close([("2020-05-05", 300.0)] + closes) == 300.0
+    assert market.all_time_high_close(closes) == 128.0                 # ATH is the 52-week high close itself: consistent
+    assert market.all_time_high_close([]) is None
+    text = "\n".join(market.format_context_lines(closes, {}, [], 300.0))
+    assert "Price vs all-time high (daily closes): -57.3% (high $300.00)" in text
+    # the series can never contradict itself through this function; simulate a bad input by monkeying the window
+    bad = [("2026-01-01", 50.0)] * 300 + [("2026-12-31", 60.0)]
+    assert market.all_time_high_close(bad) == 60.0 and "FAILED" not in capsys.readouterr().out
+
+
+def test_fmp_plan_limit_is_a_named_failure(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(market.requests, "get", lambda *a, **k: SimpleNamespace(status_code=402, text="Premium Query Parameter", json=lambda: (_ for _ in ()).throw(ValueError("x"))))
+    with pytest.raises(RuntimeError, match="not covered by the current FMP subscription"):
+        market.fmp_get_json("quote", "AVGO")
+
+
+def test_dispersed_pe_history_is_information_not_the_grid():
+    import datetime as dt
+    info = {"currentPrice": 376.51, "forwardPE": 19.41}; est = {"0y": {"avg": 11.66}, "+1y": {"avg": 19.39}}
+    closes = [((dt.date(2021, 1, 1) + dt.timedelta(days=i)).isoformat(), 200 + (i % 300)) for i in range(2100)]
+    trough = [("2022-10-30", 10.0), ("2023-10-29", 1.5), ("2024-11-03", 2.0), ("2025-11-02", 16.0)]   # acquisition/trough years -> huge P/Es
+    text = "\n".join(valuation.format_valuation_lines(info, est, 2026, {"closes": closes, "annual_eps": trough}))
+    assert "Trailing P/E band" in text and "Band note: p75/p25" in text and "too dispersed" in text
+    assert "fwd 19.4x = $376.17" in text and "p75" not in text.split("Scenario grid")[1]   # grid fell back to today's multiple
+    assert valuation.BAND_MAX_DISPERSION == 2.0
+
+
+def test_list_blocks_print_as_lines_and_concentration_skips_design_win_sentences():
+    from markut.evidence import rag
+    block = rag.format_theme_block("t", [{"text": "- (10-K filed 2025-12-18) top five end customers 40%.\n- (10-Q filed 2026-09-10) backstop for the customer's lease obligations.",
+                                          "metadata": {"form": "10-Q", "section": "Concentration (dated)", "filing_date": "2026-09-10", "url": "u"}}], 400)
+    assert block[1].startswith("- (10-K filed") and block[2].startswith("- (10-Q filed") and block[3].startswith("  [source:")
+    assert not any(l.startswith('- "') for l in block)
+    got = edgar.concentration_sentences("Winning a product design does not guarantee sales to a customer. "
+                                        "We believe sales to our top five end customers accounted for approximately 40% of our net revenue for fiscal year 2025.")
+    assert len(got) == 1 and got[0].startswith("We believe")

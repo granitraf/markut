@@ -7,7 +7,8 @@ from markut.evidence.edgar import (ticker_to_cik, get_filing_index,
     find_latest_filings, fetch_filing_html, extract_10k_sections,
     extract_10q_sections, extract_8k_press_release, extract_risk_titles,
     extract_outlook, extract_10k_business, business_overview,
-    extract_10q_commitments)
+    extract_10q_commitments, dollar_sentences, extract_highlights,
+    concentration_sentences, normalize_dollars)
 from markut.guardrails.tracer import extract_numeric_claims
 
 import re
@@ -224,6 +225,14 @@ def build_filing_index(ticker: str):
                              "filing_date": doc["filing_date"], "url": doc["url"]},
             })
         all_chunks += chunk_sections(sections, "10-K", doc["filing_date"], doc["url"])
+        # AUDIT (run #9, item 6): the 10-K's own concentration sentences, dated
+        conc_10k = concentration_sentences(sections.get("Item 1A", "") if "Item 1A" in sections else "")
+        if not conc_10k and titles:
+            conc_10k = concentration_sentences(" ".join(split_risk_factors(extract_10k_sections(html)["Item 1A"], titles)))
+        if conc_10k:
+            all_chunks.append({"text": "\n".join(f"- (10-K filed {doc['filing_date']}) {s}" for s in conc_10k),
+                               "metadata": {"form": "10-K", "section": "Concentration (dated)",
+                                            "filing_date": doc["filing_date"], "url": doc["url"]}})
         # AUDIT FIX (run #2): what the company SELLS — the head of Item 1,
         # stored as a deterministic block so every debate opens with it
         overview = business_overview(extract_10k_business(html))
@@ -248,6 +257,19 @@ def build_filing_index(ticker: str):
         # its own section name so the obligations theme can fence to it
         sections["Commitments (10-Q note)"] = extract_10q_commitments(q_html)
         all_chunks += chunk_sections(sections, "10-Q", doc["filing_date"], doc["url"])
+        # AUDIT (run #9, item 2): every dollar figure in the commitments note as
+        # its own line — never the truncated tail of a longer quote
+        dollars = dollar_sentences(sections["Commitments (10-Q note)"])
+        if dollars:
+            all_chunks.append({"text": "\n".join(f"- {s}" for s in dollars),
+                               "metadata": {"form": "10-Q", "section": "Commitments $ lines",
+                                            "filing_date": doc["filing_date"], "url": doc["url"]}})
+        # AUDIT (run #9, item 6): newer customer facts, dated by the 10-Q
+        conc_q = concentration_sentences(" ".join(v for k, v in sections.items() if not v.startswith("[section unavailable")))
+        if conc_q:
+            all_chunks.append({"text": "\n".join(f"- (10-Q filed {doc['filing_date']}) {s}" for s in conc_q),
+                               "metadata": {"form": "10-Q", "section": "Concentration (dated)",
+                                            "filing_date": doc["filing_date"], "url": doc["url"]}})
     else:
         print(f"RAG: no recent 10-Q for {symbol} — skipping")
 
@@ -258,6 +280,18 @@ def build_filing_index(ticker: str):
     if not pr["text"].startswith("[press release unavailable"):
         all_chunks += chunk_sections({"press release": pr["text"]}, "8-K",
                                      pr["filing_date"], pr["url"])
+        # AUDIT (run #9, item 3): headline figures, segment/AI revenue lines and
+        # the CEO quote from the top of the release — deterministic, like Outlook
+        highlights = extract_highlights(pr["text"])
+        if highlights:
+            all_chunks.append({"text": highlights,
+                               "metadata": {"form": "8-K", "section": "8-K highlights",
+                                            "filing_date": pr["filing_date"], "url": pr["url"]}})
+        conc_pr = concentration_sentences(pr["text"])
+        if conc_pr:
+            all_chunks.append({"text": "\n".join(f"- (8-K filed {pr['filing_date']}) {s}" for s in conc_pr),
+                               "metadata": {"form": "8-K", "section": "Concentration (dated)",
+                                            "filing_date": pr["filing_date"], "url": pr["url"]}})
         outlook = extract_outlook(pr["text"])
         if outlook:
             all_chunks.append({
@@ -482,7 +516,7 @@ from datetime import date
 # model bills by), but Python only sees characters. ~4 chars/token is the
 # standard rough ratio for English prose — close enough for budget enforcement.
 CHARS_PER_TOKEN = 4
-GLOBAL_TOKEN_CAP = 3300  # hard ceiling for the whole [FILINGS] section (was 2500 before the audit pass added overview + obligations)
+GLOBAL_TOKEN_CAP = 4200  # hard ceiling for the whole [FILINGS] section (2500 -> 3300 audit pass -> 4200 with dollar lines, highlights, concentration)
 
 # SEMANTIC themes: (title, rerank query, sub-queries, section fence, k, cap).
 # WHY sub-query FAN-OUT instead of one abstract query per theme: embeddings
@@ -540,6 +574,9 @@ DETERMINISTIC_BLOCKS = [
     ("Risk factor titles", "Item 1A titles", 300),
     ("Guidance & outlook", "Outlook", 400),
     ("Business overview", "Item 1 overview", 350),   # what the company sells (10-K Item 1 head)
+    ("Guarantees & commitments — dollar figures", "Commitments $ lines", 400),   # run #9 item 2
+    ("8-K highlights", "8-K highlights", 400),                                   # run #9 item 3
+    ("Customer concentration (dated)", "Concentration (dated)", 350),           # run #9 item 6
 ]
 
 # WHY these budgets: retrieved quotes carry the debate (850 + 850); the
@@ -599,7 +636,28 @@ def format_theme_block(title: str, results: list, token_cap: int) -> list:
         # middle-body excerpt belongs to.
         if m.get("risk_title"):
             lines.append(f"- Risk: {m['risk_title']}")
-        lines.append(f'- "{truncate_to_budget(r["text"], per_excerpt)}"')
+        if r["text"].startswith("- "):
+            # a deterministic LIST block (dollar lines, dated concentration): one
+            # line per item, the whole block trimmed to its budget, no quote wrapper
+            kept, used = [], 0
+            for item in r["text"].split("\n"):
+                if used + len(item) > per_excerpt and kept:
+                    kept.append("- [...more items omitted for budget]")
+                    break
+                kept.append(item)
+                used += len(item)
+            lines.extend(kept)
+            lines.append(f"  [source: EDGAR/{m['form']} {m['section']}, filed {m['filing_date']}, {m['url']}]")
+            continue
+        budget = per_excerpt
+        if str(m.get("section", "")).startswith("Commitments") and "$" in r["text"]:
+            # AUDIT (run #9, item 2): a guarantee quote cut before its first
+            # dollar figure is worthless — extend the cut to the end of that
+            # sentence (up to 2x budget)
+            first = re.search(r"[^.]*\$\s?\d[^.]*\.", normalize_dollars(r["text"]))
+            if first and first.end() > budget:
+                budget = min(first.end() + 1, 2 * per_excerpt)
+        lines.append(f'- "{truncate_to_budget(normalize_dollars(r["text"]), budget)}"')
         # Source tag on its own line: the global-cap enforcer below must be able
         # to shrink quotes WITHOUT ever eating a source attribution.
         lines.append(f"  [source: EDGAR/{m['form']} {m['section']}, filed {m['filing_date']}, {m['url']}]")
@@ -766,6 +824,9 @@ def get_filings_evidence(ticker: str) -> str:
         semantic_block(coll, *THEMES[1]),            # Results & drivers (retrieved)
         deterministic_block(coll, *DETERMINISTIC_BLOCKS[1]),  # Guidance & outlook
         semantic_block(coll, *THEMES[2]),            # Guidance, commitments & obligations (retrieved)
+        deterministic_block(coll, *DETERMINISTIC_BLOCKS[3]),  # Guarantees & commitments — dollar figures
+        deterministic_block(coll, *DETERMINISTIC_BLOCKS[4]),  # 8-K highlights
+        deterministic_block(coll, *DETERMINISTIC_BLOCKS[5]),  # Customer concentration (dated)
     ]
 
     blocks = enforce_global_cap(blocks, GLOBAL_TOKEN_CAP * CHARS_PER_TOKEN)
@@ -795,7 +856,8 @@ def number_variants(num: str) -> list:
         n, unit = m.group(1), m.group(2).lower()
         word = {"t": "trillion", "b": "billion", "m": "million", "k": "thousand"}[unit]
         base = n.rstrip("0").rstrip(".") if "." in n else n
-        out += [f"${base} {word}", f"${n} {word}", f"{base} {word}", f"${base}.0 {word}" if "." not in base else f"${base} {word}"]
+        out += [f"${base} {word}", f"${n} {word}", f"{base} {word}", f"$ {base} {word}",
+                f"${base}.0 {word}" if "." not in base else f"${base} {word}"]
     seen, uniq = set(), []
     for v in out:
         if v not in seen:

@@ -455,3 +455,99 @@ def extract_10q_commitments(html: str) -> str:
         [r"(?m)^\s*(?:note\s+)?\d{1,2}\.\s+[A-Z][a-z]", r"(?m)^\s*item\s+2\b", r"(?m)^\s*item\s+4\b"],
     )
     return note if len(note) >= 300 else "[section unavailable: Commitments and Contingencies note not located in this 10-Q]"
+
+
+# ---------------- AUDIT (run #9): dollar figures from the commitments note; 8-K highlights; dated concentration ----------------
+
+_DOLLAR_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?\s*(?:billion|million|thousand|[BMK]\b)?", re.IGNORECASE)
+_OBLIGATION_WORDS = ("maximum", "guarantee", "guaranteed", "backstop", "liability", "exposure", "commitment",
+                     "obligation", "contingen", "indemnif", "lease", "purchase")
+
+
+def normalize_dollars(text: str) -> str:
+    # PURE. Filings print "$ 29 billion" with a space (inline-XBRL); the
+    # packet's numbers are "$29 billion" — same figure, one spelling
+    return re.sub(r"\$\s+(?=\d)", "$", text or "")
+
+
+def dollar_sentences(note_text: str, max_items: int = 8) -> list:
+    """PURE. Every sentence of a commitments/guarantees note that states a
+    dollar amount, most obligation-like first (maximum / guarantee / backstop /
+    liability words), deduped, each capped at 320 chars. These become
+    separate packet lines so a $29 billion maximum exposure is never a
+    truncated-away tail of a longer quote."""
+    text = normalize_dollars(re.sub(r"\s+", " ", note_text or ""))
+    if text.startswith("[section unavailable"):
+        return []
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z(\"'])", text)
+    scored, seen = [], set()
+    for s in sentences:
+        if not _DOLLAR_RE.search(s):
+            continue
+        key = re.sub(r"[^a-z0-9]", "", s.lower())[:120]
+        if key in seen:
+            continue
+        seen.add(key)
+        low = s.lower()
+        score = sum(w in low for w in _OBLIGATION_WORDS) + (2 if "maximum" in low else 0)
+        scored.append((score, len(scored), s[:320].rstrip()))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [s for _, _, s in scored[:max_items]]
+
+
+_BOILERPLATE_START = re.compile(r"^(about broadcom|about nvidia|about [A-Z][\w.]+|forward-looking statements|cautionary|non-gaap financial measures|"
+                                r"conference call|webcast|contact|investor relations|source:)", re.IGNORECASE)
+
+
+def extract_highlights(press_text: str, char_limit: int = 1500) -> str:
+    """PURE. The head of an earnings release — headline figures, segment and
+    AI revenue lines with their YoY/QoQ changes, and the CEO quote — up to the
+    Outlook heading or the first boilerplate section. Keeps paragraphs that
+    carry a number, a percent, or a quotation; stops at char_limit on a
+    sentence boundary."""
+    cleaned = re.sub(r"(?i)^\s*ex-?99\.\d\s+(?:document\s+)?(?:exhibit\s+99\.\d\s+)?", "", press_text or "")
+    paras = [p.strip() for p in cleaned.split("\n\n") if p.strip()]
+    out, total = [], 0
+    for p in paras:
+        head = p[:80].lower()
+        if "outlook" in head or "guidance" in head or _BOILERPLATE_START.match(p):
+            break
+        if not (re.search(r"\d", p) or "“" in p or '"' in p or " said " in p):
+            continue
+        if total + len(p) > char_limit and out:
+            break
+        out.append(normalize_dollars(p))
+        total += len(p)
+    text = "\n\n".join(out)
+    if len(text) > char_limit:
+        cut = text[:char_limit]
+        ends = [m.end() for m in re.finditer(r"[.!?](?=\s|$)", cut)]
+        text = cut[:ends[-1]] if ends else cut
+    return text.strip()
+
+
+_CONC_RE = re.compile(r"customer", re.IGNORECASE)
+_CONC_SIGNAL = re.compile(r"(\d{1,2}\s?%|largest customer|largest (?:end )?customers|significant portion|top (?:five|ten|5|10)|financial guarantee|"
+                          r"backstop|lease obligations|expected to (?:be|become) (?:a|our) (?:largest|significant))", re.IGNORECASE)
+
+
+def concentration_sentences(text: str, max_items: int = 4) -> list:
+    """PURE. Sentences about customers that carry a percentage, a 'largest /
+    top-five' framing, or a guarantee tied to a customer — the dated facts
+    that sit next to the 10-K's concentration figure so a reader can see which
+    is newer."""
+    text = normalize_dollars(re.sub(r"\s+", " ", text or ""))
+    out, seen = [], set()
+    for s in re.split(r"(?<=[.!?])\s+(?=[A-Z(\"'])", text):
+        if not (_CONC_RE.search(s) and _CONC_SIGNAL.search(s)):
+            continue
+        if len(s) < 40 or len(s) > 420:
+            continue
+        key = re.sub(r"[^a-z0-9]", "", s.lower())[:100]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s.strip())
+        if len(out) == max_items:
+            break
+    return out

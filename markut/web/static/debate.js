@@ -120,21 +120,33 @@ window.Markut = (function () {
       const body = l.replace(/\s*\[source:[^\]]*\]\s*$/, "");
       if ((m = body.match(/^-\s+((?:BASIS|PERIOD)\s+NOTE|[A-Z][A-Z ]{2,}NOTE)\s*:\s*(.*)$/))) { section.notes.push(m[2]); continue; }
       if ((m = body.match(/^-\s+Scenario multiples\s*\((.*)\)\s*$/))) { section.notes.push("Scenario multiples: " + m[1]); continue; }
-      if ((m = body.match(/^-\s+Implied price from (.*?)\s+consensus EPS\s+(\$[\d.]+)\s*\(non-GAAP\):\s+(.*)$/))) {   // scenario table row
-        const cells = m[3].split("|").map((c) => { const cm = c.trim().match(/^(bear|base|bull)\s+([\d.]+x)\s+=\s+(\$[\d,.]+)\s+\(([-+][\d.]+%)/); return cm ? { name: cm[1], mult: cm[2], price: cm[3], pct: cm[4] } : null; }).filter(Boolean);
-        section.scenarios.push({ label: m[1], eps: m[2], cells }); continue;
+      if ((m = body.match(/^-\s+Scenario grid\s*\((.*)\)\s*$/))) { section.notes.push("Scenario grid: " + m[1]); continue; }
+      if ((m = body.match(/^-\s+Implied price, EPS\s+(.*?)\s+(\$[\d.]+):\s+(.*)$/))) {   // scenario grid row: "name mult = $price (pct)" cells
+        const cells = m[3].split("|").map((c) => { const cm = c.trim().match(/^(.*?)\s+([\d.]+x)\s+=\s+(\$[\d,.]+)\s+\(([-+][\d.]+%)\)/); return cm ? { name: cm[1], mult: cm[2], price: cm[3], pct: cm[4] } : null; }).filter(Boolean);
+        section.scenarios.push({ label: "EPS " + m[1], eps: m[2], cells }); continue;
       }
+      if (section.name === "DATA GAPS" && (m = body.match(/^-\s+(.*)$/)) && !/:\s/.test(m[1])) { section.rows.push({ k: m[1], v: "" }); continue; }
       if ((m = body.match(/^-\s+([^:]{3,120}):\s*$/))) { section.rows.push({ sub: m[1] }); continue; }         // bare sub-header
       if ((m = body.match(/^-\s+(.+?):\s+(.+)$/))) { section.rows.push({ k: m[1], v: m[2] }); continue; }
       break;                                                        // first line that is not market data
     }
     const rest = lines.slice(i).join("\n").trim();
     const sectionHtml = (s) => {
+      if (s.name === "DATA GAPS") {
+        const items = s.rows.map((r) => r.sub ? null : { k: r.k, v: r.v }).filter(Boolean);
+        const missing = items.filter((r) => !/^known gap/.test(r.k) && !/^none/.test(r.k));
+        return `<div class="gaps ${missing.length ? "has" : ""}"><span class="gk">data gaps</span>` +
+          (missing.length ? missing.map((r) => `<span class="gi"><b>${esc(r.k)}</b> ${esc(r.v)}</span>`).join("") : `<span class="gi">none — every source responded</span>`) +
+          items.filter((r) => /^known gap/.test(r.k)).map((r) => `<span class="gi known">${esc(r.v)}</span>`).join("") + `</div>`;
+      }
       let h = `<div class="pk"><div class="pkh">${esc(s.name.toLowerCase())}</div>`;
       const kv = s.rows.filter((r) => !r.sub);
       if (kv.length) h += `<div class="pkg">` + kv.map((r) => `<div class="pkr"><span class="pkk">${esc(r.k)}</span><span class="pkv">${esc(r.v)}</span></div>`).join("") + `</div>`;
-      if (s.scenarios.length) h += `<table class="pkt"><thead><tr><th>implied price (EPS × multiple)</th><th>bear</th><th>base</th><th>bull</th></tr></thead><tbody>` +
-        s.scenarios.map((r) => `<tr><td>${esc(r.label)} EPS <b>${esc(r.eps)}</b></td>` + ["bear", "base", "bull"].map((n) => { const c = r.cells.find((x) => x.name === n); return c ? `<td><b>${esc(c.price)}</b> <small>${esc(c.pct)} · ${esc(c.mult)}</small></td>` : "<td>–</td>"; }).join("") + `</tr>`).join("") + `</tbody></table>`;
+      if (s.scenarios.length) {
+        const cols = s.scenarios[0].cells.map((c) => c.name);           // p25 / median / p75, or 0.8x fwd / fwd / 1.2x fwd
+        h += `<table class="pkt"><thead><tr><th>implied price (EPS × multiple)</th>${cols.map((c, i) => `<th>${esc(c)} <small>${esc(s.scenarios[0].cells[i].mult)}</small></th>`).join("")}</tr></thead><tbody>` +
+          s.scenarios.map((r) => `<tr><td>${esc(r.label)} <b>${esc(r.eps)}</b></td>` + cols.map((n) => { const c = r.cells.find((x) => x.name === n); return c ? `<td><b>${esc(c.price)}</b> <small>${esc(c.pct)}</small></td>` : "<td>–</td>"; }).join("") + `</tr>`).join("") + `</tbody></table>`;
+      }
       h += s.notes.map((n) => `<div class="pkn">${esc(n)}</div>`).join("");
       return h + `</div>`;
     };
@@ -224,7 +236,7 @@ window.Markut = (function () {
         return card("review", `<h3><span class="who">governed verdict</span> <span class="pill">${esc(s.status || "")}</span>${d.budget_exceeded ? ' <span class="pill live">budget exceeded</span>' : ""}</h3>
           <div class="verdict">${verdictHtml(d.verdict)}</div>
           ${kvs([["claims", num(s.claims)], ["cited", num(s.cited)], ["flagged", num(s.flagged)], ["derived", num(s.derived)], ["labeled", num(s.labeled)], ["annotated", num(s.annotated)]])}
-          ${tagged.length ? `<div class="tagged"><span class="k">left tagged — no evidence anchor:</span> ${tagged.map((t) => `<span class="ungrounded">${esc(t)}</span>`).join(" ")}</div>` : `<div class="tagged"><span class="k">every number in the verdict traced to the evidence packet.</span></div>`}
+          ${tagged.length ? `<div class="tagged"><span class="k">left tagged — no evidence anchor:</span> ${tagged.map((t) => `<span class="ungrounded">${esc(t)}</span>`).join(" ")}</div>` : `<div class="tagged"><span class="k">every number in the verdict traced to the evidence packet${s.sources_unavailable ? `; ${s.sources_unavailable} source${s.sources_unavailable === 1 ? "" : "s"} unavailable (see data gaps)` : ""}.</span></div>`}
           ${note(d)}`);
       },
       done(d) {

@@ -166,6 +166,8 @@ def parse_packet(evidence: str) -> tuple:
         m = re.match(r"^\[([^\]]+)\]$", l)
         if m:
             section = {"name": m.group(1), "rows": []}; grid.append(section); continue
+        if section and section["name"] == "DATA GAPS":
+            continue   # rendered in the title block, not as metrics
         m = re.match(r"^-\s+((?:BASIS|PERIOD)\s+NOTE|[A-Z][A-Z ]{2,}NOTE)\s*:\s*(.*?)\s*(?:\[source:[^\]]*\])?$", l)
         if m and section:
             section.setdefault("notes", []).append(m.group(2)); continue
@@ -179,7 +181,7 @@ def parse_packet(evidence: str) -> tuple:
     else:
         i = len(lines)
     rest = "\n".join(lines[i:]).strip() if i < len(lines) else ""
-    return [s for s in grid if s["rows"] or s.get("notes")], rest
+    return [s for s in grid if (s["rows"] or s.get("notes")) and s["name"] != "DATA GAPS"], rest
 
 
 def footnote_verdict(verdict: str) -> tuple:
@@ -244,7 +246,15 @@ def build_report(run: dict) -> bytes:
                colWidths=[width * w / sum(mw) for w in mw])
     mt.setStyle(TableStyle([("LINEBELOW", (0, 1), (-1, 1), 0.5, LINE), ("BOTTOMPADDING", (0, 1), (-1, 1), 6),
                             ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
-    story += [Spacer(1, 6), mt, Spacer(1, 10)]
+    story += [Spacer(1, 6), mt, Spacer(1, 6)]
+    gaps_block = re.search(r"^\[DATA GAPS\]\n((?:- .*\n?)+)", research.get("evidence", ""), re.M)
+    if gaps_block:
+        items = [ln[2:] for ln in gaps_block.group(1).splitlines() if ln.startswith("- ")]
+        missing = [i for i in items if not i.startswith("none") and not i.startswith("known gap")]
+        known = [i.split(":", 1)[1].strip() for i in items if i.startswith("known gap")]
+        story.append(Paragraph("<b>Data gaps:</b> " + (escape("; ".join(missing)) if missing else "none — every evidence source responded")
+                               + (("  ·  <i>known: " + escape("; ".join(known)) + "</i>") if known else ""), st["small"]))
+    story.append(Spacer(1, 6))
 
     # ---- key metrics ----
     grid, rest_evidence = parse_packet(research.get("evidence", ""))
@@ -283,7 +293,9 @@ def build_report(run: dict) -> bytes:
         for i, t in enumerate(tags, 1):
             story.append(Paragraph(f"[{i}]  <font name='Mono'>{escape(t)}</font> — no anchor in the evidence packet; left tagged by the governor.", st["foot"]))
     else:
-        story.append(Paragraph("Every number in the verdict traced to the evidence packet.", st["foot"]))
+        n = (stats or {}).get("sources_unavailable", 0)
+        story.append(Paragraph("Every number in the verdict traced to the evidence packet"
+                               + (f"; {n} source{'s' if n != 1 else ''} unavailable (see data gaps)." if n else "."), st["foot"]))
     if stats:
         srow = [("claims", stats.get("claims")), ("cited", stats.get("cited")), ("flagged", stats.get("flagged")),
                 ("derived", stats.get("derived")), ("labeled", stats.get("labeled")), ("annotated", stats.get("annotated")), ("status", stats.get("status"))]

@@ -8,6 +8,7 @@ from markut.agents import prompts
 from markut.agents.prompts import REVIEW_JSON_SKELETON
 from markut.agents.schemas import REVIEW_SCHEMA
 from markut.agents.state import DebateState
+from markut.evidence.gaps import count_gaps
 from markut.guardrails.parsing import parse_review_json
 from markut.guardrails.tracer import (DISCLAIMER_TEXT, _as_float, check_scenarios,
     extract_numeric_claims, find_advice_language, find_mislabeled, has_disclaimer,
@@ -95,13 +96,16 @@ def review_node(state: DebateState) -> dict:
         # keep the sentence so the stamper can place the tag inside it
         f.setdefault("sentence", next((c["sentence"] for c in _claim_sentences(verdict) if c["claim"] == f["claim"]), ""))
     cited_count = len(claims) - len(flagged)
+    sources_unavailable = count_gaps(evidence)
     report = {"initial_flags": list(flagged), "advice_phrases": list(advice),
               "mislabeled": [dict(f) for f in mislabeled], "scenario_flags": [dict(f) for f in scenarios],
-              "miscomputed": [], "resolutions": [], "final_status": "clean", "revision_used": False}
+              "miscomputed": [], "resolutions": [], "final_status": "clean", "revision_used": False,
+              "sources_unavailable": sources_unavailable}
 
     if not flagged and not advice and not mislabeled and not scenarios and has_disclaimer(verdict):
         print(f"REVIEW STATS: claims={len(claims)} cited={cited_count} flagged=0 | "
-              f"derived=0 labeled=0 annotated=0 | mislabeled=0 scenario=0 miscomputed=0 | status=clean"
+              f"derived=0 labeled=0 annotated=0 | mislabeled=0 scenario=0 miscomputed=0 | "
+              f"sources_unavailable={sources_unavailable} | status=clean"
               + (" | BUDGET EXCEEDED" if budget_exceeded else ""))
         return {"verdict": verdict, "review_report": report,
                 "budget_exceeded": budget_exceeded}
@@ -347,7 +351,7 @@ def review_node(state: DebateState) -> dict:
     print(f"REVIEW STATS: claims={len(claims)} cited={cited_count} "
           f"flagged={len(flagged)} | derived={derived_n} labeled={labeled_n} "
           f"annotated={annotated_count} | mislabeled={mis_n} scenario={sc_n} "
-          f"miscomputed={len(report['miscomputed'])} | status={report['final_status']}"
+          f"miscomputed={len(report['miscomputed'])} | sources_unavailable={sources_unavailable} | status={report['final_status']}"
           + (" | BUDGET EXCEEDED" if budget_exceeded else ""))
     return {"verdict": revised, "review_report": report,
             "budget_exceeded": budget_exceeded}

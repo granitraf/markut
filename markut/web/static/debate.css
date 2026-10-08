@@ -89,6 +89,12 @@ summary.typing::after, .argtitle.typing::after, .typing::after { content: "▍";
 .sc .k { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 4px; }
 @media (max-width: 600px) { .sc { grid-template-columns: 1fr; } }
 
+/* data gaps strip (top of the packet card) */
+.gaps { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline; font-size: 12.5px; margin: 0 0 12px; padding: 8px 10px; border-radius: 8px; background: var(--bg); border: 1px solid var(--line); }
+.gaps.has { border-color: var(--review); }
+.gaps .gk { font-size: 10.5px; text-transform: uppercase; letter-spacing: .1em; color: var(--review); margin-right: 4px; }
+.gaps .gi { color: var(--muted); } .gaps .gi b { color: var(--ink); font-weight: 500; margin-right: 4px; }
+.gaps .gi.known { font-style: italic; }
 /* evidence packet: key/value grid + small tables. Values never wrap; labels do. */
 .pk { margin: 0 0 16px; }
 .pkh { font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); margin: 8px 0 6px; }
