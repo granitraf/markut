@@ -9,31 +9,8 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,700;1,400&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/debate.css">
+<link rel="stylesheet" href="/static/terminal.css">
 <style>
-  /* Dico (pixel font) for the logo only — self-hosted; drop the file at
-     markut/web/static/fonts/Dico.ttf. Until then the logo falls back to
-     JetBrains Mono bold. */
-  @font-face { font-family: "Dico"; src: url("/static/fonts/Dico.ttf") format("truetype"); font-display: swap; }
-
-  /* Terminal theme: always dark, macOS Terminal background (#1e1e1e).
-     Overrides the shared tokens from debate.css for this page only. */
-  /* Declared on html:root:root:not(#_) so it outranks debate.css's
-     dark-mode rule (:root:not([data-theme="light"])), which otherwise wins on
-     systems set to dark mode and paints its old blue-tinted greys. */
-  html:root:root:not(#_) {
-    --bg: #1e1e1e; --surface: #252525; --ink: #e4e4e4; --muted: #8a8a8a; --line: #353535;
-    --accent: #6cb6ff; --bull: #5fd38d; --bull-bg: #232823; --bear: #ff7b72; --bear-bg: #2b2323;
-    --judge: #c4a7ff; --judge-bg: #2a2a2a; --review: #e6c07b; --review-bg: #2a2722; --tag-bg: #4a1f1a; --tag-ink: #ffb3aa;
-    --good: #5fd38d; --bad: #ff7b72;
-    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    --sans: var(--mono); --serif: var(--mono);
-    color-scheme: dark;
-  }
-  body { background: var(--bg); color: var(--ink); font: 15px/1.65 var(--mono); }
-  ::selection { background: #4a4a4a; }
-  .logo { text-align: center; padding: 28px 0 8px; }
-  .logo h1 { margin: 0; font: 400 56px/1 "Dico", "JetBrains Mono", monospace; letter-spacing: .02em; color: var(--ink); }
-  .logo p { margin: 10px 0 0; color: var(--muted); font-size: 13px; letter-spacing: .04em; }
   .wrap { max-width: 880px; margin: 0 auto; padding: 32px 16px 72px; }
   .hero { padding: 20px 0 20px; text-align: center; }
   .hero p.lede { margin: 0 auto; font-size: 15px; color: var(--muted); max-width: 640px; }

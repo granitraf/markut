@@ -1,0 +1,21 @@
+/* Terminal theme for markut.dev: always dark, neutral macOS-Terminal grey.
+   Loaded AFTER debate.css; the html:root:root:not(#_) selector outranks
+   debate.css's dark-mode rule (:root:not([data-theme="light"])) so every
+   visitor gets the same greys whatever their system setting. */
+@font-face { font-family: "Dico"; src: url("/static/fonts/Dico.ttf") format("truetype"); font-display: swap; }
+html:root:root:not(#_) {
+  --bg: #1e1e1e; --surface: #252525; --ink: #e4e4e4; --muted: #8a8a8a; --line: #353535;
+  --accent: #6cb6ff; --bull: #5fd38d; --bull-bg: #232823; --bear: #ff7b72; --bear-bg: #2b2323;
+  --judge: #c4a7ff; --judge-bg: #2a2a2a; --review: #e6c07b; --review-bg: #2a2722; --tag-bg: #4a1f1a; --tag-ink: #ffb3aa;
+  --good: #5fd38d; --bad: #ff7b72; --green: #7ddc8f;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: var(--mono); --serif: var(--mono);
+  color-scheme: dark;
+}
+body { background: var(--bg); color: var(--ink); font: 15px/1.65 var(--mono); }
+::selection { background: #4a4a4a; }
+.logo { text-align: center; padding: 28px 0 8px; }
+.logo h1 { margin: 0; font: 400 56px/1 "Dico", "JetBrains Mono", monospace; letter-spacing: .02em; color: var(--ink); }
+.logo h1 a { color: inherit; text-decoration: none; }
+.logo p { margin: 10px 0 0; color: var(--muted); font-size: 13px; letter-spacing: .04em; }
+@media (max-width: 520px) { .logo h1 { font-size: 38px; } }

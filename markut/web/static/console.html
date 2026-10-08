@@ -4,53 +4,51 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Markut Console</title>
-<meta name="description" content="Operator console: run a live bull-vs-bear debate on any ticker, or replay a stored one, agent by agent.">
+<meta name="description" content="Operator console: a terminal that runs a live bull-vs-bear debate on any ticker, or replays a stored one.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,700;1,400&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/debate.css">
+<link rel="stylesheet" href="/static/terminal.css">
 <style>
-  .wrap { max-width: 880px; margin: 0 auto; padding: 24px 16px 64px; }
-  header { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-  header h1 { margin: 0; font-size: 26px; letter-spacing: -0.01em; }
-  header h1 small { font-size: 13px; color: var(--muted); font-weight: 500; margin-left: 8px; letter-spacing: .08em; text-transform: uppercase; }
-  header p { margin: 4px 0 0; color: var(--muted); }
-  header nav { display: flex; gap: 14px; } header nav a { text-decoration: none; font-weight: 600; font-size: 14px; }
-  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 20px 0 8px; padding: 14px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
-  .controls input { width: 110px; text-transform: uppercase; font-family: var(--mono); }
-  .spacer { flex: 1; }
-  .status { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--muted); font-size: 14px; min-height: 22px; margin-bottom: 16px; }
-  .status b { color: var(--ink); font-weight: 600; }
-  .readhead { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: baseline; margin: 20px 0 6px; padding: 14px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
-  .readhead .t { font-size: 24px; font-weight: 700; font-family: var(--mono); }
-  .readhead .d { color: var(--muted); }
-  .disclaimer { margin-top: 24px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--line); padding-top: 12px; }
-  @media (max-width: 520px) { .controls { gap: 8px; } .controls input { width: 90px; } header h1 { font-size: 22px; } }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 24px 16px 40vh; min-height: 100vh; cursor: text; }
+  .logo { padding-top: 18px; }
+  .logo h1 { font-size: 40px; }
+  .term { margin-top: 18px; }
+  .line { white-space: pre-wrap; word-break: break-word; min-height: 1.65em; }
+  .line.dim { color: var(--muted); }
+  .line.ok { color: var(--green); }
+  .line.err { color: var(--bad); }
+  .line.info { color: var(--accent); }
+  .ps { color: var(--green); }
+  .echo .ps { color: var(--muted); }
+  .cmd { color: var(--ink); }
+  .ghost { color: var(--muted); font-style: italic; }
+  .ghost .green { color: var(--green); font-style: italic; }
+  .cursor { display: inline-block; width: .62em; height: 1.15em; background: #c8c8c8; vertical-align: text-bottom; margin-left: 1px; animation: blink 1.05s steps(1) infinite; }
+  .wrap.blur .cursor { animation: none; background: transparent; outline: 1px solid #8a8a8a; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .reader { position: absolute; left: -9999px; top: 0; width: 1px; height: 1px; opacity: 0; }
+  .out { margin: 10px 0 14px; }
+  .out .timeline { gap: 10px; }
+  .out .card { padding: 12px 14px; }
+  .out .card.route { padding: 0 14px; }
+  .status { color: var(--muted); }
+  .status b { color: var(--ink); font-weight: 500; }
+  .status .pill { border-color: var(--line); }
+  .hidden { display: none !important; }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <div>
-      <h1>Markut <small>console</small></h1>
-      <p>Run a live debate on any ticker, or replay a stored one. Each card is one agent finishing its turn.</p>
-    </div>
-    <nav><a href="/console/library">Archive →</a><a href="/">Public site</a></nav>
+<div class="wrap" id="wrap">
+  <header class="logo">
+    <h1><a href="/">markut.dev</a></h1>
+    <p>console</p>
   </header>
 
-  <div class="readhead hidden" id="readhead"></div>
-
-  <form class="controls" id="controls">
-    <input id="ticker" value="NVDA" placeholder="TICKER" maxlength="7" autocomplete="off" aria-label="Ticker">
-    <select id="rounds" aria-label="Max rounds"><option value="1">1 round</option><option value="2" selected>2 rounds</option><option value="3">3 rounds</option></select>
-    <button class="primary" id="run" type="submit">Run live debate</button>
-    <span class="spacer"></span>
-    <select id="record" aria-label="Stored run"></select>
-    <button id="replay" type="button">Replay stored run</button>
-  </form>
-  <div class="status" id="status"><span>Live runs are paid (8–12 model calls) and are logged to the archive. Replays are free.</span></div>
-
-  <div class="timeline" id="timeline"></div>
-
-  <p class="disclaimer">Markut is a research tool. Everything it produces is research framing only and does not constitute investment advice.
-    Verdict numbers are traced against the evidence packet; anything without an anchor is tagged inline rather than removed.</p>
+  <div class="term" id="term"></div>
+  <div class="line" id="promptline"><span class="ps" id="ps">$ </span><span class="cmd" id="typed"></span><span class="cursor"></span><span class="ghost" id="ghost"></span></div>
+  <input class="reader" id="reader" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="console input">
 </div>
 
 <script src="/static/debate.js"></script>
@@ -58,77 +56,202 @@
 (function () {
   const { esc, Timeline, play } = window.Markut;
   const $ = (id) => document.getElementById(id);
-  const status = $("status"), head = $("readhead");
-  let player = null, timer = null, startedAt = 0;
+  const term = $("term"), reader = $("reader"), typed = $("typed"), ghost = $("ghost"), wrap = $("wrap");
 
-  const setStatus = (html) => { status.innerHTML = html; };
-  function startClock() { stopClock(); startedAt = Date.now(); timer = setInterval(() => { const c = $("clock"); if (c) c.textContent = Math.round((Date.now() - startedAt) / 1000) + "s"; }, 1000); }
-  function stopClock() { if (timer) clearInterval(timer); timer = null; }
-  function setBusy(b) { $("run").disabled = b || !liveEnabled; $("replay").disabled = b; }
+  // ---- terminal state ----
+  // steps: ticker -> rounds -> confirm -> running; hints are the italic ghost text
+  let step = "ticker", ticker = "", rounds = 2, running = false;
+  let history = [], histIdx = -1, player = null, timer = null, startedAt = 0, statusEl = null;
   let liveEnabled = true;
+  const tab = { base: "", options: [], idx: -1 };     // Tab-completion cycle
+  const runsCache = {};                               // ticker -> runs (newest first)
+  let tickers = [];                                   // every ticker in the archive
 
-  const timeline = Timeline($("timeline"), {
-    onStart(d) {
-      const mode = d.mode === "replay" ? "replay" : "live";
-      setStatus(`<span class="pill ${mode}">${mode === "replay" ? "STORED RUN" : "LIVE"}</span> <b>${esc(d.ticker)}</b> · up to ${d.max_rounds} round(s) · model ${esc(d.model || "")}` +
-        (d.recorded_at ? ` · recorded ${esc(d.recorded_at)}` : "") + ` · <span id="clock">0s</span>`);
-    },
-    onEnd() { stopClock(); setBusy(false); },
-    onSaved(d) {
-      if (d.run) { timeline.card("route", `Logged as run #${d.run} — <a href="/console?run=${d.run}">read it</a>, or find it in the <a href="/console/library">archive</a>.`); loadRuns(String(d.run)); }
-      else if (d.error) timeline.card("route", "Run finished but could not be logged: " + esc(d.error));
-    },
-  });
+  const HINTS = {
+    ticker: () => `input your ticker symbol eg. NVDA`,
+    rounds: () => `input amount of debate rounds (max 3)`,
+    confirm: () => `to start stock analysis, confirm with <span class="green">run debate</span>`,
+    running: () => `debate in progress — output below`,
+  };
 
-  function open(url) {
-    if (player) player.close();
-    timeline.clear(); setBusy(true); setStatus("Connecting…"); startClock();
-    player = play(url, timeline);
+  // ---- output helpers ----
+  function println(html, cls = "") { const d = document.createElement("div"); d.className = "line " + cls; d.innerHTML = html; term.appendChild(d); scroll(); return d; }
+  function echo(text) { println(`<span class="ps">$ </span>${esc(text)}`, "echo"); }
+  function scroll() { window.scrollTo({ top: document.body.scrollHeight, behavior: "instant" }); }
+  function setPrompt() {
+    typed.textContent = reader.value;
+    ghost.innerHTML = reader.value ? "" : (HINTS[step] ? HINTS[step]() : "");
   }
+  function setStep(s) { step = s; reader.value = ""; setPrompt(); }
 
-  $("controls").addEventListener("submit", (e) => {
-    e.preventDefault();
-    const t = $("ticker").value.trim().toUpperCase();
-    if (!/^[A-Z]{1,5}(\.[A-Z])?$/.test(t)) { setStatus(`<b>${esc(t) || "(empty)"}</b> is not a ticker shape (1–5 letters, optional .X class).`); return; }
-    open(`/api/debate?ticker=${encodeURIComponent(t)}&max_rounds=${$("rounds").value}`);
-  });
-  $("replay").addEventListener("click", () => { const r = $("record").value; if (r) open(`/api/replay?run=${encodeURIComponent(r)}`); });
-
-  async function loadRuns(select) {
+  // ---- commands ----
+  function help() {
+    println("commands", "info");
+    println("  <ticker>              start a debate on that symbol (then rounds, then run debate)");
+    println("  replay <ticker> [date] replay a stored run — press Tab to cycle through that ticker's run dates");
+    println("  runs [ticker]         list stored runs");
+    println("  archive               open the archive table");
+    println("  clear                 clear the screen");
+  }
+  async function listRuns(t) {
+    const runs = await fetchRuns(t);
+    if (!runs.length) return println(`no stored runs${t ? " for " + esc(t) : ""}`, "dim");
+    for (const r of runs) println(`  #${String(r.id).padStart(3)}  ${esc(r.started_at)}  ${esc(r.ticker).padEnd(6)}  ${esc(r.mode).padEnd(6)}  ${r.claims != null ? r.cited + "/" + r.claims + " grounded" : ""}  ${r.status !== "done" ? "· " + esc(r.status) : ""}`);
+  }
+  async function fetchRuns(t) {
+    const key = (t || "").toUpperCase();
+    if (runsCache[key]) return runsCache[key];
     try {
-      const { runs } = await (await fetch("/api/runs")).json(); const sel = $("record"); sel.innerHTML = "";
-      for (const r of runs) { const o = document.createElement("option"); o.value = String(r.id); o.textContent = `#${r.id} ${r.ticker} · ${r.started_at}${r.mode === "course" ? " · course run" : ""}${r.status !== "done" ? " · " + r.status : ""}`; sel.appendChild(o); }
-      if (select) sel.value = select;
-      $("replay").disabled = runs.length === 0;
-    } catch (_) { $("replay").disabled = true; }
+      const res = await fetch("/api/runs" + (key ? "?ticker=" + encodeURIComponent(key) : ""));
+      const { runs } = await res.json(); runsCache[key] = runs; return runs;
+    } catch (_) { return []; }
   }
-  async function loadHealth() {
+
+  async function handle(raw) {
+    const text = raw.trim();
+    echo(raw);
+    if (!text && step === "ticker") return;
+    const [cmd, ...rest] = text.split(/\s+/);
+    const low = (cmd || "").toLowerCase();
+
+    if (low === "clear") { term.innerHTML = ""; return; }
+    if (low === "help" || low === "?") return help();
+    if (low === "archive") { location.href = "/console/library"; return; }
+    if (low === "cancel" || low === "back") {
+      if (step === "running") { if (player) player.close(); println("stopped watching — a live run keeps going on the server and lands in the archive", "dim"); running = false; stopClock(); return setStep("ticker"); }
+      step !== "ticker" && println("cancelled", "dim"); return setStep("ticker");
+    }
+
+    if (step === "ticker") {
+      if (low === "runs") return listRuns(rest[0]);
+      if (low === "replay") {
+        const t = (rest[0] || "").toUpperCase();
+        if (!t) return println("usage: replay <ticker> [date] — Tab cycles the dates", "err");
+        const runs = await fetchRuns(t);
+        if (!runs.length) return println(`no stored runs for ${esc(t)}`, "err");
+        const date = rest.slice(1).join(" ");
+        const run = date ? runs.find((r) => r.started_at.startsWith(date)) : runs[0];
+        if (!run) return println(`no ${esc(t)} run on ${esc(date)} — Tab to see the dates`, "err");
+        return startStream(`/api/replay?run=${run.id}`, `replay ${t} · ${run.started_at}`);
+      }
+      const t = text.toUpperCase();
+      if (!/^[A-Z]{1,5}(\.[A-Z])?$/.test(t)) return println(`${esc(text)}: not a ticker (1–5 letters, optional .X class) — type help for commands`, "err");
+      if (!liveEnabled) return println("live debates are disabled on this server (no API key) — use replay <ticker>", "err");
+      ticker = t; println(`ticker set to ${t}`, "dim"); return setStep("rounds");
+    }
+    if (step === "rounds") {
+      const n = text === "" ? 2 : Number(text);
+      if (!Number.isInteger(n) || n < 1 || n > 3) return println("rounds must be 1, 2 or 3", "err");
+      rounds = n; println(`${n} round${n === 1 ? "" : "s"}`, "dim"); return setStep("confirm");
+    }
+    if (step === "confirm") {
+      if (/^(run( debate)?|y|yes|go)$/.test(low + (rest.length ? " " + rest.join(" ").toLowerCase() : ""))) {
+        return startStream(`/api/debate?ticker=${encodeURIComponent(ticker)}&max_rounds=${rounds}`, `run debate ${ticker} · ${rounds} round${rounds === 1 ? "" : "s"}`);
+      }
+      return println("type run debate to start, or cancel", "err");
+    }
+    if (step === "running") return println("a debate is in progress — wait for it to finish", "dim");
+  }
+
+  // ---- Tab completion ----
+  async function complete() {
+    const value = reader.value;
+    if (tab.options.length && value === tab.options[tab.idx]) {          // cycling
+      tab.idx = (tab.idx + 1) % tab.options.length; reader.value = tab.options[tab.idx]; setPrompt(); return;
+    }
+    tab.options = []; tab.idx = -1;
+    let m;
+    if ((m = value.match(/^(replay\s+)([A-Za-z.]+)\s*(.*)$/i))) {
+      const t = m[2].toUpperCase();
+      if (!tickers.length) await loadTickers();
+      const exact = tickers.includes(t);
+      if (!exact) {                                                       // complete the ticker first
+        tab.options = tickers.filter((x) => x.startsWith(t)).map((x) => `replay ${x} `);
+      } else {                                                            // then cycle the run dates, newest first
+        const runs = await fetchRuns(t);
+        tab.options = runs.map((r) => `replay ${t} ${r.started_at}`);
+      }
+    } else if ((m = value.match(/^(replay\s*)$/i))) {
+      if (!tickers.length) await loadTickers();
+      tab.options = tickers.map((x) => `replay ${x} `);
+    } else if (step === "ticker" && /^[A-Za-z.]+$/.test(value)) {
+      if (!tickers.length) await loadTickers();
+      tab.options = tickers.filter((x) => x.startsWith(value.toUpperCase()));
+    }
+    if (tab.options.length) { tab.idx = 0; reader.value = tab.options[0]; setPrompt(); }
+  }
+  async function loadTickers() { const runs = await fetchRuns(""); tickers = [...new Set(runs.map((r) => r.ticker))]; }
+
+  // ---- streaming output (live or replay) ----
+  function startStream(url, label) {
+    if (player) player.close();
+    const out = document.createElement("div"); out.className = "out"; term.appendChild(out);
+    statusEl = document.createElement("div"); statusEl.className = "line status"; statusEl.textContent = "connecting…"; out.appendChild(statusEl);
+    const tl = document.createElement("div"); tl.className = "timeline"; out.appendChild(tl);
+    running = true; setStep("running");
+    const timeline = Timeline(tl, {
+      onStart(d) {
+        const mode = d.mode === "replay" ? "replay" : "live";
+        statusEl.innerHTML = `<span class="pill ${mode}">${mode === "replay" ? "STORED RUN" : "LIVE"}</span> <b>${esc(d.ticker)}</b> · up to ${d.max_rounds} round(s) · model ${esc(d.model || "")}` +
+          (d.recorded_at ? ` · recorded ${esc(d.recorded_at)}` : "") + ` · <span class="clock">0s</span>`;
+        startClock();
+      },
+      onEnd() { stopClock(); finish(); },
+      onSaved(d) {
+        if (d.run) { timeline.card("route", `logged as run #${d.run} — <a href="/console?run=${d.run}">read it</a> · replay ${esc(ticker)} to watch again`); delete runsCache[ticker]; delete runsCache[""]; }
+        else if (d.error) timeline.card("route", "run finished but could not be logged: " + esc(d.error));
+      },
+    });
+    println(`» ${esc(label)}`, "info");
+    player = play(url, timeline, { onClose: () => { stopClock(); finish(); } });
+  }
+  function finish() { if (!running) return; running = false; setStep("ticker"); scroll(); reader.focus(); }
+  function startClock() { stopClock(); startedAt = Date.now(); timer = setInterval(() => { const c = statusEl && statusEl.querySelector(".clock"); if (c) c.textContent = Math.round((Date.now() - startedAt) / 1000) + "s"; }, 1000); }
+  function stopClock() { if (timer) clearInterval(timer); timer = null; }
+
+  // ---- read mode: /console?run=ID renders a stored run instantly ----
+  async function openRead(id) {
+    let run;
+    try { const res = await fetch("/api/runs/" + encodeURIComponent(id)); if (!res.ok) throw new Error(res.status); run = await res.json(); }
+    catch (_) { return println(`run #${esc(id)} not found — type runs to list`, "err"); }
+    println(`» read run #${run.id} · ${esc(run.ticker)} · ${esc(run.started_at)} · ${esc(run.mode)}${run.price ? " · price " + esc(run.price) : ""}${run.claims != null ? ` · ${run.cited}/${run.claims} grounded` : ""}`, "info");
+    const out = document.createElement("div"); out.className = "out"; term.appendChild(out);
+    const tl = document.createElement("div"); tl.className = "timeline"; out.appendChild(tl);
+    Timeline(tl, { autoscroll: false }).renderAll(run.events);
+    println(`replay ${esc(run.ticker)} ${esc(run.started_at)} — to watch it with pacing`, "dim");
+  }
+
+  // ---- input plumbing: an off-screen input receives keys; the prompt line mirrors it ----
+  reader.addEventListener("input", () => { tab.options = []; setPrompt(); });
+  reader.addEventListener("keydown", (e) => {
+    if (e.key === "Tab") { e.preventDefault(); complete(); return; }
+    if (e.key === "Enter") {
+      e.preventDefault(); const v = reader.value; reader.value = "";
+      if (v.trim()) { history.push(v); histIdx = history.length; }
+      tab.options = []; handle(v).then(setPrompt); setPrompt(); return;
+    }
+    if (e.key === "ArrowUp") { e.preventDefault(); if (histIdx > 0) { histIdx--; reader.value = history[histIdx]; setPrompt(); } return; }
+    if (e.key === "ArrowDown") { e.preventDefault(); histIdx = Math.min(history.length, histIdx + 1); reader.value = history[histIdx] || ""; setPrompt(); return; }
+    if (e.key === "l" && e.ctrlKey) { e.preventDefault(); term.innerHTML = ""; return; }
+    if (e.key === "c" && e.ctrlKey && !window.getSelection().toString()) { e.preventDefault(); echo(reader.value + "^C"); reader.value = ""; if (!running) setStep("ticker"); else setPrompt(); return; }
+  });
+  wrap.addEventListener("mousedown", (e) => { if (!window.getSelection().toString() && e.target.tagName !== "A") setTimeout(() => reader.focus(), 0); });
+  reader.addEventListener("focus", () => wrap.classList.remove("blur"));
+  reader.addEventListener("blur", () => wrap.classList.add("blur"));
+
+  // ---- boot ----
+  (async () => {
     try {
       const h = await (await fetch("/api/health")).json();
       liveEnabled = !!h.live_enabled;
-      if (!liveEnabled) { $("run").disabled = true; $("run").title = "ANTHROPIC_API_KEY not set on the server"; setStatus("Live debates are disabled on this server (no API key). Stored runs still play."); }
-    } catch (_) {}
-  }
-
-  // ---- read mode: /console?run=ID renders a stored run instantly as a document ----
-  async function openRead(id) {
-    $("controls").classList.add("hidden"); status.classList.add("hidden");
-    head.classList.remove("hidden"); head.innerHTML = "Loading run #" + esc(id) + "…";
-    let run;
-    try { const res = await fetch("/api/runs/" + encodeURIComponent(id)); if (!res.ok) throw new Error(res.status); run = await res.json(); }
-    catch (e) { head.innerHTML = `Run #${esc(id)} was not found. <a href="/console/library">Back to the archive</a>.`; return; }
-    const grounding = run.claims != null ? `${run.cited}/${run.claims} grounded` : "";
-    head.innerHTML = `<span class="t">${esc(run.ticker)}</span><span class="d">${esc(run.started_at)}</span>` +
-      `<span class="pill">${esc(run.mode)}</span>${run.price ? `<span class="d">price ${esc(run.price)}</span>` : ""}` +
-      `${grounding ? `<span class="d">${grounding}</span>` : ""}<span class="spacer"></span>` +
-      `<button id="readreplay" type="button">Replay with pacing</button> <a href="/console/library" style="align-self:center">Archive</a>`;
-    $("readreplay").addEventListener("click", () => { head.classList.add("hidden"); status.classList.remove("hidden"); open(`/api/replay?run=${encodeURIComponent(id)}`); });
-    timeline.renderAll(run.events); stopClock();
-  }
-
-  loadRuns(); loadHealth();
-  const wantRun = new URLSearchParams(location.search).get("run");
-  if (wantRun) openRead(wantRun);
+      println(`markut console · model ${esc(h.model)} · store ${esc(h.db_backend)}${liveEnabled ? "" : " · live debates disabled (no API key)"}`, "dim");
+    } catch (_) { println("markut console · could not reach the server", "err"); }
+    println("type help for commands", "dim");
+    loadTickers();
+    const want = new URLSearchParams(location.search).get("run");
+    if (want) await openRead(want);
+    setPrompt(); reader.focus();
+  })();
 })();
 </script>
 </body>
