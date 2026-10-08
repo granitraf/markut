@@ -285,6 +285,30 @@ def market_snapshot(ticker: str) -> str:
         out.append(f"[earnings_estimate unavailable: {e}]")
     out.extend(basis_notes(info))
 
+    # ---- VALUATION (deterministic; AUDIT FIX item 10) ----
+    try:
+        from markut.evidence.valuation import fetch_peer_metrics, format_valuation_lines
+        est_rows = {}
+        try:
+            est = t.earnings_estimate
+            if est is not None and len(est.index) > 0:
+                est_rows = {str(k): {c: est.loc[k, c] for c in est.columns} for k in est.index}
+        except Exception:
+            est_rows = {}
+        cur_fy = None
+        try:
+            if info.get("nextFiscalYearEnd"):
+                cur_fy = datetime.fromtimestamp(float(info["nextFiscalYearEnd"])).year
+        except Exception:
+            cur_fy = None
+        peers = fetch_peer_metrics(config.PEERS.get(symbol, []))
+        val = format_valuation_lines(info, est_rows, peers, cur_fy)
+        if val:
+            out.append("")
+            out.extend(val)
+    except Exception as e:
+        out.append(f"[valuation section unavailable: {e}]")
+
     # FMP adds intraday context yfinance/info does not expose in the current packet.
     try:
         quote = fmp_get_json("quote", symbol)

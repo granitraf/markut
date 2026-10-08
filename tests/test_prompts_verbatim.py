@@ -1,7 +1,8 @@
-"""Proof that every hoisted prompt renders byte-identical to the notebook.
-Reads the untouched markut.ipynb, evaluates each original system_prompt
-literal, and compares against markut.agents.prompts — an automated diff,
-not an eyeball."""
+"""Proof that every notebook prompt is preserved byte-identical as the
+*_NOTEBOOK constant in markut.agents.prompts, and that the LIVE prompts
+extend (never silently rewrite) that text. Reads the untouched markut.ipynb,
+evaluates each original system_prompt literal, and compares — an automated
+diff, not an eyeball."""
 import json
 import os
 
@@ -42,7 +43,10 @@ def nodes_cell():
 ])
 def test_agent_prompt_verbatim(nodes_cell, const, anchor):
     literal = _grab(nodes_cell[nodes_cell.index(anchor):], "system_prompt")
-    assert eval(literal) == getattr(prompts, const)
+    notebook_text = eval(literal)
+    assert notebook_text == getattr(prompts, const + "_NOTEBOOK")
+    # the live prompt starts with the notebook's exact text and only ADDS to it
+    assert getattr(prompts, const).startswith(notebook_text)
 
 
 def test_review_skeleton_and_prompt_verbatim(nodes_cell):

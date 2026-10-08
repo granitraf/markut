@@ -342,3 +342,39 @@ def test_live_avgo_packet_has_guidance_block():
     assert "8-K press release filed" in text
     assert "-- Guidance & outlook --\n[not extracted" not in text
     assert "-- Business overview --" in text
+
+
+# ================================================================ P2 — analytical depth
+from markut.agents import prompts
+from markut.evidence import valuation
+
+
+def test_valuation_block_is_deterministic_and_labeled():
+    info = {"currentPrice": 375.81, "forwardPE": 19.38, "trailingPE": 46.28, "enterpriseToEbitda": 30.2,
+            "marketCap": 1.79e12, "freeCashflow": 30.6e9, "trailingPegRatio": 1.1, "priceToSalesTrailing12Months": 28.0}
+    est = {"0y": {"avg": 11.57}, "+1y": {"avg": 19.39}}
+    peers = {"NVDA": {"forwardPE": 30.1, "trailingPE": 45.0, "enterpriseToEbitda": 28.0, "priceToSalesTrailing12Months": 22.0},
+             "AMD": {"forwardPE": 35.0}, "MRVL": {"error": "down"}}
+    text = "\n".join(valuation.format_valuation_lines(info, est, peers, 2026))
+    assert text.startswith("[VALUATION] (computed by code")
+    assert "FCF yield (TTM FCF / market cap): 1.71%" in text
+    assert "- Peer NVDA: fwd P/E 30.1 | trailing P/E 45.0 | EV/EBITDA 28.0 | P/S 22.0" in text
+    assert "- Peer MRVL" not in text and "Peer median forward P/E: 32.5" in text
+    # base case at today's forward multiple reproduces the current price, by construction
+    assert "next-FY FY2027 consensus EPS $19.39 (non-GAAP): bear 15.5x = $300.62 (-20.0% vs price) | base 19.4x = $375.78 (-0.0% vs price)" in text
+    assert "FY2027 EPS at the peer median 32.5x: $631.14 (+67.9% vs price)" in text
+    # every implied price in the table traces as a packet number
+    assert tracer.trace_claim("$300.62", text) == "CITED"
+    assert valuation.format_valuation_lines({}, {}, {}) == []
+
+
+def test_judge_prompt_has_checklist_and_verdict_format():
+    j = prompts.JUDGE_SYSTEM_PROMPT
+    assert j.startswith(prompts.JUDGE_SYSTEM_PROMPT_NOTEBOOK)
+    for needle in ("Period and basis", "Overlapping categories", "48% + top-five end customers 40%",
+                   "Competitor or customer", "Which year's EPS", "[VALUATION] scenario table",
+                   "Debates that move the stock:", "What would change this view:", "Next catalyst:"):
+        assert needle in j, needle
+    assert "do not compute your own multiple" in j
+    assert prompts.BULL_SYSTEM_PROMPT.endswith(prompts.ANALYST_ADDENDUM) and "never call a" in prompts.BEAR_SYSTEM_PROMPT
+    assert "[FILINGS ADDENDUM" in prompts.NEWS_VERIFY_SYSTEM_PROMPT

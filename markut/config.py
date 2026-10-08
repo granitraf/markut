@@ -70,3 +70,14 @@ DEFAULT_MAX_ROUNDS = 2
 ARGUMENT_MAX_TOKENS = 1000
 ARGUMENT_RETRY_MAX_TOKENS = 1600
 ARGUMENT_WORD_BUDGET = 450
+
+# peer comparison for the [VALUATION] block (configurable per ticker; a ticker
+# with no entry gets no peer rows, never a guess)
+PEERS = {
+    "AVGO": ["NVDA", "AMD", "MRVL"],
+    "NVDA": ["AMD", "AVGO", "INTC"],
+    "AMD": ["NVDA", "INTC", "AVGO"],
+    "GLW": ["AMAT", "LRCX", "COHR"],
+    "AAPL": ["MSFT", "GOOGL", "DELL"],
+    "MSFT": ["AAPL", "GOOGL", "ORCL"],
+}
