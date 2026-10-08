@@ -1,30 +1,15 @@
 """Deterministic valuation block (AUDIT FIX run #2, item 10): multiples the
-agents READ but never compute — EV/EBITDA, FCF yield, PEG, a peer comparison
-table, and a bear/base/bull table of consensus EPS × multiple → implied price.
-The judge is instructed to cite this table instead of doing its own
-arithmetic; the governor's scenario check polices the rest.
+agents READ but never compute — EV/EBITDA, FCF yield, PEG, and a
+bear/base/bull table of consensus EPS × multiple → implied price. The judge is
+instructed to cite this table instead of doing its own arithmetic; the
+governor's scenario check polices the rest.
 
-Everything here is pure except fetch_peer_metrics (yfinance, fail-soft)."""
-import statistics
-
-from markut import config
+No peer comparison, on purpose: peers need a curated list per ticker, and a
+list only covers the symbols someone thought of (ask for CAKE and it is
+empty). Everything here comes from the company's own data and is PURE."""
 from markut.evidence.market import fmt_price, fmt_ratio, fmt_pct
 
-PEER_FIELDS = ("forwardPE", "trailingPE", "enterpriseToEbitda", "priceToSalesTrailing12Months")
 SCENARIO_MULTIPLE_SPREAD = 0.20   # bear/bull multiples sit ±20% around today's forward P/E
-
-
-def fetch_peer_metrics(peers: list) -> dict:
-    # yfinance per peer; one broken peer costs one row, never the block
-    import yfinance as yf
-    out = {}
-    for p in peers or []:
-        try:
-            info = yf.Ticker(p).info or {}
-            out[p] = {k: info.get(k) for k in PEER_FIELDS}
-        except Exception as e:
-            out[p] = {"error": str(e)}
-    return out
 
 
 def _num(x):
@@ -35,9 +20,9 @@ def _num(x):
         return None
 
 
-def format_valuation_lines(info: dict, estimates: dict, peers: dict, current_fy=None) -> list:
-    """PURE. info = yfinance info; estimates = {"0y": {"avg":..}, "+1y": {...}};
-    peers = {"NVDA": {forwardPE:.., ...}, ...}. Returns packet lines."""
+def format_valuation_lines(info: dict, estimates: dict, current_fy=None) -> list:
+    """PURE. info = yfinance info; estimates = {"0y": {"avg":..}, "+1y": {...}}.
+    Returns packet lines."""
     lines = ["[VALUATION] (computed by code from the figures above — cite these rows; do not compute your own implied prices)"]
     price = _num(info.get("currentPrice"))
 
@@ -51,37 +36,7 @@ def format_valuation_lines(info: dict, estimates: dict, peers: dict, current_fy=
         add("FCF yield (TTM FCF / market cap)", fmt_pct(fcf / mc), "computed")
     add("PEG (trailing, yfinance)", fmt_ratio(_num(info.get("trailingPegRatio") or info.get("pegRatio"))))
 
-    # ---- peer table ----
-    fwd_pes = []
-    rows = []
-    for sym, m in (peers or {}).items():
-        if not isinstance(m, dict) or m.get("error"):
-            continue
-        parts = []
-        for key, label in (("forwardPE", "fwd P/E"), ("trailingPE", "trailing P/E"),
-                           ("enterpriseToEbitda", "EV/EBITDA"), ("priceToSalesTrailing12Months", "P/S")):
-            v = _num(m.get(key))
-            if v is not None:
-                parts.append(f"{label} {v:.1f}")
-        if _num(m.get("forwardPE")) is not None:
-            fwd_pes.append(_num(m["forwardPE"]))
-        if parts:
-            rows.append(f"- Peer {sym}: " + " | ".join(parts) + "  [source: yfinance/info]")
     own_fwd = _num(info.get("forwardPE"))
-    if rows:
-        own = []
-        for key, label in (("forwardPE", "fwd P/E"), ("trailingPE", "trailing P/E"),
-                           ("enterpriseToEbitda", "EV/EBITDA"), ("priceToSalesTrailing12Months", "P/S")):
-            v = _num(info.get(key))
-            if v is not None:
-                own.append(f"{label} {v:.1f}")
-        lines.append("- Peer comparison (same yfinance fields; forward P/E on non-GAAP consensus):")
-        if own:
-            lines.append("- This company: " + " | ".join(own) + "  [source: yfinance/info]")
-        lines.extend(rows)
-    peer_median = statistics.median(fwd_pes) if fwd_pes else None
-    if peer_median is not None:
-        add("Peer median forward P/E", f"{peer_median:.1f}", "computed")
 
     # ---- scenario table: consensus EPS × multiple → implied price ----
     if own_fwd and price:
@@ -98,8 +53,4 @@ def format_valuation_lines(info: dict, estimates: dict, peers: dict, current_fy=
                 implied = eps * m
                 cells.append(f"{name} {m:.1f}x = {fmt_price(implied)} ({(implied / price - 1) * 100:+.1f}% vs price)")
             lines.append(f"- Implied price from {label}{fy} consensus EPS {fmt_price(eps)} (non-GAAP): " + " | ".join(cells) + "  [source: computed]")
-            if peer_median is not None and key == "+1y":   # one peer-median row (next FY) is enough
-                implied = eps * peer_median
-                lines.append(f"- Implied price from {label}{fy} EPS at the peer median {peer_median:.1f}x: {fmt_price(implied)} "
-                             f"({(implied / price - 1) * 100:+.1f}% vs price)  [source: computed]")
     return lines if len(lines) > 1 else []

@@ -290,7 +290,7 @@ def market_snapshot(ticker: str) -> str:
 
     # ---- VALUATION (deterministic; AUDIT FIX item 10) ----
     try:
-        from markut.evidence.valuation import fetch_peer_metrics, format_valuation_lines
+        from markut.evidence.valuation import format_valuation_lines
         est_rows = {}
         try:
             est = t.earnings_estimate
@@ -304,8 +304,7 @@ def market_snapshot(ticker: str) -> str:
                 cur_fy = datetime.fromtimestamp(float(info["nextFiscalYearEnd"])).year
         except Exception:
             cur_fy = None
-        peers = fetch_peer_metrics(config.PEERS.get(symbol, []))
-        val = format_valuation_lines(info, est_rows, peers, cur_fy)
+        val = format_valuation_lines(info, est_rows, cur_fy)
         if val:
             out.append("")
             out.extend(val)

@@ -160,8 +160,9 @@ the LangGraph topology is unchanged.
   by materiality; a market-context block (returns, distance from highs,
   earnings reaction).
 - **Analytical depth.** A deterministic `[VALUATION]` block (EV/EBITDA, FCF
-  yield, PEG, configurable peers in `config.PEERS`, consensus EPS × multiple
-  bear/base/bull table) that agents cite instead of computing; a judge
+  yield, PEG, consensus EPS × multiple bear/base/bull table; no peer table —
+  peers would need a curated list per ticker, which cannot cover an arbitrary
+  symbol) that agents cite instead of computing; a judge
   checklist and a verdict format ending with the debates that move the stock,
   what would change the view, and the next catalyst. Notebook prompts remain
   byte-identical as `*_NOTEBOOK` constants; live prompts extend them.

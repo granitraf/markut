@@ -76,13 +76,6 @@ JUDGE_MAX_TOKENS = 4000
 # claim-review reply cap (run #7: 1400 was cut twice once the review restated the whole verdict)
 CLAIM_REVIEW_MAX_TOKENS = 2500
 
-# peer comparison for the [VALUATION] block (configurable per ticker; a ticker
-# with no entry gets no peer rows, never a guess)
-PEERS = {
-    "AVGO": ["NVDA", "AMD", "MRVL"],
-    "NVDA": ["AMD", "AVGO", "INTC"],
-    "AMD": ["NVDA", "INTC", "AVGO"],
-    "GLW": ["AMAT", "LRCX", "COHR"],
-    "AAPL": ["MSFT", "GOOGL", "DELL"],
-    "MSFT": ["AAPL", "GOOGL", "ORCL"],
-}
+# NOTE: there is deliberately NO per-ticker peer table. A hand-picked list only
+# ever covers the tickers someone thought of; any other symbol would get nothing
+# or, worse, a guess that looks authoritative. Valuation uses the company's own data.
