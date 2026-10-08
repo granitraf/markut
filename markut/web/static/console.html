@@ -35,6 +35,12 @@
   .out .timeline { gap: 10px; }
   .out .card { padding: 12px 14px; }
   .out .card.route { padding: 0 14px; }
+  .help { display: grid; grid-template-columns: max-content 1fr; gap: 3px 22px; margin: 8px 0 14px 2ch; max-width: 80ch; font-size: 14px; }
+  .help .hg { grid-column: 1 / -1; color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .1em; margin-top: 8px; }
+  .help .hg:first-child { margin-top: 0; }
+  .help .hc { color: var(--ink); white-space: nowrap; }
+  .help .hd { color: var(--muted); }
+  .help .green { color: var(--green); }
   .status { color: var(--muted); }
   .status b { color: var(--ink); font-weight: 500; }
   .status .pill { border-color: var(--line); }
@@ -101,13 +107,20 @@
     setStep("ticker"); window.scrollTo({ top: 0, behavior: "instant" }); reader.focus();
   }
   function help() {
-    println("commands", "info");
-    println("  <ticker>              start a debate on that symbol (then rounds, then run debate)");
-    println("  replay <ticker> [date] replay a stored run — press Tab to cycle through that ticker's run dates");
-    println("  download <ticker> [date] download the run as a PDF equity report (same Tab cycling)");
-    println("  runs [ticker]         list stored runs");
-    println("  archive               open the archive table");
-    println("  clear                 clear the screen");
+    // a two-column grid, not padded spaces: commands align whatever their length
+    const groups = [
+      ["run a debate", [["<ticker>", "start a debate on that symbol — then rounds, then <span class=\"green\">run debate</span>"]]],
+      ["stored runs", [["replay <ticker> [date]", "replay a stored run agent by agent · Tab cycles the dates"],
+                       ["download <ticker> [date]", "PDF equity report of a run · Tab cycles the dates"],
+                       ["runs [ticker]", "list stored runs"],
+                       ["archive", "open the archive table"]]],
+      ["screen", [["clear", "clear the screen · also ctrl+l or the button top right"],
+                  ["cancel", "back out of a step, or stop watching a live run"]]],
+      ["keys", [["Tab", "complete a ticker or cycle run dates"], ["↑ ↓", "command history"], ["ctrl+c", "cancel the current line"]]],
+    ];
+    const html = groups.map(([g, rows]) => `<div class="hg">${esc(g)}</div>` +
+      rows.map(([c, d]) => `<div class="hc">${esc(c)}</div><div class="hd">${d}</div>`).join("")).join("");
+    const box = document.createElement("div"); box.className = "help"; box.innerHTML = html; term.appendChild(box); scroll();
   }
   async function listRuns(t) {
     const runs = await fetchRuns(t);
