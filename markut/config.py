@@ -73,6 +73,8 @@ ARGUMENT_WORD_BUDGET = 450
 # judge reply cap (run #6: the checklist + closing sections overran 2000 and the
 # JSON was cut mid-string twice). Length limits live in the prompt; the cap is headroom.
 JUDGE_MAX_TOKENS = 4000
+# claim-review reply cap (run #7: 1400 was cut twice once the review restated the whole verdict)
+CLAIM_REVIEW_MAX_TOKENS = 2500
 
 # peer comparison for the [VALUATION] block (configurable per ticker; a ticker
 # with no entry gets no peer rows, never a guess)

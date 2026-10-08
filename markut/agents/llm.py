@@ -93,6 +93,10 @@ def call_claude(system_prompt: str, user_content: str, max_tokens: int = 1000, s
             TOKENS["calls"] += 1
             global LAST_STOP_REASON
             LAST_STOP_REASON = getattr(response, "stop_reason", "end_turn") or "end_turn"
+            # one line per call: where the tokens went (uncached / cache write / cache read) and how it stopped
+            print(f"CALL: in={response.usage.input_tokens} cache_w={getattr(response.usage, 'cache_creation_input_tokens', 0) or 0} "
+                  f"cache_r={getattr(response.usage, 'cache_read_input_tokens', 0) or 0} out={response.usage.output_tokens} "
+                  f"stop={LAST_STOP_REASON}")
             if response.stop_reason == "refusal":
                 details = getattr(response, "stop_details", None)
                 category = getattr(details, "category", None) if details else None

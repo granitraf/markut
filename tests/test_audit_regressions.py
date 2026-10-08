@@ -479,3 +479,28 @@ def test_trims_after_run6():
         {"currentPrice": 100.0, "forwardPE": 20.0, "marketCap": 1e9, "freeCashflow": 5e7},
         {"0y": {"avg": 4.0}, "+1y": {"avg": 5.0}}, {"A": {"forwardPE": 30.0}}, 2026))
     assert text.count("at the peer median") == 1 and "EV/Revenue" not in text
+
+
+# ================================================================ run #7: claim review truncation + crash
+def test_claim_review_truncation_shorter_retry_and_no_crash(stub_llm, monkeypatch, capsys):
+    import markut.evidence.rag as rag
+    monkeypatch.setattr(nodes, "get_related_leads", lambda claims, ticker: "")
+    monkeypatch.setattr(rag, "corroborate_claims", lambda ticker, claims, coll=None, max_hits=2: [])
+    state = {"ticker": "AVGO", "evidence": EVIDENCE6, "verdict": "v", "judge_decision": {"unsupported_claims": ["c1", "c2"]}}
+    cut = '{"claim_reviews":[{"claim":"c1","status":"unresolved","evidence_summary":"long long'
+    good = json.dumps({"claim_reviews": [{"claim": "c1", "status": "unresolved", "evidence_summary": "", "sources": []}],
+                       "reasoning": "ok", "verdict_changed": False, "revised_verdict": ""})
+    # 1. cut off once -> a SHORTER retry (not a repair), which succeeds; empty revised_verdict keeps the verdict
+    calls = stub_llm([cut, good], ["max_tokens", "end_turn"])
+    out = nodes.news_verify_node(dict(state))
+    assert len(calls) == 2 and "MUCH SHORTER" in calls[1]["user"] and "FAILED validation" not in calls[1]["user"]
+    assert calls[0]["max_tokens"] == config.CLAIM_REVIEW_MAX_TOKENS == 2500
+    assert out["verdict"] == "v" and out["claim_verification"]["claim_reviews"][0]["claim"] == "c1"
+    # 2. cut off twice -> fail unresolved WITHOUT crashing (run #7 raised UnboundLocalError here)
+    stub_llm([cut, cut], ["max_tokens", "max_tokens"])
+    out = nodes.news_verify_node(dict(state))
+    reviews = out["claim_verification"]["claim_reviews"]
+    assert [r["status"] for r in reviews] == ["unresolved", "unresolved"] and out["verdict"] == "v"
+    assert "could not be parsed: retry also cut off" in out["claim_verification"]["reasoning"]
+    assert "CLAIM REVIEW DEBUG raw retry reply" in capsys.readouterr().out
+    assert "revised_verdict must be an EMPTY string unless verdict_changed" in prompts.NEWS_VERIFY_SYSTEM_PROMPT

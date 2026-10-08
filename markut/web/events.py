@@ -173,12 +173,14 @@ def stream_debate(ticker: str, max_rounds: int = None, app=None, check_sec: bool
                 yield event_for(node, update or {}, before, state)
                 if node == "judge":
                     # the graph's own conditional edge decides; we only report
-                    # it. (Reading should_continue here mirrors what the graph
-                    # read: same state, same TOKENS, same budget.)
+                    # it. route_reason mirrors should_continue's priority order
+                    # on the same state/TOKENS/budget — calling should_continue
+                    # itself here printed every routing line twice.
+                    reason = route_reason(state)
                     yield {"event": "route", "data": {
                         "round": state["round"],
-                        "decision": should_continue(state),
-                        "reason": route_reason(state)}}
+                        "decision": "continue" if reason == "looping back for rebuttal" else "done",
+                        "reason": reason}}
     except Exception as e:  # fail loudly to the page, never hang the stream
         yield {"event": "error", "data": {"stage": "debate", "message": f"{type(e).__name__}: {e}",
                                           "usage": usage()}}

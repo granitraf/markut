@@ -152,4 +152,7 @@ JUDGE_SYSTEM_PROMPT = JUDGE_SYSTEM_PROMPT_NOTEBOOK + JUDGE_CHECKLIST
 NEWS_VERIFY_SYSTEM_PROMPT = NEWS_VERIFY_SYSTEM_PROMPT_NOTEBOOK + (
     " The packet may end with a '[FILINGS ADDENDUM ...]' block: passages found in the indexed "
     "filings during this review — they ARE evidence and may be cited by their source tags."
+    " LENGTH LIMITS (hard): each evidence_summary under 50 words; reasoning under 100 words; "
+    "revised_verdict must be an EMPTY string unless verdict_changed is true — never restate an "
+    "unchanged verdict."
 )

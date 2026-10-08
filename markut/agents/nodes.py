@@ -303,24 +303,38 @@ def news_verify_node(state: DebateState) -> dict:
     # AUDIT FIX (run #2): every claim came back "invalid JSON". Shape is now
     # schema-enforced; one repair retry shows the model its own reply and the
     # exact validator error; the raw reply is logged on every failure.
-    raw = llm.call_claude(system_prompt, user_content, max_tokens=1400, schema=CLAIM_REVIEW_SCHEMA,
-                          cached_prefix=prefix)
-    verification = None
+    raw = llm.call_claude(system_prompt, user_content, max_tokens=config.CLAIM_REVIEW_MAX_TOKENS,
+                          schema=CLAIM_REVIEW_SCHEMA, cached_prefix=prefix)
+    verification, last_error = None, None
+    truncated_first = llm.LAST_STOP_REASON == "max_tokens"
     try:
+        if truncated_first:
+            raise ValueError("reply cut off at the output cap")
         verification = parse_news_review_json(raw)
     except Exception as first_error:
-        print(f"CLAIM REVIEW: review JSON invalid ({first_error}); one repair retry.")
+        last_error = first_error
+        print(f"CLAIM REVIEW: {'reply truncated' if truncated_first else f'review JSON invalid ({first_error})'}; "
+              f"one {'shorter' if truncated_first else 'repair'} retry.")
         print("CLAIM REVIEW DEBUG raw reply:", (raw or "")[:400])
+        if truncated_first:
+            # RUN #7 FIX: too long is not malformed — ask for less, not for a repair
+            retry_content = (user_content + "\n\nYour previous reply exceeded the output limit and was cut off. "
+                             "Reply again MUCH SHORTER: evidence_summary under 30 words each, reasoning under 60 words, "
+                             "revised_verdict an empty string unless verdict_changed is true. Finish the JSON.")
+        else:
+            retry_content = (user_content + "\n\nYour previous response FAILED validation with this exact error:\n  "
+                             + str(first_error) + "\n\nYour previous response was:\n" + (raw or "")
+                             + "\n\nFix exactly that problem and respond again with the JSON object only.")
         try:
-            raw_retry = llm.call_claude(
-                system_prompt,
-                user_content + "\n\nYour previous response FAILED validation with this exact error:\n  "
-                + str(first_error) + "\n\nYour previous response was:\n" + (raw or "")
-                + "\n\nFix exactly that problem and respond again with the JSON object only.",
-                max_tokens=1400, schema=CLAIM_REVIEW_SCHEMA, cached_prefix=prefix)
+            raw_retry = llm.call_claude(system_prompt, retry_content, max_tokens=config.CLAIM_REVIEW_MAX_TOKENS,
+                                        schema=CLAIM_REVIEW_SCHEMA, cached_prefix=prefix)
+            if llm.LAST_STOP_REASON == "max_tokens":
+                raise ValueError("retry also cut off at the output cap")
             verification = parse_news_review_json(raw_retry)
-        except Exception as e:
-            print(f"CLAIM REVIEW: repair retry also failed ({e}); preserving verdict and failing unresolved.")
+        except Exception as second_error:
+            last_error = second_error
+            print(f"CLAIM REVIEW: retry also failed ({second_error}); preserving verdict and failing unresolved.")
+            print("CLAIM REVIEW DEBUG raw retry reply:", (locals().get('raw_retry') or '')[:400])
     if verification is not None:
         verification.setdefault("reasoning", "")
         verification.setdefault("verdict_changed", False)
@@ -331,7 +345,7 @@ def news_verify_node(state: DebateState) -> dict:
                  "evidence_summary": "Claim-review response was invalid JSON.", "sources": []}
                 for claim in remaining
             ],
-            "reasoning": f"Claim review could not be parsed: {e}",
+            "reasoning": f"Claim review could not be parsed: {last_error}",
             "verdict_changed": False,
             "revised_verdict": state["verdict"],
         }
