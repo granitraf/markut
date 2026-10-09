@@ -12,12 +12,12 @@ API
   GET /api/health                liveness (no DB, no models) + feature flags — Railway's health check
   GET /api/featured              latest finished run per ticker (public presets, max 5)
   GET /api/article               the public article (markdown; edit content/article.md)
-  GET /api/runs[?ticker=NVDA]    OPERATOR: the run log (summary rows, newest first)
+  GET /api/runs[?ticker=XYZ]     OPERATOR: the run log (summary rows, newest first)
   GET /api/runs/{id}             one run: summary + every turn + every event
   GET /api/runs/{id}/report.pdf  the run as an equity-style PDF report (built from the store, <1s)
   GET /api/replay?run=ID[&speed] SSE replay of a stored run (free)
-  GET /api/debate?ticker=NVDA&max_rounds=2
-                                 OPERATOR: SSE live debate (paid: 8-12 model calls); stored when done
+  GET /api/debate?ticker=XYZ&max_rounds=2
+                                 OPERATOR: SSE live debate (paid: 10-14 model calls; at least 2 rounds); stored when done
 
 WHY Server-Sent Events: one plain HTTP response the browser keeps open, one
 "event: NAME / data: JSON" block per graph node. No websockets, no polling,
@@ -150,8 +150,11 @@ OPERATOR = [Depends(require_console)]
 
 def sse(event: dict) -> str:
     # one SSE block; ensure_ascii keeps the wire pure ASCII so em-dashes in
-    # verdicts survive any proxy that mangles encodings
-    return f"event: {event['event']}\ndata: {json.dumps(event['data'], ensure_ascii=True)}\n\n"
+    # verdicts survive any proxy that mangles encodings. The turn id rides as
+    # the SSE id field too, so a reconnecting browser reports where it was.
+    tid = (event.get("data") or {}).get("turn_id")
+    head = f"id: {tid}\n" if tid else ""
+    return f"{head}event: {event['event']}\ndata: {json.dumps(event['data'], ensure_ascii=True)}\n\n"
 
 
 def stamped(event: dict) -> dict:
@@ -185,7 +188,8 @@ def health():
     # the models, so a slow Supabase or a loading model never reads as "down"
     rag = sys.modules.get("markut.evidence.rag")
     return {"ok": True, "model": config.MODEL_NAME, "token_budget": config.TOKEN_BUDGET,
-            "default_max_rounds": config.DEFAULT_MAX_ROUNDS, "db_path": store.backend_label(),
+            "default_max_rounds": config.DEFAULT_MAX_ROUNDS, "min_rounds": config.MIN_ROUNDS,
+            "graph": "profiler-planner-research-coverage-debate-review", "db_path": store.backend_label(),
             "db_backend": "postgres" if store.is_postgres() else "sqlite",
             "live_enabled": bool(config.ANTHROPIC_API_KEY), "live_busy": live_busy(),
             "console_locked": config.IN_PRODUCTION and not config.CONSOLE_PASSWORD,
@@ -260,7 +264,7 @@ def runs(ticker: str = Query(None)):
 
 @app.get("/api/debate", dependencies=OPERATOR)
 async def debate_stream(ticker: str = Query(...),
-                        max_rounds: int = Query(config.DEFAULT_MAX_ROUNDS, ge=1, le=MAX_ROUNDS_CAP)):
+                        max_rounds: int = Query(config.DEFAULT_MAX_ROUNDS, ge=config.MIN_ROUNDS, le=MAX_ROUNDS_CAP)):
     global _live_job
     _ensure_store()
 

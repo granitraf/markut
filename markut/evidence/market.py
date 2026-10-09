@@ -87,11 +87,14 @@ def format_market_lines(info: dict) -> list:
     # companies. Unlabeled, the pair reads like "earnings will double" when it
     # is really GAAP-vs-non-GAAP across different years.
     add("P/E (trailing TTM, GAAP EPS)", fmt_ratio(info.get("trailingPE")))
-    add("P/E (forward, on next-FY consensus non-GAAP EPS)", fmt_ratio(info.get("forwardPE")))
+    # the forward multiple is price / the SAME next-FY consensus EPS the
+    # valuation grid uses (forwardEps), never a second provider field
+    fwd_pe = forward_pe(info)
+    add("P/E (forward, price / next-FY consensus non-GAAP EPS)", fmt_ratio(fwd_pe), "computed" if fwd_pe else "yfinance/info")
     add("Price/Book (mrq)", fmt_ratio(info.get("priceToBook")))
     add("EPS (trailing TTM, GAAP)", fmt_price(info.get("trailingEps")))
     # yfinance forwardEps is the NEXT-FISCAL-YEAR consensus (it equals the
-    # earnings_estimate "+1y" average — verified on AVGO: both $19.39), not a
+    # earnings_estimate "+1y" average — verified live: identical values), not a
     # rolling 12-month figure; the P/E built on it is a next-FY multiple
     add("EPS (forward, consensus non-GAAP, next fiscal year)", fmt_price(info.get("forwardEps")))
 
@@ -103,7 +106,12 @@ def format_market_lines(info: dict) -> list:
     # percent-style number (e.g. 12.95 means 12.95%). Multiplying by 100 again
     # would print a wildly wrong figure the agents would happily argue about.
     add("Debt/Equity (mrq, %)", fmt_ratio(info.get("debtToEquity")))
-    add("Free cash flow (TTM)", fmt_big(info.get("freeCashflow")))
+    fcf = info.get("_fcf_quarters") or {}
+    if fcf.get("fcf") is not None:
+        add(f"Free cash flow (TTM: last 4 quarters of operating cash flow {fmt_big(fcf['ocf'])} less capex {fmt_big(-fcf['capex'])}, "
+            f"quarters to {fcf['quarters'][0]})", fmt_big(fcf["fcf"]), "yfinance/quarterly_cashflow, computed")
+    elif info.get("freeCashflow") is not None:
+        add("Free cash flow (TTM, data-provider field; quarterly cash flow unavailable)", fmt_big(info.get("freeCashflow")))
     # AUDIT FIX (run #2): yfinance revenueGrowth is the MOST RECENT QUARTER vs
     # the same quarter a year earlier — NOT annual growth. Labeled "(yoy)" it
     # was quoted as "revenue grew 85.5% in FY2025". The annual figure is
@@ -111,6 +119,38 @@ def format_market_lines(info: dict) -> list:
     add("Revenue growth (MRQ YoY, most recent quarter vs year-ago quarter)", fmt_pct(info.get("revenueGrowth")))
     add("Earnings growth (MRQ YoY)", fmt_pct(info.get("earningsGrowth")))
     return lines
+
+
+def forward_pe(info: dict):
+    # PURE. price / forwardEps (the next-FY consensus); the provider's own
+    # forwardPE only when one of the two inputs is missing
+    try:
+        price, eps = float(info.get("currentPrice")), float(info.get("forwardEps"))
+        if price > 0 and eps > 0:
+            return price / eps
+    except (TypeError, ValueError):
+        pass
+    return info.get("forwardPE")
+
+
+def fcf_from_quarterly(cf) -> dict:
+    """PURE over a yfinance quarterly_cashflow frame: free cash flow as the
+    last four quarters of (operating cash flow + capital expenditure, which
+    the provider reports negative). {} when fewer than four quarters."""
+    try:
+        if cf is None or "Operating Cash Flow" not in cf.index or "Capital Expenditure" not in cf.index:
+            return {}
+        cols = list(cf.columns)[:4]
+        if len(cols) < 4:
+            return {}
+        ocf = [float(cf.loc["Operating Cash Flow", c]) for c in cols]
+        capex = [float(cf.loc["Capital Expenditure", c]) for c in cols]
+        if any(v != v for v in ocf + capex):
+            return {}
+        return {"fcf": sum(ocf) + sum(capex), "ocf": sum(ocf), "capex": sum(capex),
+                "quarters": [str(c)[:10] for c in cols]}
+    except Exception:
+        return {}
 
 
 def fy_growth_lines(annuals: list) -> list:
@@ -284,6 +324,14 @@ def market_snapshot(ticker: str) -> str:
     except Exception as e:
         all_closes = []
         out.append(f"[price history unavailable: {e}]")
+
+    # FCF = last four quarters of (operating cash flow - capex), never the
+    # provider's single freeCashflow field (it lagged the filings by a year)
+    try:
+        info["_fcf_quarters"] = fcf_from_quarterly(t.quarterly_cashflow)
+    except Exception as e:
+        info["_fcf_quarters"] = {}
+        out.append(f"[quarterly cash flow unavailable: {e}]")
 
     # ---- 1 & 2. QUOTE & VALUATION + FUNDAMENTALS (info-derived, pure part) ----
     try:

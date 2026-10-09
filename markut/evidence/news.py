@@ -386,7 +386,7 @@ def score_news_item(item: dict, identity: dict, context_query: str = "", now: fl
     # WHY identity over title+summary COMBINED, and ticker OR company name:
     # (a) title-only matching would over-filter the exact items that carry
     #     text depth — plenty of stories name the company only in the blurb;
-    # (b) a per-ticker feed's headlines often say "NVDA", never "NVIDIA", so
+    # (b) a per-ticker feed's headlines often say the ticker, never the company name, so
     #     with Yahoo as the ONLY source the ticker must count as identity.
     #     (Ticker counts only at 3+ letters: a 1-2 letter ticker like KO
     #     collides with ordinary words, and its stories name the company.)

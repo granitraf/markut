@@ -155,18 +155,29 @@ def _md_flow(text: str, st: dict) -> list:
     return out
 
 
+METRIC_SECTIONS = ("QUOTE & VALUATION", "FUNDAMENTALS", "VALUATION", "ANALYST VIEW", "EVENTS", "MARKET CONTEXT", "DCF")
+
+
 def parse_packet(evidence: str) -> tuple:
-    """Market section of the packet -> [(section, [(key, value, source)])], plus the rest."""
+    """Market sections of the packet -> [(section, [(key, value, source)])], plus
+    everything else (profile, questions, filings, news, gaps) as text."""
     lines = str(evidence or "").split("\n")
-    grid, section, i = [], None, 0
-    for i, raw in enumerate(lines):
+    grid, section, rest_lines = [], None, []
+    for raw in lines:
         l = raw.strip()
         if not l:
+            if section is None:
+                rest_lines.append(raw)
             continue
-        m = re.match(r"^\[([^\]]+)\]$", l)
-        if m:
-            section = {"name": m.group(1), "rows": []}; grid.append(section); continue
-        if section and section["name"] == "DATA GAPS":
+        m = re.match(r"^\[([^\]]+)\](?:\s|$)", l)
+        if m and "unavailable" not in l:
+            if m.group(1) in METRIC_SECTIONS:
+                section = {"name": m.group(1), "rows": []}; grid.append(section); continue
+            section = None
+        if section is None:
+            rest_lines.append(raw)
+            continue
+        if section["name"] == "DATA GAPS":
             continue   # rendered in the title block, not as metrics
         m = re.match(r"^-\s+((?:BASIS|PERIOD)\s+NOTE|[A-Z][A-Z ]{2,}NOTE)\s*:\s*(.*?)\s*(?:\[source:[^\]]*\])?$", l)
         if m and section:
@@ -177,10 +188,8 @@ def parse_packet(evidence: str) -> tuple:
         m = re.match(r"^-\s+([^:]+):\s+(.*?)\s*(?:\[source:\s*([^\]]+)\])?$", l)
         if m and section:
             section["rows"].append((m.group(1), m.group(2), m.group(3) or "")); continue
-        break
-    else:
-        i = len(lines)
-    rest = "\n".join(lines[i:]).strip() if i < len(lines) else ""
+        rest_lines.append(raw)
+    rest = "\n".join(rest_lines).strip()
     return [s for s in grid if (s["rows"] or s.get("notes")) and s["name"] != "DATA GAPS"], rest
 
 
@@ -254,6 +263,16 @@ def build_report(run: dict) -> bytes:
         known = [i.split(":", 1)[1].strip() for i in items if i.startswith("known gap")]
         story.append(Paragraph("<b>Data gaps:</b> " + (escape("; ".join(missing)) if missing else "none — every evidence source responded")
                                + (("  ·  <i>known: " + escape("; ".join(known)) + "</i>") if known else ""), st["small"]))
+    # the company profile and the planner's questions, when the run had them
+    prof = ((by.get("profiler") or [{}])[0]).get("profile") or {}
+    plan = ((by.get("planner") or [{}])[0]).get("plan") or {}
+    if prof.get("business") or plan.get("key_questions"):
+        story.append(Spacer(1, 4))
+        if prof.get("business"):
+            story.append(Paragraph("<b>Company profile:</b> " + _inline(prof["business"])
+                                   + (f"  ·  <i>{escape(str(prof.get('archetype', '')).replace('_', ' '))}</i>" if prof.get("archetype") else ""), st["small"]))
+        for q in plan.get("key_questions", []):
+            story.append(Paragraph(f"<b>{escape(str(q.get('id', '')))}</b> {_inline(q.get('question', ''))}", st["small"]))
     story.append(Spacer(1, 6))
 
     # ---- key metrics ----

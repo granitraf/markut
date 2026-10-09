@@ -16,13 +16,18 @@ _FINANCE_NOUNS = ("revenue", "earnings", "eps", "margin", "margins", "growth",
 
 # Ordered alternation — ranges BEFORE single percents so "30-40%" is captured
 # as ONE claim instead of a stray "40%"; dollars carry their scale suffix/word.
+# IDENTIFIERS are not claims: the digit inside Q4, FY2027, p25, 10-K, 10-Q,
+# 8-K or a date (2026-10-27) is never the start of a number (the lookbehinds),
+# and a bare year before a finance noun ("2026 revenue") is a label, not a
+# quantity (the lookahead).
 _CLAIM_RE = re.compile(
-    r"""\$\s?\d[\d,]*(?:\.\d+)?(?:\s*(?:trillion|billion|million|thousand)\b|\s?[TBMKtbmk]\b)?
+    r"""(?<![A-Za-z0-9.])(?<![0-9]-)(?<![0-9]/)
+    (?: \$\s?\d[\d,]*(?:\.\d+)?(?:\s*(?:trillion|billion|million|thousand)\b|\s?[TBMKtbmk]\b)?
       | \d+(?:\.\d+)?\s*(?:-|–|\bto\b)\s*\d+(?:\.\d+)?\s*%
       | \d+(?:\.\d+)?\s*%
       | \d+(?:\.\d+)?\s?x\b
-      | \d[\d,]*(?:\.\d+)?(?:\s+(?:trillion|billion|million|thousand))?\s+(?:__NOUNS__)\b
-    """.replace("__NOUNS__", "|".join(_FINANCE_NOUNS)),
+      | (?!(?:19|20)\d\d\s+(?:__NOUNS__)\b)\d[\d,]*(?:\.\d+)?(?:\s+(?:trillion|billion|million|thousand))?\s+(?:__NOUNS__)\b
+    )""".replace("__NOUNS__", "|".join(_FINANCE_NOUNS)),
     re.VERBOSE | re.IGNORECASE)
 
 
@@ -168,7 +173,7 @@ def has_disclaimer(text: str) -> bool:
     return any(pattern in lowered for pattern in DISCLAIMER_PATTERNS)
 
 
-# ---------------- AUDIT PASS (run #2, AVGO): label binding, arithmetic, scenarios ----------------
+# ---------------- AUDIT PASS (run #2): label binding, arithmetic, scenarios ----------------
 # WHY these exist: number PRESENCE is not number TRUTH. "revenue grew 85.5% in
 # FY2025" passed the tracer because 85.5% sits in the packet — as the most-
 # recent-QUARTER growth rate. And "46.28x on $8.12 EPS implies material
@@ -229,6 +234,12 @@ def nearest_period(clause: str, start: int, end: int) -> str:
                 after = (d, name)
         else:
             return name  # marker overlaps the span itself
+    # "46.37x on trailing TTM GAAP EPS", "$8.12 of trailing EPS": a marker
+    # joined to the figure by on/of/for/at/in names ITS basis, whatever
+    # preceded the figure
+    tail = clause[end:]
+    if after and re.match(r"\s+(?:on|of|for|at|in|over)\s+", tail) and after[0] <= 40:
+        return after[1]
     if before:
         return before[1]
     return after[1] if after else ""
@@ -258,6 +269,8 @@ def packet_labels(evidence: str) -> dict:
     # because a sentence can carry several periods at once.
     labels = {}
     for line in (evidence or "").split("\n"):
+        if re.match(r"^\s*-\s+(?:\[|\")", line):
+            continue   # a tagged filing excerpt or a quote, not a labeled figure
         m = re.match(r"^\s*-\s+([^:]{3,120}):\s+(.+?)\s*(?:\[source:[^\]]*\])?\s*$", line)
         if not m:
             continue
@@ -269,7 +282,8 @@ def packet_labels(evidence: str) -> dict:
     return labels
 
 
-_CLAUSE_SPLIT = re.compile(r"[;:()\"\[\]]|,\s|\s[—–-]\s")
+_CLAUSE_SPLIT = re.compile(r"[;:()\"\[\]]|,\s|\s[—–-]\s|\s(?:and|or|versus|vs\.?|while|whereas|but|against|compared (?:with|to))\s",
+                           re.IGNORECASE)
 
 
 def claim_contexts(text: str) -> list:

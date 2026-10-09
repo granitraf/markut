@@ -80,8 +80,8 @@
   let tickers = [];                                   // every ticker in the archive
 
   const HINTS = {
-    ticker: () => `input your ticker symbol eg. NVDA`,
-    rounds: () => `input amount of debate rounds (max 3)`,
+    ticker: () => `input a ticker symbol`,
+    rounds: () => `debate rounds: 2 (default) or 3 — Enter for 2`,
     confirm: () => `to start stock analysis, confirm with <span class="green">run debate</span>`,
     running: () => `debate in progress — output below`,
   };
@@ -171,7 +171,7 @@
     }
     if (step === "rounds") {
       const n = text === "" ? 2 : Number(text);
-      if (!Number.isInteger(n) || n < 1 || n > 3) return println("rounds must be 1, 2 or 3", "err");
+      if (!Number.isInteger(n) || n < 2 || n > 3) return println("rounds must be 2 or 3 — every debate has at least one rebuttal round", "err");
       rounds = n; println(`${n} round${n === 1 ? "" : "s"}`, "dim"); return setStep("confirm");
     }
     if (step === "confirm") {

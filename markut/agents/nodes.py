@@ -54,24 +54,47 @@ def format_history(state: DebateState) -> str:
 
 
 def research_node(state: DebateState) -> dict:
-    print("RESEARCH: fetching LIVE data for", state["ticker"])
-    # One immutable packet per debate — now assembled THROUGH the MCP protocol.
-    # WHY: this agent no longer knows the evidence functions exist; it knows a
-    # protocol. It discovers whatever tools the "markut-evidence" server
-    # offers and calls them by name, so swapping yfinance (or EDGAR, or the
-    # news feed) for another vendor touches ZERO agent code — only the
-    # server-side tool implementation changes. News keeps its epistemic
-    # labels: leads may suggest a question but may not support a fact.
-    # lazy import: the MCP client spins its worker-thread event loop —
-    # keep module import free of that machinery
-    from markut.mcp.client import call_evidence_tools
-    from markut.evidence.gaps import summarize_gaps
-    # AUDIT (run #9, item 5): one clean DATA GAPS block up front; raw parser
-    # errors never reach the agents, the page or the report
-    packet, gaps = summarize_gaps(call_evidence_tools(state["ticker"]))
+    """Question-driven research. The evidence still arrives THROUGH the MCP
+    protocol (discover tools, call them by name — swapping a vendor touches
+    zero agent code), but the filings tool now takes the planner's questions
+    and the packet is composed here in the order every agent reads it:
+    profile -> key questions -> evidence under Q1-Q5 -> general evidence ->
+    guidance -> valuation and market data -> news -> what would mislead ->
+    coverage gaps -> data gaps. A second pass (the coverage gate) reruns the
+    tool with a wider net on the uncovered questions only."""
+    from markut.mcp.client import gather_evidence
+    from markut.evidence.assembly import assemble_packet
+    from markut.evidence.questions import coverage_from_text
+    ticker = state["ticker"]
+    pass_no = (state.get("research_pass") or 0) + 1
+    plan, profile = state.get("plan") or {}, state.get("profile") or {}
+    qids = [q.get("id") for q in plan.get("key_questions", []) if q.get("id")]
+    uncovered = list(state.get("uncovered") or []) if pass_no > 1 else []
+    if pass_no == 1:
+        print(f"RESEARCH: fetching LIVE data for {ticker} — working through {len(qids)} question(s)")
+    else:
+        print(f"RESEARCH (pass {pass_no}): wider net on {', '.join(uncovered) or 'nothing'}")
+    tool_args = {"filings_evidence_tool": {"plan": plan, "profile": profile,
+                                           "profiled_text": state.get("profiled_text") or "",
+                                           "relaxed_questions": uncovered}}
+    market = state.get("market_evidence") or ""
+    results = gather_evidence(ticker, tool_args=tool_args, skip=["market_snapshot_tool"] if market else [])
+    market = market or results.get("market_snapshot_tool", "")
+    filings = results.get("filings_evidence_tool", "")
+    news = results.get("news_evidence_tool", "")
+    # a tool this layer does not know yet rides after the news section
+    extra = "".join(v for k, v in results.items()
+                    if k not in ("market_snapshot_tool", "filings_evidence_tool", "news_evidence_tool"))
+    coverage = coverage_from_text(filings, qids)
+    packet, gaps = assemble_packet(profile, plan, filings, market, (news or "") + extra, coverage,
+                                   research_pass=pass_no, profile_gaps=state.get("profile_gaps") or [],
+                                   profile_sources=state.get("profile_sources") or [])
     if gaps:
         print("RESEARCH: data gaps — " + "; ".join(f"{g['source']} ({g['reason']})" for g in gaps))
-    return {"evidence": packet}
+    print("RESEARCH: coverage " + " ".join(f"{q}:{n}" for q, n in coverage.items()) + f"  (packet {len(packet) // 4:,} tok)")
+    return {"evidence": packet, "coverage": coverage, "uncovered": [q for q, n in coverage.items() if not n],
+            "research_pass": pass_no, "market_evidence": market}
+
 
 def complete_argument(system_prompt: str, user_content: str, label: str, cached_prefix: str = None) -> str:
     """One analyst turn that NEVER hands the judge a half-sentence.
@@ -206,6 +229,8 @@ def judge_node(state: DebateState) -> dict:
             # verdict) is kept and labeled truncated; nothing is invented.
             salvaged = salvage_judge_json(raw_retry) or salvage_judge_json(raw)
             decision = {
+                "questions": salvaged.get("questions") if isinstance(salvaged.get("questions"), list) else [],
+                "planner_coverage": salvaged.get("planner_coverage", ""),
                 "bull_strongest": salvaged.get("bull_strongest", ""),
                 "bear_strongest": salvaged.get("bear_strongest", ""),
                 "unsupported_claims": salvaged.get("unsupported_claims", []),
@@ -216,6 +241,8 @@ def judge_node(state: DebateState) -> dict:
                 "truncated": True,
             }
 
+    decision.setdefault("questions", [])
+    decision.setdefault("planner_coverage", "")
     return {
         "verdict": decision["verdict"],
         "converged": bool(decision["converged"]),
@@ -224,17 +251,94 @@ def judge_node(state: DebateState) -> dict:
     }
 
 
+import re as _re
+
+# the three rulings a reader sees; the model's status vocabulary stays
+# supported / contradicted / unresolved (clearer for the re-audit itself)
+CLAIM_VERDICTS = {"supported": "flag overturned", "contradicted": "flag upheld", "unresolved": "unresolved"}
+
+
+def _claim_key(claim) -> str:
+    return _re.sub(r"[^a-z0-9 ]", "", str(claim).lower()).strip()[:160]
+
+
+def _claim_words(claim) -> set:
+    return {w for w in _re.findall(r"[a-z0-9%$.]+", str(claim).lower()) if len(w) > 2}
+
+
+def claims_similar(a, b, threshold: float = 0.5) -> bool:
+    wa, wb = _claim_words(a), _claim_words(b)
+    if not wa or not wb:
+        return _claim_key(a) == _claim_key(b)
+    return len(wa & wb) / len(wa | wb) >= threshold
+
+
+def dedupe_claims(claims: list) -> list:
+    """PURE. Distinct claims in order: exact duplicates and near-restatements
+    (word-set Jaccard >= 0.8) collapse onto the first occurrence."""
+    out = []
+    for c in claims:
+        c = str(c).strip()
+        if not c:
+            continue
+        if any(_claim_key(c) == _claim_key(k) or claims_similar(c, k, 0.8) for k in out):
+            continue
+        out.append(c)
+    return out
+
+
+def claims_from_decision(decision: dict) -> list:
+    """The judge's unsupported claims: the top-level list plus every
+    per-question list, deduped, in order."""
+    raw = (decision or {}).get("unsupported_claims", [])
+    claims = list(raw) if isinstance(raw, list) else ([raw] if raw else [])
+    for q in (decision or {}).get("questions") or []:
+        if isinstance(q, dict):
+            claims += [c for c in (q.get("unsupported_claims") or []) if c]
+    return dedupe_claims([str(c) for c in claims])
+
+
+_INFERENCE_RE = _re.compile(r"(?i)\b(assum\w*|infer\w*|impl(?:y|ies|ied)|rests? on|characteri[sz]\w*|interpret\w*|attribut\w*|"
+                            r"because|driven by|came from|due to|result of|reflects?|suggests?|proves?|establish\w*|causal|"
+                            r"rel(?:y|ies|ied) on|depends? on|requires?|presumes?|extrapolat\w*|reading|treat\w*|view\w*|"
+                            r"as evidence|conclu\w*|signals?|favou?rable|"
+                            r"leverage effect|operating leverage|hinted|momentum|trend)\b")
+
+
+_PRESENCE_RE = _re.compile(r"(?i)appears? only|only in (?:a |the )?news|not in the (?:packet|filings|evidence)|"
+                           r"does not appear|do not appear|no (?:such )?figure|not (?:stated|disclosed|found|present|provided)|"
+                           r"cannot be (?:verified|traced|found)|unsupported figure|no source|not supported by the packet|"
+                           r"packet (?:does not|doesn't) (?:contain|include|state|give|provide)|nowhere in")
+
+
+def inferential(claim) -> bool:
+    """PURE. A flagged claim about an INTERPRETATION ("assumes", "driven by",
+    "is inference") is not settled by finding its figure in a filing; only a
+    claim whose problem is the figure's PRESENCE ("appears only in a news
+    item", "not in the packet") can be overturned by code."""
+    text = str(claim)
+    return bool(_INFERENCE_RE.search(text)) or not _PRESENCE_RE.search(text)
+
+
+def with_verdict(review: dict) -> dict:
+    review = dict(review)
+    review["verdict"] = CLAIM_VERDICTS.get(str(review.get("status", "")).lower(), "unresolved")
+    return review
+
+
 def news_verify_node(state: DebateState) -> dict:
     """Terminal post-Judge step, two INDEPENDENT jobs:
     1. RESOLUTION - re-audit the judge's unsupported claims STRICTLY against
        the evidence packet (one bounded LLM call; the existing revision loop).
     2. ATTACHMENT - semantically-ranked related news leads, stored for display
        under the schema-stable key targeted_news_evidence. Leads are context
-       only; they are never an input to resolution."""
-    raw_claims = state.get("judge_decision", {}).get("unsupported_claims", [])
-    claims = raw_claims if isinstance(raw_claims, list) else ([raw_claims] if raw_claims else [])
-    claims = [str(claim) for claim in claims]
-    print(f"CLAIM REVIEW: re-auditing up to {NEWS_TARGET_MAX_CLAIMS} unsupported claim(s) against the evidence packet")
+       only; they are never an input to resolution.
+    Every claim is reviewed once (deduped), a 'found verbatim' ruling shows the
+    passage that contains the match, and each ruling carries one of three
+    verdicts: flag upheld / flag overturned / unresolved."""
+    claims = claims_from_decision(state.get("judge_decision", {}))
+    print(f"CLAIM REVIEW: re-auditing up to {NEWS_TARGET_MAX_CLAIMS} of {len(claims)} distinct unsupported claim(s) "
+          "against the evidence packet")
 
     # WHY leads never enter resolution — and why there is no "body counts"
     # carve-out either: by the epistemic rule only status "body" or filings-
@@ -256,35 +360,53 @@ def news_verify_node(state: DebateState) -> dict:
         return {"news_checked": True, "targeted_news_evidence": leads,
                 "claim_verification": verification}
 
-    # AUDIT FIX (run #2): CORROBORATE BEFORE DISCARDING. A number the judge
-    # flagged as "untrusted news" may sit verbatim in the filings ("221%" in
-    # the 8-K release, "$29B" in the 10-Q note). Search the indexed filings
-    # first; a hit makes the claim filing-backed, is appended to the evidence
-    # as an addendum the governor can trace against, and is removed from the
-    # paid re-audit. Lazy import: the RAG module loads the local models.
+    # CORROBORATE BEFORE DISCARDING. A number the judge flagged as "untrusted
+    # news" may sit verbatim in the filings. Search the indexed filings first;
+    # a claim whose EVERY figure is found verbatim is filing-backed: the flag
+    # is overturned, the passage that contains the match is shown, the
+    # passage is appended to the evidence as an addendum the governor can
+    # trace against, and the claim leaves the paid re-audit. A claim with no
+    # figure, or with figures only partly found, still goes to the re-audit.
     evidence = state["evidence"]
     corroborated = []
+    candidates = claims[:NEWS_TARGET_MAX_CLAIMS]
     try:
         from markut.evidence.rag import corroborate_claims, format_corroboration_addendum
-        hits = corroborate_claims(state["ticker"], claims[:NEWS_TARGET_MAX_CLAIMS])
+        from markut.guardrails.tracer import extract_numeric_claims
+        hits = corroborate_claims(state["ticker"], candidates)
         if hits:
-            addendum = format_corroboration_addendum(hits)
-            evidence = evidence + "\n\n" + addendum
+            by_claim = {}
             for h in hits:
-                if h["claim"] not in [c["claim"] for c in corroborated]:
-                    corroborated.append({
-                        "claim": h["claim"], "status": "supported",
-                        "evidence_summary": f"{h['number']} found verbatim in the filing: \"{h['text'][:200]}\"",
-                        "sources": [h["metadata"].get("url", "")]})
-            print(f"CLAIM REVIEW: {len(corroborated)} claim(s) corroborated in the filings — promoted, not re-audited")
+                by_claim.setdefault(h["claim"], []).append(h)
+            promoted = []
+            for claim in candidates:
+                numbers = extract_numeric_claims(claim)
+                found = {h["number"] for h in by_claim.get(claim, [])}
+                if numbers and set(numbers) <= found and not inferential(claim):
+                    promoted += by_claim[claim]
+                    first = by_claim[claim][0]
+                    m = first["metadata"]
+                    passages = "; ".join(f"{h['number']}: \u201c{h.get('passage') or h['text'][:240]}\u201d" for h in by_claim[claim])
+                    corroborated.append(with_verdict({
+                        "claim": claim, "status": "supported",
+                        "evidence_summary": (f"every figure found verbatim in the {m.get('form', 'filing')} "
+                                             f"({m.get('section', '?')}, filed {m.get('filing_date', '?')}): {passages}"),
+                        "sources": [h["metadata"].get("url", "") for h in by_claim[claim]]}))
+            # every passage found rides in the addendum: the re-audit sees the
+            # filing text behind an inferential claim's figures too
+            all_hits = [h for hs in by_claim.values() for h in hs]
+            if all_hits:
+                evidence = evidence + "\n\n" + format_corroboration_addendum(all_hits)
+            if promoted:
+                print(f"CLAIM REVIEW: {len(corroborated)} claim(s) corroborated in the filings — flag overturned, not re-audited")
     except Exception as e:
         print(f"CLAIM REVIEW: filing corroboration skipped ({e})")
     corroborated_claims = {c["claim"] for c in corroborated}
-    remaining = [c for c in claims[:NEWS_TARGET_MAX_CLAIMS] if c not in corroborated_claims]
+    remaining = [c for c in candidates if c not in corroborated_claims]
     if not remaining:
         verification = {
             "claim_reviews": corroborated,
-            "reasoning": "Every flagged claim's numbers were found verbatim in the indexed filings.",
+            "reasoning": "Every flagged claim's figures were found verbatim in the indexed filings.",
             "verdict_changed": False,
             "revised_verdict": state["verdict"],
         }
@@ -295,7 +417,7 @@ def news_verify_node(state: DebateState) -> dict:
     # five other jobs in one response. This re-audit examines ONLY the flagged
     # claims, so over-flagged ones can be rescued (supported), genuinely
     # contradicted ones named, and everything else stays unresolved. Runs ONCE
-    # per debate (terminal node), so the ~3k-token packet costs one extra pass.
+    # per debate (terminal node), so the packet costs one extra cached pass.
     system_prompt = prompts.NEWS_VERIFY_SYSTEM_PROMPT
     user_content = (
         f"Ticker: {state['ticker']}\n\n"
@@ -306,9 +428,6 @@ def news_verify_node(state: DebateState) -> dict:
         + (("\n\n" + split_addendum(evidence)[1]) if split_addendum(evidence)[1] else "")
     )
     prefix = evidence_prefix(evidence)
-    # AUDIT FIX (run #2): every claim came back "invalid JSON". Shape is now
-    # schema-enforced; one repair retry shows the model its own reply and the
-    # exact validator error; the raw reply is logged on every failure.
     raw = llm.call_claude(system_prompt, user_content, max_tokens=config.CLAIM_REVIEW_MAX_TOKENS,
                           schema=CLAIM_REVIEW_SCHEMA, cached_prefix=prefix)
     verification, last_error = None, None
@@ -323,7 +442,6 @@ def news_verify_node(state: DebateState) -> dict:
               f"one {'shorter' if truncated_first else 'repair'} retry.")
         print("CLAIM REVIEW DEBUG raw reply:", (raw or "")[:400])
         if truncated_first:
-            # RUN #7 FIX: too long is not malformed — ask for less, not for a repair
             retry_content = (user_content + "\n\nYour previous reply exceeded the output limit and was cut off. "
                              "Reply again MUCH SHORTER: evidence_summary under 30 words each, reasoning under 60 words, "
                              "revised_verdict an empty string unless verdict_changed is true. Finish the JSON.")
@@ -331,6 +449,7 @@ def news_verify_node(state: DebateState) -> dict:
             retry_content = (user_content + "\n\nYour previous response FAILED validation with this exact error:\n  "
                              + str(first_error) + "\n\nYour previous response was:\n" + (raw or "")
                              + "\n\nFix exactly that problem and respond again with the JSON object only.")
+        raw_retry = ""
         try:
             raw_retry = llm.call_claude(system_prompt, retry_content, max_tokens=config.CLAIM_REVIEW_MAX_TOKENS,
                                         schema=CLAIM_REVIEW_SCHEMA, cached_prefix=prefix)
@@ -340,15 +459,40 @@ def news_verify_node(state: DebateState) -> dict:
         except Exception as second_error:
             last_error = second_error
             print(f"CLAIM REVIEW: retry also failed ({second_error}); preserving verdict and failing unresolved.")
-            print("CLAIM REVIEW DEBUG raw retry reply:", (locals().get('raw_retry') or '')[:400])
+            print("CLAIM REVIEW DEBUG raw retry reply:", (raw_retry or "")[:400])
     if verification is not None:
         verification.setdefault("reasoning", "")
         verification.setdefault("verdict_changed", False)
+        # one ruling per submitted claim: the model's entries are matched back
+        # to the claims it was given; restatements of other claims are dropped
+        # and a claim it skipped is recorded as unresolved
+        returned = list(verification.get("claim_reviews") or [])
+        matched, used = [], set()
+        for claim in remaining:
+            best, best_score = None, 0.0
+            for i, r in enumerate(returned):
+                if i in used:
+                    continue
+                wa, wb = _claim_words(claim), _claim_words(r.get("claim", ""))
+                score = (len(wa & wb) / len(wa | wb)) if (wa and wb) else (1.0 if _claim_key(claim) == _claim_key(r.get("claim", "")) else 0.0)
+                if score > best_score:
+                    best, best_score = i, score
+            if best is not None and best_score >= 0.3:
+                used.add(best)
+                matched.append(with_verdict({**returned[best], "claim": claim}))
+            else:
+                matched.append(with_verdict({"claim": claim, "status": "unresolved",
+                                             "evidence_summary": "the re-audit returned no ruling for this claim",
+                                             "sources": []}))
+        dropped = len(returned) - len(used)
+        if dropped:
+            print(f"CLAIM REVIEW: {dropped} returned entr{'y' if dropped == 1 else 'ies'} did not match a submitted claim — dropped")
+        verification["claim_reviews"] = matched
     else:
         verification = {
             "claim_reviews": [
-                {"claim": claim, "status": "unresolved",
-                 "evidence_summary": "Claim-review response was invalid JSON.", "sources": []}
+                with_verdict({"claim": claim, "status": "unresolved",
+                              "evidence_summary": "Claim-review response was invalid JSON.", "sources": []})
                 for claim in remaining
             ],
             "reasoning": f"Claim review could not be parsed: {last_error}",

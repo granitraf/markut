@@ -58,10 +58,34 @@ EMBEDDER_MODEL = "all-MiniLM-L6-v2"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 # execution guardrail: soft close at 1x (should_continue), hard stop at 2x
-# (call_claude). ~3-4x a measured fully-loaded run — catches runaways.
-TOKEN_BUDGET = 200_000
+# (call_claude). ~2x a cold run with the profiler, planner and a transcribed
+# slide deck — catches runaways, never a normal debate.
+TOKEN_BUDGET = 300_000
 
 DEFAULT_MAX_ROUNDS = 2
+# every ticker gets at least two rounds: a one-round debate has no rebuttal,
+# so the judge never sees either side answer the other
+MIN_ROUNDS = 2
+
+# ---- profiler / planner / research (the understand-the-company-first pass) ----
+# token caps for the four filing sections the profiler reads (4 chars/token)
+PROFILE_SECTION_TOKENS = {"item1": 3000, "mdna": 3000, "segment": 2000, "exhibit": 2000, "slides": 2000}
+PROFILER_MAX_TOKENS = 2500
+PLANNER_MAX_TOKENS = 3500   # five questions with queries ran ~2k tokens; a truncated plan is invalid JSON
+# image-only 8-K exhibits (investor decks filed as JPEG slides) are transcribed
+# by the model once per filing and cached by accession number; set to 0 to
+# record an extraction failure instead of spending the tokens
+TRANSCRIBE_IMAGE_EXHIBITS = os.getenv("MARKUT_TRANSCRIBE_SLIDES", "1") == "1"
+TRANSCRIPT_SLIDES_PER_CALL = 8
+TRANSCRIPT_MAX_TOKENS = 4000
+MAX_SLIDES_PER_EXHIBIT = 60
+# research: excerpts per question and words per excerpt (text only — numbers,
+# guidance, valuation rows and segment/KPI figures are never trimmed)
+EXCERPTS_PER_QUESTION = 5
+EXCERPT_WORDS = 50
+CHUNKS_PER_QUERY = 4
+# coverage gate: fewer covered questions than this routes research back once
+COVERAGE_MIN_QUESTIONS = 4
 
 # bull/bear reply budget (AUDIT FIX run #2: 3 of 4 arguments were cut off at the
 # cap and reached the judge mid-sentence). First attempt at ARGUMENT_MAX_TOKENS;

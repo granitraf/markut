@@ -17,3 +17,5 @@ uvicorn
 psycopg[binary]
 # PDF report of a stored run (markut.report)
 reportlab
+
+pillow>=10            # downscale image-only filing exhibits before transcription

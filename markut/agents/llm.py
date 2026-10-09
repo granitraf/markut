@@ -1,5 +1,5 @@
 """call_claude + the shared TOKENS accumulator (notebook cell 6; model name,
-thinking setting and budget backstop read late-bound from markut.config).
+thinking setting and budget hard stop read late-bound from markut.config).
 
 Sonnet 5.5 notes (why this differs from the notebook's one-liner):
 - thinking is ON by default on this model; we send the explicit setting from
@@ -63,15 +63,12 @@ def _text_of(response) -> str:
     return "".join(block.text for block in response.content if getattr(block, "type", "") == "text")
 
 
-def call_claude(system_prompt: str, user_content: str, max_tokens: int = 1000, schema: dict = None,
-                cached_prefix: str = None) -> str:
-    # HARD BACKSTOP (execution guardrail, belt-and-suspenders): even if graph
+def _complete(kwargs: dict) -> str:
+    # HARD STOP (execution guardrail, belt-and-suspenders): even if graph
     # routing somehow kept looping past the soft budget check in
     # should_continue, no call may START once spend reaches 2x TOKEN_BUDGET.
     # Raising here is the fail-closed floor — a crashed run costs strictly
-    # less than an unbounded one. TOKEN_BUDGET lives in the RUN CONFIGURATION
-    # cell; the name resolves at call time, and every real call happens after
-    # that cell has run.
+    # less than an unbounded one.
     spent = TOKENS["input"] + TOKENS["output"] + TOKENS["cache_write"] + TOKENS["cache_read"]
     if spent >= 2 * config.TOKEN_BUDGET:
         raise RuntimeError(
@@ -83,7 +80,7 @@ def call_claude(system_prompt: str, user_content: str, max_tokens: int = 1000, s
     last_error = None
     for attempt in range(2):
         try:
-            response = client.messages.create(**_request_kwargs(system_prompt, user_content, max_tokens, schema, cached_prefix))
+            response = client.messages.create(**kwargs)
             # WHY: only count usage on SUCCESS, so a failed+retried call isn't
             # double-billed in our totals. usage is on the response object.
             TOKENS["input"] += response.usage.input_tokens
@@ -112,6 +109,24 @@ def call_claude(system_prompt: str, user_content: str, max_tokens: int = 1000, s
     # WHY (raise after 2nd failure): surface a clear error instead of returning
     # empty text, which would silently poison a bull/bear/judge argument downstream.
     raise RuntimeError(f"call_claude failed after 2 attempts: {last_error}")
+
+
+def call_claude(system_prompt: str, user_content: str, max_tokens: int = 1000, schema: dict = None,
+                cached_prefix: str = None) -> str:
+    return _complete(_request_kwargs(system_prompt, user_content, max_tokens, schema, cached_prefix))
+
+
+def call_claude_images(system_prompt: str, user_content: str, images: list, max_tokens: int = 3000) -> str:
+    """One call with image blocks ahead of the text (used to transcribe
+    image-only filing exhibits). images = [(bytes, media_type), ...]."""
+    import base64
+    content = [{"type": "image", "source": {"type": "base64", "media_type": media_type,
+                                             "data": base64.b64encode(blob).decode("ascii")}}
+               for blob, media_type in images]
+    content.append({"type": "text", "text": user_content})
+    kwargs = _request_kwargs(system_prompt, user_content, max_tokens)
+    kwargs["messages"] = [{"role": "user", "content": content}]
+    return _complete(kwargs)
 
 # Legacy demo evidence kept only for reference. The live graph now uses fetch_fundamentals().
 EVIDENCE = """

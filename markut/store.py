@@ -109,11 +109,15 @@ def _schema(db: str = None) -> list:
         f"CREATE TABLE IF NOT EXISTS turns (id {pk}, {_TURN_COLUMNS.format(run_ref='BIGINT' if pg else 'INTEGER')})",
         "CREATE INDEX IF NOT EXISTS idx_turns_run ON turns(run_id, seq)",
         "CREATE INDEX IF NOT EXISTS idx_runs_ticker_date ON runs(ticker, started_at)",
+        # small JSON cache: company profiles, planner output and slide transcripts,
+        # keyed by ticker + the accession numbers of the filings they were read from
+        "CREATE TABLE IF NOT EXISTS kv_cache (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, created_at TEXT NOT NULL)",
     ]
     if pg:
         # shut the Supabase REST door; the owner connection is unaffected
         stmts += ["ALTER TABLE runs ENABLE ROW LEVEL SECURITY",
-                  "ALTER TABLE turns ENABLE ROW LEVEL SECURITY"]
+                  "ALTER TABLE turns ENABLE ROW LEVEL SECURITY",
+                  "ALTER TABLE kv_cache ENABLE ROW LEVEL SECURITY"]
     return stmts
 
 
@@ -147,6 +151,71 @@ def _row(r) -> dict:
     return dict(r) if r is not None else None
 
 
+# ---------------------------------------------------------------- JSON cache
+def cache_get(key: str, db: str = None):
+    """The cached JSON value for key, or None. Never raises: a cache that is
+    down just means a cache miss (the caller recomputes)."""
+    try:
+        conn = connect(db)
+    except Exception as e:
+        print(f"CACHE: unavailable ({type(e).__name__}: {e}) — treating as a miss")
+        return None
+    try:
+        row = conn.cursor().execute(_sql("SELECT value_json FROM kv_cache WHERE key = ?", db), (key,)).fetchone()
+    except Exception as e:
+        print(f"CACHE: read failed ({type(e).__name__}: {e}) — treating as a miss")
+        return None
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    try:
+        return json.loads(_row(row)["value_json"])
+    except Exception:
+        return None
+
+
+def cache_delete(prefix: str, db: str = None) -> int:
+    """Remove every cached value whose key starts with prefix (e.g.
+    'profile:XYZ:' or 'transcript:'). Returns the row count; never raises."""
+    try:
+        conn = connect(db)
+    except Exception as e:
+        print(f"CACHE: unavailable ({type(e).__name__}: {e})")
+        return 0
+    try:
+        cur = conn.cursor()
+        cur.execute(_sql("DELETE FROM kv_cache WHERE key LIKE ?", db), (prefix + "%",))
+        conn.commit()
+        return cur.rowcount or 0
+    except Exception as e:
+        print(f"CACHE: delete failed ({type(e).__name__}: {e})")
+        return 0
+    finally:
+        conn.close()
+
+
+def cache_put(key: str, value, db: str = None) -> bool:
+    """Upsert a JSON value. Returns False (and says why) instead of raising."""
+    try:
+        conn = connect(db)
+    except Exception as e:
+        print(f"CACHE: unavailable ({type(e).__name__}: {e}) — not cached")
+        return False
+    try:
+        conn.cursor().execute(_sql(
+            "INSERT INTO kv_cache (key, value_json, created_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, created_at = excluded.created_at", db),
+            (key, json.dumps(value, ensure_ascii=False), _iso()))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"CACHE: write failed ({type(e).__name__}: {e}) — not cached")
+        return False
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------- shaping
 def _iso(t: float = None) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t if t is not None else time.time()))
@@ -156,12 +225,38 @@ def turn_content(event: dict) -> str:
     # the one text a reader wants from each event — what the turns table
     # shows in a plain SELECT, without digging through JSON
     name, d = event.get("event"), event.get("data", {}) or {}
+    if name == "profiler":
+        p = d.get("profile", {}) or {}
+        parts = [f"Business: {p.get('business', '')}", f"Archetype: {p.get('archetype', '')}"]
+        parts += [f"Segment: {s.get('name')} — {s.get('latest_revenue', '')} {s.get('latest_yoy', '')} ({s.get('period', '')})"
+                  for s in (p.get("segments") or []) if isinstance(s, dict)]
+        parts += [f"KPI: {k.get('name')} — {k.get('definition', '')}" for k in (p.get("company_kpis") or []) if isinstance(k, dict)]
+        if p.get("accounting_flags"):
+            parts.append("Accounting flags: " + ", ".join(p["accounting_flags"]))
+        if d.get("cached"):
+            parts.append("(profile served from the cache)")
+        return "\n".join(parts)
+    if name == "planner":
+        plan = d.get("plan", {}) or {}
+        parts = [f"{q.get('id')}: {q.get('question')}" for q in plan.get("key_questions", [])]
+        parts += [f"Would mislead: {x}" for x in plan.get("what_would_mislead", [])]
+        if d.get("cached"):
+            parts.append("(plan served from the cache)")
+        return "\n".join(parts)
+    if name == "coverage":
+        return (f"coverage gate: {d.get('covered')}/{d.get('total')} questions covered after pass {d.get('pass')} -> "
+                f"{d.get('decision')}" + (f" (uncovered: {', '.join(d.get('uncovered') or [])})" if d.get("uncovered") else ""))
     if name == "research":
         return d.get("evidence", "")
     if name in ("bull", "bear"):
         return d.get("text", "")
     if name == "judge":
         parts = []
+        for q in d.get("questions") or []:
+            if isinstance(q, dict):
+                parts.append(f"{q.get('id')}: {q.get('answer', '')} [{q.get('stronger_side', '')}, {q.get('confidence', '')} confidence]")
+        if d.get("planner_coverage"):
+            parts.append(f"Planner coverage: {d['planner_coverage']}")
         if d.get("bull_strongest"):
             parts.append(f"Strongest bull point: {d['bull_strongest']}")
         if d.get("bear_strongest"):
@@ -177,7 +272,7 @@ def turn_content(event: dict) -> str:
         return f"{d.get('decision', '')}: {d.get('reason', '')}"
     if name == "news_verify":
         reviews = d.get("claim_reviews") or []
-        lines = [f"- [{r.get('status', '?')}] {r.get('claim', '')}" for r in reviews]
+        lines = [f"- [{r.get('verdict') or r.get('status', '?')}] {r.get('claim', '')}" for r in reviews]
         return "\n".join(lines + ([d["reasoning"]] if d.get("reasoning") else []))
     if name == "review":
         return d.get("verdict", "")

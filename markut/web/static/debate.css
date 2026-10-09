@@ -138,3 +138,18 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
 .md table { border-collapse: collapse; margin: 8px 0; font-size: 14px; }
 .md th, .md td { border: 1px solid var(--line); padding: 5px 9px; text-align: left; }
 .md img { max-width: 100%; }
+
+/* ---- profiler / planner / coverage (understand the company first) ---- */
+.card.profile { border-left-color: var(--accent); } .card.profile .who { color: var(--accent); }
+.card.plan { border-left-color: var(--judge); } .card.plan .who { color: var(--judge); }
+.card.profile h3 .pill { margin-left: 6px; }
+.kpis .k, .mislead .k, .cov small { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); display: block; margin: 8px 0 2px; }
+.qs { padding-left: 20px; margin: 4px 0 8px; } .qs li { margin: 5px 0; font-size: 13.5px; line-height: 1.55; } .qs li small { color: var(--muted); }
+.cov { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; align-items: center; }
+.pill.no { color: var(--bear); border-color: var(--bear); }
+.pk.wrap .pkg { grid-template-columns: 1fr; } .pk.wrap .pkv { white-space: normal; }
+.pk-text { margin: 0 0 10px; } .pk-text pre.evidence { margin-top: 6px; }
+pre.evidence.small { font-size: 12px; margin-top: 8px; }
+.qt td:nth-child(2) { white-space: normal; max-width: 46ch; } .qt .qflag { color: var(--review); font-size: 12px; margin-top: 3px; }
+.side.bull { color: var(--bull); } .side.bear { color: var(--bear); } .side.neither { color: var(--muted); }
+.card.route details.tok { margin-top: 6px; } .card.route details.tok table { font-size: 12px; }

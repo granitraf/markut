@@ -57,24 +57,50 @@ def _assemble_packet(discovered: list, results: dict) -> str:
                    for name in ordered)
 
 
-async def _gather_evidence(ticker: str, client) -> tuple:
+async def _gather_evidence(ticker: str, client, tool_args: dict = None, skip: list = None) -> tuple:
     # Discovery FIRST (list_tools — the demo moment: nothing below hardcodes
     # the three tool names), then one call per discovered tool. Per-tool
     # try/except: one dead source contributes a marker line and the packet
     # survives — the same degrade philosophy the sections themselves follow.
+    # tool_args = {tool name: extra arguments} (the filings tool takes the
+    # planner's questions); skip = tools whose result the caller already holds.
+    tool_args, skip = tool_args or {}, set(skip or [])
     async with client:
         discovered = [tool.name for tool in await client.list_tools()]
         print(f"MCP: discovered {len(discovered)} evidence tool(s): {discovered}")
         results = {}
         for name in discovered:
+            if name in skip:
+                continue
             try:
-                result = await client.call_tool(name, {"ticker": ticker})
+                result = await client.call_tool(name, {"ticker": ticker, **tool_args.get(name, {})})
                 results[name] = _tool_result_text(result)
                 print(f"MCP: called {name} -> {len(results[name])} chars")
             except Exception as e:
                 results[name] = f"\n\n[evidence source unavailable: {name}, {e}]"
                 print(f"MCP: {name} failed ({e}) — marker added, packet continues")
         return discovered, results
+
+
+def gather_evidence(ticker: str, tool_args: dict = None, skip: list = None, client=None) -> dict:
+    """{tool name: section text} for every discovered tool not in skip —
+    the research node composes the packet in its own order from these."""
+    if client is None:
+        client = Client(evidence_server)
+    _discovered, results = _run_coro_blocking(_gather_evidence(ticker, client, tool_args, skip))
+    return results
+
+
+def call_one_tool(name: str, args: dict, client=None) -> str:
+    """One evidence tool by name (the planner fetches the market snapshot
+    before research runs). Raises on failure — the caller decides the marker."""
+    if client is None:
+        client = Client(evidence_server)
+
+    async def _one():
+        async with client:
+            return _tool_result_text(await client.call_tool(name, args))
+    return _run_coro_blocking(_one())
 
 
 def call_evidence_tools(ticker: str, client=None) -> str:

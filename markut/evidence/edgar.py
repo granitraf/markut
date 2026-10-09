@@ -129,7 +129,61 @@ def fetch_filing_html(url: str) -> str:
     return text
 
 
-def html_to_text(html: str) -> str:
+_ZERO_WIDTH = re.compile(r"[\u200b\u200c\u200d\ufeff]")
+_FIGURE_CELL = re.compile(r"^\(?[-+]?\$?\s?\d[\d,]*(?:\.\d+)?\)?\s?(?:%|x|bps)?\)?$|^[-+]\d")
+
+
+def is_figure_cell(cell: str) -> bool:
+    # PURE. A cell that IS a figure ("$729,476", "(3)%", "+127%", "5.8"), as
+    # opposed to a label that merely contains digits ("Q3 FY26", "June 30, 2026")
+    return bool(_FIGURE_CELL.match((cell or "").strip()))
+
+
+def table_rows(table) -> list:
+    # PURE over a BeautifulSoup <table>: one " | "-joined line per row that
+    # carries a number, preceded by its column-header row. Inline-XBRL splits
+    # "$" and "29,000" (and a trailing ")" or "%") into separate cells and
+    # spreads a multi-word column header over several rows; the fragments are
+    # merged back so a row reads "Semiconductor solutions | $24,882 | $12,598 | 98%".
+    raw_rows = []
+    for tr in table.find_all("tr"):
+        cells = []
+        for td in tr.find_all(["td", "th"]):
+            c = re.sub(r"\s+", " ", _ZERO_WIDTH.sub("", td.get_text(" ", strip=True)).replace("\xa0", " ")).strip()
+            if not c:
+                cells.append("")
+                continue
+            if c in (")", "%", ")%", "%)") and any(cells):
+                last = max(i for i, x in enumerate(cells) if x)
+                cells[last] += c
+            elif any(cells) and cells[max(i for i, x in enumerate(cells) if x)] in ("$", "(", "($", "$("):
+                last = max(i for i, x in enumerate(cells) if x)
+                cells[last] += c
+            else:
+                cells.append(c)
+        cells = [c for c in cells if c not in ("$", "(", ")", "—", "-")]
+        if any(cells):
+            raw_rows.append(cells)
+    # merge runs of header rows (no figures) of equal width column-wise:
+    # a three-word brand name stacked over one column becomes one header
+    merged = []
+    for cells in raw_rows:
+        numeric = any(is_figure_cell(c) for c in cells)
+        if (not numeric and merged and merged[-1][0] is False and len(merged[-1][1]) == len(cells)):
+            merged[-1] = (False, [(a + " " + b).strip() for a, b in zip(merged[-1][1], cells)])
+        else:
+            merged.append((numeric, cells))
+    rows = []
+    for numeric, cells in merged:
+        cells = [c for c in cells if c]
+        if numeric and len(cells) >= 2:
+            rows.append(" | ".join(cells))
+        elif not numeric and len(cells) >= 2 and all(len(c) < 60 for c in cells):
+            rows.append(" | ".join(cells))
+    return rows
+
+
+def html_to_text(html: str, keep_tables: bool = False) -> str:
     # WHY BeautifulSoup + manual paragraph stitching: EDGAR HTML is tag soup —
     # inline-XBRL filings wrap single sentences in dozens of nested tags, so a
     # naive get_text() either glues the whole document into one blob or splits
@@ -138,14 +192,25 @@ def html_to_text(html: str) -> str:
     # sentence-final punctuation. The RAG chunker later splits on these \n\n
     # breaks, so paragraph integrity here directly controls chunk quality.
     soup = BeautifulSoup(html, "html.parser")
-    # WHY drop tables: a financial table flattened to text is a context-free
-    # number stream that poisons semantic search. The narrative is the value;
-    # hard numbers already arrive structured via market_snapshot.
-    for t in soup(["script", "style", "table"]):
+    for t in soup(["script", "style"]):
         t.decompose()
+    if keep_tables:
+        # the segment note, the earnings release and guidance tables carry
+        # their figures in cells: each row becomes its own " | " line
+        for table in soup.find_all("table"):
+            if table.find_parent("table") is not None:
+                continue
+            rows = table_rows(table)
+            table.replace_with(soup.new_string("\n" + "\n".join(rows) + "\n") if rows else soup.new_string("\n"))
+    else:
+        # WHY drop tables: a financial table flattened to text is a context-free
+        # number stream that poisons semantic search. The narrative is the value;
+        # hard numbers already arrive structured via market_snapshot.
+        for t in soup("table"):
+            t.decompose()
     raw_lines = soup.get_text("\n").replace("\xa0", " ").splitlines()
     paras, buf = [], ""
-    # WHY the heading break (added after LIVE testing on NVDA's real 10-K):
+    # WHY the heading break (added after LIVE testing on a real 10-K):
     # headings like "Item 7. Management's Discussion..." often follow a line
     # that ends WITHOUT sentence punctuation (page numbers, "PART II"), so the
     # sentence-end heuristic merged them into the middle of a paragraph where
@@ -155,9 +220,21 @@ def html_to_text(html: str) -> str:
     # required punctuation after the item number keeps bare cross-references
     # ("see Item 1A of Part I") from triggering false breaks.
     heading = re.compile(r"^(item\s+\d+[a-z]?\s*[.:\-]|part\s+[ivx]+\b)", re.IGNORECASE)
+    # page furniture: "Table of Contents" back-links always; a bare 1-3 digit
+    # line only BETWEEN paragraphs (buf empty) — inline-XBRL puts every tagged
+    # number on its own line, so a bare "29" mid-sentence is "$ 29 billion",
+    # not a page number
+    toc = re.compile(r"^(?:table of contents|\d{1,3}\s+table of contents|table of contents\s+\d{1,3})$", re.IGNORECASE)
+    page_no = re.compile(r"^\d{1,3}$")
     for ln in raw_lines:
         ln = re.sub(r"[ \t]+", " ", ln).strip()
-        if not ln:
+        if not ln or toc.match(ln) or (page_no.match(ln) and not buf):
+            continue
+        if " | " in ln:   # a flattened table row keeps its own paragraph
+            if buf:
+                paras.append(buf)
+                buf = ""
+            paras.append(ln)
             continue
         if buf and heading.match(ln):
             paras.append(buf)
@@ -238,7 +315,7 @@ def extract_10q_sections(html: str) -> dict:
         [r"(?m)^\s*item\s+3\b", r"(?m)^\s*item\s+4\b"],
     )
     # NOTE: an earlier draft fell back to a bare "item 2" pattern when the
-    # management-anchored one missed. LIVE testing on NVDA's real 10-Q showed
+    # management-anchored one missed. LIVE testing on a real 10-Q showed
     # that fallback confidently returning Part II "Unregistered Sales of Equity
     # Securities" LABELED as MD&A. A mislabeled section is far worse than a
     # missing one — the source tag would lie to the debaters — so: no fallback,
@@ -261,9 +338,10 @@ def extract_10q_sections(html: str) -> dict:
 # Preference order for the earnings exhibit inside an 8-K folder. Specific
 # 99.1 spellings first, then press-release-style names, then 99.2 / CFO
 # commentary, and LAST a bare "ex99" with no part number — AUDIT FIX (run #2):
-# Broadcom files "avgo-08022026x8kxex99.htm", which none of the earlier
+# one filer's release name matched none of the earlier
 # patterns matched, so no 8-K was ever indexed and the guidance block came up
-# empty. iXBRL filers also write "ex99d1" for 99.1.
+# empty (a filer named its release "<ticker>-<date>x8kxex99.htm"). iXBRL
+# filers also write "ex99d1" for 99.1.
 EXHIBIT_PATTERNS = (
     r"ex[-_]?99[._-]?1", r"99[._-]?1", r"ex99d1",
     r"pressrelease", r"earningsrelease", r"pr\.html?$",
@@ -284,7 +362,7 @@ def pick_exhibit(names: list):
 
 def extract_8k_press_release(eightk_entries: list) -> dict:
     # WHY select by ITEM CODE first (added after LIVE testing): frequent filers
-    # like NVDA push out 8-Ks constantly (debt offerings, votes, board changes)
+    # like large caps push out 8-Ks constantly (debt offerings, votes, board changes)
     # — on the real data the 4 newest 8-Ks contained NO earnings release at all.
     # EDGAR tags every 8-K with item codes, and "2.02" means "Results of
     # Operations and Financial Condition" — i.e., THE earnings 8-K. Hunting only
@@ -343,30 +421,6 @@ def strip_sgml_header(text: str) -> str:
     return re.sub(r"(?i)^\s*ex-?\d+(\.\d+)?\s+\d+\s+\S+\.html?\s*", "", text)
 
 
-def extract_outlook(press_text: str) -> str:
-    # PURE. Deterministic guidance extraction — NOT semantic search. The
-    # forward guidance in an earnings release sits under a heading that
-    # literally says "Outlook" (or "Guidance"); the retrieval audit scored
-    # 0.08-0.13 cosine (noise) trying to *search* for what a string match
-    # finds exactly. Scan paragraphs for the heading, then keep the following
-    # paragraphs only WHILE they still read like guidance ("expected to be...")
-    # — the first paragraph without guidance language is boilerplate
-    # (conference-call info, forward-looking-statements legalese) and stops
-    # the collection. Returns "" when no heading is found, so the caller can
-    # report an honest absence instead of quoting noise.
-    paras = [p.strip() for p in press_text.split("\n\n") if p.strip()]
-    guidance_like = re.compile(r"(?i)\b(expected|expects|anticipates|estimated|guidance|outlook)\b")
-    for i, p in enumerate(paras):
-        if "outlook" in p[:80].lower() or "guidance" in p[:80].lower():
-            block = [p]
-            for q in paras[i + 1: i + 8]:
-                if not guidance_like.search(q[:200]) or sum(len(b) for b in block) > 1200:
-                    break
-                block.append(q)
-            return "\n\n".join(block)
-    return ""
-
-
 def extract_risk_titles(html: str, section_text: str) -> list:
     # Risk Factors is a TITLED LIST: each risk opens with a bold/italic caption
     # ("We depend on a limited number of customers...") that is management's
@@ -402,9 +456,9 @@ def extract_risk_titles(html: str, section_text: str) -> list:
 
 def extract_10k_business(html: str) -> str:
     # Item 1 (Business): the section that says what the company actually sells
-    # and to whom. AUDIT FIX: the bear and the judge treated Google TPU as a
-    # Broadcom competitor; Broadcom DESIGNS the TPU. The agents never saw Item
-    # 1. Anchored like the other sections; "item 1" must not be followed by
+    # and to whom. AUDIT FIX: a debate once called a company's own product a
+    # competitor because the agents never saw Item 1. Anchored like the other
+    # sections; "item 1" must not be followed by
     # A/B/C (Item 1A is Risk Factors) and ends where Item 1A starts.
     text = html_to_text(html)
     item_1 = _find_section(
@@ -442,25 +496,10 @@ def business_overview(item_1_text: str, char_limit: int = 1000) -> str:
     return text.strip()
 
 
-def extract_10q_commitments(html: str) -> str:
-    # The "Commitments and Contingencies" note of the newest 10-Q: guarantees,
-    # purchase obligations, backstops, residual-value guarantees, litigation —
-    # the place a $29B maximum guarantee exposure is disclosed. Notes are
-    # numbered ("Note 11.", "11.") so the heading is matched with an optional
-    # number and ends at the next numbered note or at Item 2.
-    text = html_to_text(html)
-    note = _find_section(
-        text,
-        r"(?m)^\s*(?:note\s+)?(?:\d{1,2}\.?\s*[\-—:]?\s*)?commitments and contingencies\b",
-        [r"(?m)^\s*(?:note\s+)?\d{1,2}\.\s+[A-Z][a-z]", r"(?m)^\s*item\s+2\b", r"(?m)^\s*item\s+4\b"],
-    )
-    return note if len(note) >= 300 else "[section unavailable: Commitments and Contingencies note not located in this 10-Q]"
-
-
 # ---------------- AUDIT (run #9): dollar figures from the commitments note; 8-K highlights; dated concentration ----------------
 
 _DOLLAR_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?\s*(?:billion|million|thousand|[BMK]\b)?", re.IGNORECASE)
-_OBLIGATION_WORDS = ("maximum", "guarantee", "guaranteed", "backstop", "liability", "exposure", "commitment",
+_OBLIGATION_WORDS = ("maximum", "guarantee", "guaranteed", "liability", "exposure", "commitment",
                      "obligation", "contingen", "indemnif", "lease", "purchase")
 
 
@@ -472,10 +511,10 @@ def normalize_dollars(text: str) -> str:
 
 def dollar_sentences(note_text: str, max_items: int = 8) -> list:
     """PURE. Every sentence of a commitments/guarantees note that states a
-    dollar amount, most obligation-like first (maximum / guarantee / backstop /
-    liability words), deduped, each capped at 320 chars. These become
-    separate packet lines so a $29 billion maximum exposure is never a
-    truncated-away tail of a longer quote."""
+    dollar amount, most obligation-like first (maximum / guarantee /
+    liability words), deduped, each capped at ~320 chars but never cut before
+    its first dollar figure. These become separate packet lines so a maximum
+    exposure is never a truncated-away tail of a longer quote."""
     text = normalize_dollars(re.sub(r"\s+", " ", note_text or ""))
     if text.startswith("[section unavailable"):
         return []
@@ -490,22 +529,33 @@ def dollar_sentences(note_text: str, max_items: int = 8) -> list:
         seen.add(key)
         low = s.lower()
         score = sum(w in low for w in _OBLIGATION_WORDS) + (2 if "maximum" in low else 0)
-        scored.append((score, len(scored), s[:320].rstrip()))
+        cut = 320
+        first = _DOLLAR_RE.search(s)
+        if first and first.end() > cut - 20:
+            cut = min(len(s), first.end() + 60)   # keep the figure, never the tail without it
+        scored.append((score, len(scored), s[:cut].rstrip()))
     scored.sort(key=lambda t: (-t[0], t[1]))
     return [s for _, _, s in scored[:max_items]]
 
 
-_BOILERPLATE_START = re.compile(r"^(about broadcom|about nvidia|about [A-Z][\w.]+|forward-looking statements|cautionary|non-gaap financial measures|"
+_BOILERPLATE_START = re.compile(r"^(about\s+\S+|forward-looking statements|cautionary|non-gaap financial measures|use of non-gaap|"
                                 r"conference call|webcast|contact|investor relations|source:)", re.IGNORECASE)
+# "EXHIBIT 99.1 Exhibit 99.1 <Company> reports ..." — the exhibit label the
+# converter stitches onto the first paragraph of a release, in any casing
+_EXHIBIT_LABEL = re.compile(r"^(?:\s*(?:ex(?:hibit)?[-\s]*99\.\d\b|document)[:\s]*)+", re.IGNORECASE)
+
+
+def strip_exhibit_label(text: str) -> str:
+    return _EXHIBIT_LABEL.sub("", text or "", count=1).lstrip()
 
 
 def extract_highlights(press_text: str, char_limit: int = 1500) -> str:
     """PURE. The head of an earnings release — headline figures, segment and
-    AI revenue lines with their YoY/QoQ changes, and the CEO quote — up to the
-    Outlook heading or the first boilerplate section. Keeps paragraphs that
+    product-line revenue lines with their YoY/QoQ changes, and the executive
+    quotes — up to the outlook heading or the first boilerplate section. Keeps paragraphs that
     carry a number, a percent, or a quotation; stops at char_limit on a
     sentence boundary."""
-    cleaned = re.sub(r"(?i)^\s*ex-?99\.\d\s+(?:document\s+)?(?:exhibit\s+99\.\d\s+)?", "", press_text or "")
+    cleaned = strip_exhibit_label(press_text or "")
     paras = [p.strip() for p in cleaned.split("\n\n") if p.strip()]
     out, total = [], 0
     for p in paras:
@@ -526,28 +576,3 @@ def extract_highlights(press_text: str, char_limit: int = 1500) -> str:
     return text.strip()
 
 
-_CONC_RE = re.compile(r"customer", re.IGNORECASE)
-_CONC_SIGNAL = re.compile(r"(\d{1,2}\s?%|largest customer|largest (?:end )?customers|significant portion|top (?:five|ten|5|10)|financial guarantee|"
-                          r"backstop|lease obligations|expected to (?:be|become) (?:a|our) (?:largest|significant))", re.IGNORECASE)
-
-
-def concentration_sentences(text: str, max_items: int = 4) -> list:
-    """PURE. Sentences about customers that carry a percentage, a 'largest /
-    top-five' framing, or a guarantee tied to a customer — the dated facts
-    that sit next to the 10-K's concentration figure so a reader can see which
-    is newer."""
-    text = normalize_dollars(re.sub(r"\s+", " ", text or ""))
-    out, seen = [], set()
-    for s in re.split(r"(?<=[.!?])\s+(?=[A-Z(\"'])", text):
-        if not (_CONC_RE.search(s) and _CONC_SIGNAL.search(s)):
-            continue
-        if len(s) < 40 or len(s) > 420:
-            continue
-        key = re.sub(r"[^a-z0-9]", "", s.lower())[:100]
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(s.strip())
-        if len(out) == max_items:
-            break
-    return out

@@ -21,6 +21,6 @@ def validate_ticker(raw: str) -> str:
     if not re.fullmatch(r"[A-Z]{1,5}(\.[A-Z])?", ticker):
         raise ValueError(
             f"Invalid ticker {raw!r}: expected 1-5 letters with an optional "
-            f".X share-class suffix (e.g. NVDA, AAPL, BRK.B)."
+            f".X share-class suffix (e.g. ABC, WXYZ, ABC.B)."
         )
     return ticker

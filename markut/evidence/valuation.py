@@ -5,8 +5,8 @@ instructed to cite this table instead of doing its own arithmetic; the
 governor's scenario check polices the rest.
 
 No peer comparison, on purpose: peers need a curated list per ticker, and a
-list only covers the symbols someone thought of (ask for CAKE and it is
-empty). Everything here comes from the company's own data and is PURE."""
+list only covers the symbols someone thought of (any other ticker would get
+nothing). Everything here comes from the company's own data and is PURE."""
 from markut.evidence.market import fmt_price, fmt_ratio, fmt_pct
 
 SCENARIO_MULTIPLE_SPREAD = 0.20   # bear/bull multiples sit ±20% around today's forward P/E
@@ -48,7 +48,6 @@ def pe_band(closes: list, annual_eps: list, years: int = 4) -> dict:
     return {"p25": round(q(0.25), 1), "median": round(q(0.5), 1), "p75": round(q(0.75), 1), "sessions": len(ratios)}
 
 
-EPS_CASES = (("-15%", 0.85), ("consensus", 1.0), ("+10%", 1.10))
 BAND_MAX_DISPERSION = 2.0   # p75/p25 above this and the historical band is information, not the grid's multiple range
 
 
@@ -68,13 +67,19 @@ def format_valuation_lines(info: dict, estimates: dict, current_fy=None, band_in
             lines.append(f"- {label}: {value}  [source: {source}]")
 
     add("EV/EBITDA (TTM)", fmt_ratio(_num(info.get("enterpriseToEbitda"))))
-    mc, fcf = _num(info.get("marketCap")), _num(info.get("freeCashflow"))
+    mc = _num(info.get("marketCap"))
+    fcf = _num(((info.get("_fcf_quarters") or {}).get("fcf")))
+    if fcf is None:
+        fcf = _num(info.get("freeCashflow"))
     if mc and fcf is not None:
         add("FCF yield (TTM FCF / market cap)", fmt_pct(fcf / mc), "computed")
     add("PEG (trailing, yfinance; growth basis not disclosed by the source)", fmt_ratio(_num(info.get("trailingPegRatio") or info.get("pegRatio"))))
 
     eps0 = _num(((estimates or {}).get("0y") or {}).get("avg"))
-    eps1 = _num(((estimates or {}).get("+1y") or {}).get("avg"))
+    nxt = (estimates or {}).get("+1y") or {}
+    eps1 = _num(nxt.get("avg")) or _num(info.get("forwardEps"))
+    eps_low, eps_high = _num(nxt.get("low")), _num(nxt.get("high"))
+    n_analysts = nxt.get("numberOfAnalysts")
     fy0 = f" FY{int(current_fy)}" if current_fy else ""
     fy1 = f" FY{int(current_fy) + 1}" if current_fy else ""
     if price and eps0:
@@ -83,14 +88,15 @@ def format_valuation_lines(info: dict, estimates: dict, current_fy=None, band_in
         add(f"P/E on next-FY{fy1} consensus EPS ({fmt_price(eps1)}, non-GAAP)", f"{price / eps1:.2f}x", "computed")
 
     band = pe_band((band_inputs or {}).get("closes") or [], (band_inputs or {}).get("annual_eps") or [])
-    own_fwd = _num(info.get("forwardPE"))
+    # today's forward multiple on the SAME EPS field the grid rows use
+    own_fwd = (price / eps1) if (price and eps1) else _num(info.get("forwardPE"))
     if band:
         lines.append(f"- Trailing P/E band (company's own history: ~4y of daily closes / annual diluted GAAP EPS, {band['sessions']} sessions): "
                      f"p25 {band['p25']}x | median {band['median']}x | p75 {band['p75']}x  [source: computed]")
     # DISPERSION GUARD (the audit's peer-dispersion rule, applied to the company's
     # own history): a band whose p75 is more than 2x its p25 is not a usable
     # multiple range — an acquisition year or an earnings trough inflates GAAP
-    # trailing P/E (AVGO live: p25 32.8x, p75 125.3x). Such a band is shown as
+    # trailing P/E (one live filer: p25 32.8x, p75 125.3x). Such a band is shown as
     # information only and the grid falls back to today's forward multiple ±20%.
     usable_band = bool(band) and band["p25"] > 0 and band["p75"] / band["p25"] <= BAND_MAX_DISPERSION
     if band and not usable_band:
@@ -106,10 +112,19 @@ def format_valuation_lines(info: dict, estimates: dict, current_fy=None, band_in
     else:
         mults = []
     if price and eps1 and mults:
-        lines.append(f"- Scenario grid (rows: next-FY{fy1} consensus EPS cases; columns: multiples; cell = implied price, % vs price {fmt_price(price)}; "
-                     f"{basis_note})  [source: computed]")
-        for case_label, factor in EPS_CASES:
-            eps = eps1 * factor
+        # rows: the analysts' own range for next-FY EPS (low / consensus / high
+        # from the estimate table), not fixed +/- percentages
+        cases = [("consensus", eps1)]
+        if eps_low and eps_low < eps1:
+            cases.insert(0, ("analyst low", eps_low))
+        if eps_high and eps_high > eps1:
+            cases.append(("analyst high", eps_high))
+        n_txt = f", {int(n_analysts)} analysts" if n_analysts is not None and n_analysts == n_analysts else ""
+        rows_note = ("analyst low / consensus / high from the estimate table" if len(cases) == 3
+                     else "consensus only — the estimate table had no low/high range")
+        lines.append(f"- Scenario grid (rows: next-FY{fy1} consensus EPS, {rows_note}{n_txt}; columns: multiples; "
+                     f"cell = implied price, % vs price {fmt_price(price)}; {basis_note})  [source: computed]")
+        for case_label, eps in cases:
             cells = " | ".join(f"{name} {m}x = {fmt_price(eps * m)} ({(eps * m / price - 1) * 100:+.1f}%)" for name, m in mults)
             lines.append(f"- Implied price, EPS {case_label} {fmt_price(eps)}: {cells}  [source: computed]")
     return lines if len(lines) > 1 else []

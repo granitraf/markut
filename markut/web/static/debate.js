@@ -107,52 +107,63 @@ window.Markut = (function () {
      BASIS/PERIOD notes become full-width text. Values never wrap —
      labels do. Everything after the market lines (filings, news) stays
      collapsed as text. */
+  const WRAP_SECTIONS = /^(PROFILE|KEY QUESTIONS|WHAT WOULD MISLEAD|COVERAGE GAPS)$/;
   function packetHtml(evidence) {
     const lines = String(evidence || "").split("\n");
-    const grid = []; let i = 0, section = null;
-    const newSection = (name) => { section = { name, rows: [], notes: [], scenarios: [] }; grid.push(section); };
-    for (; i < lines.length; i++) {
-      const l = lines[i].trim(); let m;
-      if (!l) continue;
-      if ((m = l.match(/^\[([^\]]+)\]/)) && !/^\[.*unavailable.*\]$/.test(l)) { newSection(m[1]); continue; }
-      if (/^\[.*unavailable.*\]$/.test(l) && section) continue;
-      if (!section) break;
+    const sections = []; let s = null;
+    const push = (name, intro) => { s = { name, intro: intro || "", rows: [], notes: [], scenarios: [], text: [] }; sections.push(s); };
+    for (const raw of lines) {
+      const l = raw.trim(); let m;
+      if (!l) { if (s && s.text.length && s.text[s.text.length - 1] !== "") s.text.push(""); continue; }
+      if ((m = l.match(/^\[([A-Z][A-Z0-9 &\/]+)\](?:\s+\((.*)\))?\s*$/)) && !/unavailable/.test(l)) { push(m[1], m[2]); continue; }
+      if ((m = l.match(/^\[(EVIDENCE Q\d|FILINGS|NEWS|GUIDANCE|GENERAL EVIDENCE)\]\s*(.*)$/))) { push(m[1], m[2]); continue; }
+      if (!s) push("EVIDENCE");
       const body = l.replace(/\s*\[source:[^\]]*\]\s*$/, "");
-      if ((m = body.match(/^-\s+((?:BASIS|PERIOD)\s+NOTE|[A-Z][A-Z ]{2,}NOTE)\s*:\s*(.*)$/))) { section.notes.push(m[2]); continue; }
-      if ((m = body.match(/^-\s+Scenario multiples\s*\((.*)\)\s*$/))) { section.notes.push("Scenario multiples: " + m[1]); continue; }
-      if ((m = body.match(/^-\s+Scenario grid\s*\((.*)\)\s*$/))) { section.notes.push("Scenario grid: " + m[1]); continue; }
-      if ((m = body.match(/^-\s+Implied price, EPS\s+(.*?)\s+(\$[\d.]+):\s+(.*)$/))) {   // scenario grid row: "name mult = $price (pct)" cells
+      const quoteOrTag = /^-\s+(\[|")/.test(body);
+      if (!quoteOrTag && (m = body.match(/^-\s+((?:BASIS|PERIOD)\s+NOTE|[A-Z][A-Z ]{2,}NOTE)\s*:\s*(.*)$/))) { s.notes.push(m[2]); continue; }
+      if (!quoteOrTag && (m = body.match(/^-\s+Scenario grid\s*\((.*)\)\s*$/))) { s.notes.push("Scenario grid: " + m[1]); continue; }
+      if (!quoteOrTag && (m = body.match(/^-\s+Implied price, EPS\s+(.*?)\s+(\$[\d.]+):\s+(.*)$/))) {   // scenario grid row: "name mult = $price (pct)" cells
         const cells = m[3].split("|").map((c) => { const cm = c.trim().match(/^(.*?)\s+([\d.]+x)\s+=\s+(\$[\d,.]+)\s+\(([-+][\d.]+%)\)/); return cm ? { name: cm[1], mult: cm[2], price: cm[3], pct: cm[4] } : null; }).filter(Boolean);
-        section.scenarios.push({ label: "EPS " + m[1], eps: m[2], cells }); continue;
+        s.scenarios.push({ label: "EPS " + m[1], eps: m[2], cells }); continue;
       }
-      if (section.name === "DATA GAPS" && (m = body.match(/^-\s+(.*)$/)) && !/:\s/.test(m[1])) { section.rows.push({ k: m[1], v: "" }); continue; }
-      if ((m = body.match(/^-\s+([^:]{3,120}):\s*$/))) { section.rows.push({ sub: m[1] }); continue; }         // bare sub-header
-      if ((m = body.match(/^-\s+(.+?):\s+(.+)$/))) { section.rows.push({ k: m[1], v: m[2] }); continue; }
-      break;                                                        // first line that is not market data
+      if (s.name === "DATA GAPS" && (m = body.match(/^-\s+(.*)$/)) && !/:\s/.test(m[1])) { s.rows.push({ k: m[1], v: "" }); continue; }
+      if (!quoteOrTag && (m = body.match(/^-\s+([^:]{3,120}):\s*$/))) { s.rows.push({ sub: m[1] }); continue; }         // bare sub-header
+      if (!quoteOrTag && (m = body.match(/^-\s+([^:"]{2,120}?):\s+(.+)$/))) { s.rows.push({ k: m[1], v: m[2] }); continue; }
+      s.text.push(l);                                                 // evidence quotes, tagged lines, block headings
     }
-    const rest = lines.slice(i).join("\n").trim();
-    const sectionHtml = (s) => {
-      if (s.name === "DATA GAPS") {
-        const items = s.rows.map((r) => r.sub ? null : { k: r.k, v: r.v }).filter(Boolean);
+    const sectionHtml = (sec) => {
+      if (sec.name === "DATA GAPS") {
+        const items = sec.rows.map((r) => r.sub ? null : { k: r.k, v: r.v }).filter(Boolean);
         const missing = items.filter((r) => !/^known gap/.test(r.k) && !/^none/.test(r.k));
         return `<div class="gaps ${missing.length ? "has" : ""}"><span class="gk">data gaps</span>` +
           (missing.length ? missing.map((r) => `<span class="gi"><b>${esc(r.k)}</b> ${esc(r.v)}</span>`).join("") : `<span class="gi">none — every source responded</span>`) +
           items.filter((r) => /^known gap/.test(r.k)).map((r) => `<span class="gi known">${esc(r.v)}</span>`).join("") + `</div>`;
       }
-      let h = `<div class="pk"><div class="pkh">${esc(s.name.toLowerCase())}</div>`;
-      const kv = s.rows.filter((r) => !r.sub);
-      if (kv.length) h += `<div class="pkg">` + kv.map((r) => `<div class="pkr"><span class="pkk">${esc(r.k)}</span><span class="pkv">${esc(r.v)}</span></div>`).join("") + `</div>`;
-      if (s.scenarios.length) {
-        const cols = s.scenarios[0].cells.map((c) => c.name);           // p25 / median / p75, or 0.8x fwd / fwd / 1.2x fwd
-        h += `<table class="pkt"><thead><tr><th>implied price (EPS × multiple)</th>${cols.map((c, i) => `<th>${esc(c)} <small>${esc(s.scenarios[0].cells[i].mult)}</small></th>`).join("")}</tr></thead><tbody>` +
-          s.scenarios.map((r) => `<tr><td>${esc(r.label)} <b>${esc(r.eps)}</b></td>` + cols.map((n) => { const c = r.cells.find((x) => x.name === n); return c ? `<td><b>${esc(c.price)}</b> <small>${esc(c.pct)}</small></td>` : "<td>–</td>"; }).join("") + `</tr>`).join("") + `</tbody></table>`;
+      const wrap = WRAP_SECTIONS.test(sec.name);
+      const kv = sec.rows.filter((r) => !r.sub);
+      const isText = !kv.length && !sec.scenarios.length && sec.text.length;
+      if (isText) {
+        const body = sec.text.join("\n").trim();
+        const n = sec.text.filter((t) => /^- /.test(t)).length;
+        const label = sec.name.toLowerCase() + (sec.intro ? " · " + sec.intro : "") + (n ? ` · ${n} line${n === 1 ? "" : "s"}` : "");
+        return `<details class="pt pk-text"><summary>${esc(label)}</summary><pre class="evidence">${esc(body)}</pre></details>`;
       }
-      h += s.notes.map((n) => `<div class="pkn">${esc(n)}</div>`).join("");
+      let h = `<div class="pk ${wrap ? "wrap" : ""}"><div class="pkh">${esc(sec.name.toLowerCase())}</div>`;
+      if (kv.length) h += `<div class="pkg">` + kv.map((r) => `<div class="pkr"><span class="pkk">${esc(r.k)}</span><span class="pkv">${esc(r.v)}</span></div>`).join("") + `</div>`;
+      if (sec.scenarios.length) {
+        const cols = sec.scenarios[0].cells.map((c) => c.name);           // p25 / median / p75, or 0.8x fwd / fwd / 1.2x fwd
+        h += `<table class="pkt"><thead><tr><th>implied price (EPS × multiple)</th>${cols.map((c, i) => `<th>${esc(c)} <small>${esc(sec.scenarios[0].cells[i].mult)}</small></th>`).join("")}</tr></thead><tbody>` +
+          sec.scenarios.map((r) => `<tr><td>${esc(r.label)} <b>${esc(r.eps)}</b></td>` + cols.map((n) => { const c = r.cells.find((x) => x.name === n); return c ? `<td><b>${esc(c.price)}</b> <small>${esc(c.pct)}</small></td>` : "<td>–</td>"; }).join("") + `</tr>`).join("") + `</tbody></table>`;
+      }
+      h += sec.notes.map((n) => `<div class="pkn">${esc(n)}</div>`).join("");
+      if (sec.text.length) h += `<pre class="evidence small">${esc(sec.text.join("\n").trim())}</pre>`;
       return h + `</div>`;
     };
-    const gridHtml = grid.filter((s) => s.rows.length || s.notes.length || s.scenarios.length).map(sectionHtml).join("");
-    return (gridHtml || "") + (rest ? `<details class="pt"><summary>filings &amp; news evidence (${num(rest.length)} chars)</summary><pre class="evidence">${esc(rest)}</pre></details>` : "") +
-      (!gridHtml ? `<pre class="evidence">${esc(evidence || "")}</pre>` : "");
+    const used = sections.filter((x) => x.rows.length || x.notes.length || x.scenarios.length || x.text.length);
+    if (!used.length) return `<pre class="evidence">${esc(evidence || "")}</pre>`;
+    // data gaps first (a reader checks what is missing before reading), then the packet in its own order
+    const gaps = used.filter((x) => x.name === "DATA GAPS"), others = used.filter((x) => x.name !== "DATA GAPS");
+    return gaps.map(sectionHtml).join("") + others.map(sectionHtml).join("");
   }
 
   const kvs = (pairs) => '<div class="kv">' + pairs.map(([k, v]) => `<div><div class="k">${k}</div><div class="v">${v}</div></div>`).join("") + "</div>";
@@ -164,6 +175,9 @@ window.Markut = (function () {
   function Timeline(el, hooks = {}) {
     let pending = null, maxRounds = 0, queue = Promise.resolve(), reveal = !!hooks.reveal, charMs = hooks.charMs || 9;
     const ctx = { round: 0 };
+    // every event carries a turn_id unique within its run: a turn seen twice
+    // (a replayed queue, a reconnect, a double-wired listener) paints once
+    let seen = new Set(), generation = 0;
     function card(cls, html) {
       const c = document.createElement("div"); c.className = "card " + cls; c.innerHTML = html;
       el.appendChild(c); wire(c);
@@ -191,14 +205,43 @@ window.Markut = (function () {
       c.classList.remove("revealing"); c.classList.add("revealed");
       await sleep(350);
     }
-    const enqueue = (fn) => { queue = queue.then(fn).catch(() => {}); return queue; };
+    const enqueue = (fn) => { const g = generation; queue = queue.then(() => (g === generation ? fn() : undefined)).catch(() => {}); return queue; };
 
+    const pill = (t, cls) => `<span class="pill ${cls || ""}">${esc(t)}</span>`;
     const paint = {
-      start(d) { maxRounds = d.max_rounds || 0; ctx.round = 0; if (hooks.onStart) hooks.onStart(d); if (d.note) card("route", esc(d.note)); setPending("research agent is assembling the evidence packet (market, SEC filings, news)…"); },
+      start(d) { maxRounds = d.max_rounds || 0; ctx.round = 0; if (hooks.onStart) hooks.onStart(d); if (d.note) card("route", esc(d.note)); setPending("profiler is reading the latest 10-K, 10-Q and earnings release…"); },
+      profiler(d) {
+        clearPending();
+        const p = d.profile || {};
+        let body = p.business ? `<p class="md">${esc(p.business)}</p>` : `<p class="note">no profile could be built${(d.gaps || []).length ? ": " + esc(d.gaps.join("; ")) : ""}</p>`;
+        const segs = (p.segments || []).filter((x) => x && x.name);
+        if (segs.length) body += `<table class="pkt"><thead><tr><th>segment</th><th>latest revenue</th><th>yoy</th><th>period</th></tr></thead><tbody>` +
+          segs.map((x) => `<tr><td>${esc(x.name)}</td><td><b>${esc(x.latest_revenue || "—")}</b></td><td>${esc(x.latest_yoy || "—")}</td><td><small>${esc(x.period || "")}</small></td></tr>`).join("") + `</tbody></table>`;
+        const kpis = (p.company_kpis || []).filter((x) => x && x.name);
+        if (kpis.length) body += `<div class="kpis"><span class="k">the metrics this company reports</span><ul class="claims">${kpis.map((x) => `<li><b>${esc(x.name)}</b>${x.unit ? ` <small>(${esc(x.unit)})</small>` : ""} — ${esc(x.definition || "")}${x.segment && !/company-?wide/i.test(x.segment) ? ` <small>· ${esc(x.segment)}</small>` : ""}</li>`).join("")}</ul></div>`;
+        if ((d.gaps || []).length) body += `<p class="note">profile gaps: ${esc(d.gaps.join("; "))}</p>`;
+        const c = card("profile", `<h3><span class="who">profiler</span> ${p.archetype ? pill(String(p.archetype).replace(/_/g, " "), "yes") : ""}${(p.accounting_flags || []).map((f) => pill(String(f).replace(/_/g, " "))).join(" ")}${d.cached ? pill("from cache", "live") : ""}</h3>${body}`);
+        setPending("planner is choosing the five questions that decide the outlook…"); return c;
+      },
+      planner(d) {
+        clearPending();
+        const plan = d.plan || {};
+        let body = `<ol class="qs">${(plan.key_questions || []).map((q) => `<li><b>${esc(q.id || "")}</b> ${esc(q.question || "")}${(q.kpis || []).length ? ` <small>· ${esc(q.kpis.slice(0, 4).join(", "))}</small>` : ""}</li>`).join("")}</ol>`;
+        if ((plan.what_would_mislead || []).length) body += `<div class="mislead"><span class="k">what would mislead here</span><ul class="claims">${plan.what_would_mislead.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></div>`;
+        const c = card("plan", `<h3><span class="who">planner</span> key questions${d.cached ? " " + pill("from cache", "live") : ""}</h3>${body}`);
+        setPending("research agent is working through Q1–Q5 in the filings, market data and news…"); return c;
+      },
       research(d) {
         clearPending();
-        const c = card("research", `<h3><span class="who">research</span> evidence packet</h3>${packetHtml(d.evidence)}`);
-        ctx.round = 1; setPending("bull analyst is building the upside case…"); return c;
+        const cov = d.coverage || {}; const ids = Object.keys(cov);
+        const chips = ids.length ? `<div class="cov">${ids.map((q) => `<span class="pill ${cov[q] ? "yes" : "no"}">${esc(q)} · ${cov[q]} line${cov[q] === 1 ? "" : "s"}</span>`).join(" ")}${d.pass > 1 ? ` <small>pass ${d.pass}</small>` : ""}</div>` : "";
+        const c = card("research", `<h3><span class="who">research</span> evidence packet${d.pass > 1 ? ` <span class="round">pass ${d.pass}</span>` : ""}</h3>${chips}${packetHtml(d.evidence)}`);
+        ctx.round = 1; setPending("bull analyst is building the upside case…"); return c;   // a coverage event (new runs) replaces this
+      },
+      coverage(d) {
+        const again = d.decision === "research";
+        card("route", `${again ? "↻" : "→"} coverage gate: ${d.covered}/${d.total} questions have sourced evidence${again ? ` — second pass on ${esc((d.uncovered || []).join(", "))}` : (d.uncovered && d.uncovered.length ? ` — ${esc(d.uncovered.join(", "))} left as coverage gaps` : "")}`);
+        setPending(again ? `research agent is taking a wider pass on ${esc((d.uncovered || []).join(", "))}…` : "bull analyst is building the upside case…");
       },
       bull(d) { clearPending(); ctx.round = d.round || ctx.round; const c = card("bull", `<h3><span class="who">bull</span> ${roundTag(d)}</h3>${argumentHtml(d.text)}`); setPending("bear analyst is building the downside case…"); return c; },
       bear(d) { clearPending(); ctx.round = d.round || ctx.round; const c = card("bear", `<h3><span class="who">bear</span> ${roundTag(d)}</h3>${argumentHtml(d.text)}`); setPending("judge is weighing both sides against the evidence…"); return c; },
@@ -208,6 +251,10 @@ window.Markut = (function () {
         if (d.recorded === false) body = note(d);
         else {
           body += `<div class="sc"><div class="scb"><div class="k">strongest bull point</div><div class="v">${highlightNums(esc(d.bull_strongest || "—"))}</div></div><div class="scr"><div class="k">strongest bear point</div><div class="v">${highlightNums(esc(d.bear_strongest || "—"))}</div></div></div>`;
+          const qs = (d.questions || []).filter((q) => q && q.id);
+          if (qs.length) body += `<table class="pkt qt"><thead><tr><th>question</th><th>what the evidence supports</th><th>stronger</th><th>conf.</th></tr></thead><tbody>` +
+            qs.map((q) => `<tr><td><b>${esc(q.id)}</b></td><td>${highlightNums(esc(q.answer || ""))}${(q.unsupported_claims || []).length ? `<div class="qflag">unsupported: ${esc(q.unsupported_claims.join(" · "))}</div>` : ""}</td><td><span class="side ${esc(q.stronger_side || "")}">${esc(q.stronger_side || "")}</span></td><td><small>${esc(q.confidence || "")}</small></td></tr>`).join("") + `</tbody></table>` +
+            (d.planner_coverage && !/^adequate\.?$/i.test(d.planner_coverage) ? `<p class="note">planner coverage: ${esc(d.planner_coverage)}</p>` : "");
           const claims = d.unsupported_claims || [];
           if (claims.length) body += `<details class="pt flagged"><summary>${claims.length} claim${claims.length === 1 ? "" : "s"} flagged as unsupported</summary><ul class="claims">${claims.map((c) => "<li>" + esc(String(c)) + "</li>").join("")}</ul></details>`;
           if (d.reasoning) body += `<details class="pt"><summary>judge's reasoning</summary><p class="md">${highlightNums(esc(d.reasoning))}</p></details>`;
@@ -223,7 +270,7 @@ window.Markut = (function () {
       news_verify(d) {
         clearPending();
         let body = "";
-        if (d.claim_reviews && d.claim_reviews.length) body += `<ul class="claims">${d.claim_reviews.map((r) => `<li><span class="pill">${esc(r.status || "?")}</span> ${esc(r.claim || "")}${r.evidence_summary ? " — " + esc(r.evidence_summary) : ""}</li>`).join("")}</ul>`;
+        if (d.claim_reviews && d.claim_reviews.length) body += `<ul class="claims">${d.claim_reviews.map((r) => { const v = r.verdict || ({ supported: "flag overturned", contradicted: "flag upheld" }[r.status] || r.status || "?"); return `<li><span class="pill ${/overturned/.test(v) ? "yes" : /upheld/.test(v) ? "no" : ""}">${esc(v)}</span> ${esc(r.claim || "")}${r.evidence_summary ? " — " + esc(r.evidence_summary) : ""}</li>`; }).join("")}</ul>`;
         else body += `<p class="note">${esc(d.reasoning || "No unsupported claims to re-audit.")}</p>`;
         if (d.verdict_changed) body += `<p class="note">The re-audit revised the verdict.</p>`;
         if (d.leads) body += `<details class="pt"><summary>related news leads (display only, never evidence)</summary><pre class="evidence">${esc(d.leads)}</pre></details>`;
@@ -243,19 +290,23 @@ window.Markut = (function () {
         clearPending();
         const u = d.usage || {};
         const cached = (u.cache_read || 0) + (u.cache_write || 0);
-        card("route", `done — ${d.rounds} round(s), ${d.converged ? "converged" : "not converged"}. ${num(u.calls)} model calls · ${num((u.input || 0) + cached)} input tokens${cached ? ` (${num(u.cache_read || 0)} read from cache)` : ""} · ${num(u.output)} output tokens.`);
+        const by = d.by_node || {}; const nodes = Object.keys(by);
+        card("route", `done — ${d.rounds} round(s), ${d.converged ? "converged" : "not converged"}. ${num(u.calls)} model calls · ${num((u.input || 0) + cached)} input tokens${cached ? ` (${num(u.cache_read || 0)} read from cache)` : ""} · ${num(u.output)} output tokens.` +
+          (nodes.length ? `<details class="pt tok"><summary>tokens by node</summary><table class="pkt"><thead><tr><th>node</th><th>calls</th><th>input</th><th>cache write</th><th>cache read</th><th>output</th></tr></thead><tbody>${nodes.map((n) => `<tr><td>${esc(n)}</td><td>${num(by[n].calls)}</td><td>${num(by[n].input)}</td><td>${num(by[n].cache_write)}</td><td>${num(by[n].cache_read)}</td><td>${num(by[n].output)}</td></tr>`).join("")}</tbody></table></details>` : ""));
         if (hooks.onEnd) hooks.onEnd("done", d);
       },
       saved(d) { if (hooks.onSaved) hooks.onSaved(d); },
       error(d) { clearPending(); card("error", `<h3><span class="who">error</span> ${esc(d.stage || "")}</h3><p>${esc(d.message || "unknown error")}</p>`); if (hooks.onEnd) hooks.onEnd("error", d); },
     };
-    // public render API: with reveal on, each event waits its turn and types out
+    // public render API: with reveal on, each event waits its turn and types out;
+    // a turn_id already painted is skipped (dedupe by turn id)
     const render = {};
+    const fresh = (d) => { const id = d && d.turn_id; if (!id) return true; if (seen.has(id)) return false; seen.add(id); return true; };
     for (const name of Object.keys(paint)) {
-      render[name] = (d) => reveal ? enqueue(async () => { const c = paint[name](d); if (c && c.classList) await revealCard(c); }) : paint[name](d);
+      render[name] = (d) => { if (!fresh(d)) return; return reveal ? enqueue(async () => { const c = paint[name](d); if (c && c.classList) await revealCard(c); }) : paint[name](d); };
     }
-    function clear() { el.innerHTML = ""; pending = null; queue = Promise.resolve(); }
-    function renderAll(events) { const was = reveal; reveal = false; clear(); for (const e of events || []) { const fn = paint[e.event]; if (fn) fn(e.data || {}); } clearPending(); reveal = was; }
+    function clear() { el.innerHTML = ""; pending = null; generation += 1; queue = Promise.resolve(); seen = new Set(); }
+    function renderAll(events) { const was = reveal; reveal = false; clear(); for (const e of events || []) { const fn = paint[e.event]; if (fn && fresh(e.data || {})) fn(e.data || {}); } clearPending(); reveal = was; }
     function setReveal(on, ms) { reveal = !!on; if (ms) charMs = ms; }
     return { el, card, setPending, clearPending, clear, render, renderAll, setReveal };
   }

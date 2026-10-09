@@ -12,11 +12,32 @@ short_description: Bull-vs-bear research debate swarm with a governed verdict
 # Markut — AI Investment Research Advisor
 
 A bull-vs-bear debate swarm: ticker in, evidence-grounded, guardrail-governed
-research briefing out. LangGraph state machine (Research → Bull ↔ Bear →
-strict-JSON Judge → news-verify → terminal review governor), a three-source
+research briefing out. LangGraph state machine (Profiler → Planner →
+Research with a coverage gate → Bull ↔ Bear → strict-JSON Judge →
+claim review → terminal review governor), a three-source
 evidence layer (yfinance+FMP, SEC EDGAR RAG, Yahoo RSS) exposed as
 discoverable FastMCP tools, and three guardrail layers (input validation,
 token budget, deterministic output review). Research, not financial advice.
+
+## How a run works
+
+1. **Profiler** reads the latest 10-K Item 1, the newest MD&A, the segment
+   note and the earnings exhibit (an image-only deck is transcribed once per
+   filing) and writes a profile: business, archetype, segments, the KPIs the
+   company itself reports, accounting flags. Cached by ticker + filing
+   accession numbers.
+2. **Planner** turns the profile plus a market summary into the five questions
+   that decide the outlook, the ways standard metrics mislead here, and peer
+   tickers (stored only).
+3. **Research** works through Q1–Q5 in the filings (every excerpt tagged with
+   source, date, period, basis, segment; each chunk used once), adds general
+   evidence, the generic guidance scan, market data and news, then a
+   count-only **coverage gate** loops back once for uncovered questions.
+4. **Bull ↔ Bear** argue Q1–Q5 (at least two rounds), the **Judge** rules per
+   question and overall, **claim review** re-audits flagged claims (flag
+   upheld / overturned / unresolved), and the **governor** traces every number.
+
+CHANGES.md lists what this iteration removed and fixed.
 
 ## Install
 
@@ -26,8 +47,8 @@ token budget, deterministic output review). Research, not financial advice.
 
 ## Run
 
-    python run.py NVDA [--max-rounds 2] [--budget 200000]   # one governed debate
-    python -m markut.eval NVDA        # full debate + baseline comparison (paid)
+    python run.py TICKER [--max-rounds 2] [--budget 300000]   # one governed debate (rounds >= 2)
+    python -m markut.eval TICKER      # full debate + baseline comparison (paid)
     python -m markut.web              # web UI at http://127.0.0.1:8000
     python -m markut.store            # list every logged run (or: show RUN_ID)
 

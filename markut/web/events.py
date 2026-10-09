@@ -12,12 +12,16 @@ so the SAME shape is (a) written down the SSE wire, (b) saved as a run
 record, and (c) replayed later for free. The event names are the node
 names of the graph plus start/route/done/error:
 
-    start -> research -> (bull -> bear -> judge -> route)* -> news_verify
-          -> review -> done
+    start -> profiler -> planner -> research -> coverage [-> research -> coverage]
+          -> (bull -> bear -> judge -> route)* -> news_verify -> review -> done
+
+Every event's data carries a turn_id (unique within the run — the page
+dedupes on it) and usage (the model tokens that node spent); the done event
+adds by_node totals, the per-node token log.
 """
 from markut import config
 from markut.agents import llm
-from markut.agents.graph import build_graph, should_continue
+from markut.agents.graph import build_graph, coverage_decision, should_continue
 from markut.evidence.edgar import ticker_to_cik
 from markut.guardrails.tracer import extract_numeric_claims, trace_claim
 from markut.guardrails.validate import validate_ticker
@@ -38,6 +42,9 @@ def initial_state(ticker: str, max_rounds: int) -> dict:
         "targeted_news_evidence": "", "news_checked": False,
         "claim_verification": {}, "judge_decision": {},
         "budget_exceeded": False, "review_report": {},
+        "profile": {}, "profile_gaps": [], "profiled_text": "", "filing_fingerprint": "",
+        "profile_sources": [], "profile_cached": False, "plan_cached": False,
+        "plan": {}, "market_evidence": "", "research_pass": 0, "coverage": {}, "uncovered": [],
     }
 
 
@@ -105,8 +112,20 @@ def event_for(node: str, update: dict, before: dict, after: dict) -> dict:
     # the page would have to re-derive. Round numbers: bull/bear run BEFORE
     # the judge increments state["round"], so their round is before+1; the
     # judge's update carries the new round itself.
+    if node == "profiler":
+        return {"event": "profiler", "data": {"profile": update.get("profile", {}) or {},
+                                              "gaps": update.get("profile_gaps", []) or [],
+                                              "cached": bool(update.get("profile_cached", False)),
+                                              "fingerprint": update.get("filing_fingerprint", ""),
+                                              "sources": update.get("profile_sources", []) or []}}
+    if node == "planner":
+        return {"event": "planner", "data": {"plan": update.get("plan", {}) or {},
+                                             "cached": bool(update.get("plan_cached", False))}}
     if node == "research":
-        return {"event": "research", "data": {"evidence": update.get("evidence", "")}}
+        return {"event": "research", "data": {"evidence": update.get("evidence", ""),
+                                              "coverage": update.get("coverage", {}) or {},
+                                              "pass": update.get("research_pass", 1),
+                                              "uncovered": update.get("uncovered", []) or []}}
     if node in ("bull", "bear"):
         return {"event": node, "data": {"round": before["round"] + 1,
                                         "text": update.get(f"{node}_case", "")}}
@@ -120,6 +139,9 @@ def event_for(node: str, update: dict, before: dict, after: dict) -> dict:
             "bear_strongest": decision.get("bear_strongest", ""),
             "unsupported_claims": decision.get("unsupported_claims", []) or [],
             "reasoning": decision.get("reasoning", ""),
+            "questions": decision.get("questions", []) or [],
+            "planner_coverage": decision.get("planner_coverage", ""),
+            "truncated": bool(decision.get("truncated", False)),
         }}
     if node == "news_verify":
         verification = update.get("claim_verification", {}) or {}
@@ -143,6 +165,14 @@ def event_for(node: str, update: dict, before: dict, after: dict) -> dict:
     return {"event": node, "data": {"update": update}}
 
 
+def _usage_snapshot() -> dict:
+    return {k: llm.TOKENS.get(k, 0) for k in ("calls", "input", "output", "cache_write", "cache_read")}
+
+
+def _usage_delta(before: dict, after: dict) -> dict:
+    return {k: after.get(k, 0) - before.get(k, 0) for k in after}
+
+
 def stream_debate(ticker: str, max_rounds: int = None, app=None, check_sec: bool = True):
     """Generator: validate (input guardrail layers 1-2) -> build graph ->
     stream -> yield one event per node. app= is the test seam (anything
@@ -150,6 +180,9 @@ def stream_debate(ticker: str, max_rounds: int = None, app=None, check_sec: bool
     network CIK lookup so wiring is provable offline."""
     if max_rounds is None:
         max_rounds = config.DEFAULT_MAX_ROUNDS
+    if max_rounds < config.MIN_ROUNDS:
+        print(f"ROUNDS: {max_rounds} requested — every debate runs at least {config.MIN_ROUNDS} (a rebuttal needs a second round)")
+        max_rounds = config.MIN_ROUNDS
     try:
         ticker = validate_ticker(ticker)      # layer 1: shape
         if check_sec:
@@ -162,30 +195,64 @@ def stream_debate(ticker: str, max_rounds: int = None, app=None, check_sec: bool
     if app is None:
         app = build_graph()
     state = initial_state(ticker, max_rounds)
-    yield {"event": "start", "data": {"ticker": ticker, "max_rounds": max_rounds,
-                                      "model": config.MODEL_NAME,
-                                      "token_budget": config.TOKEN_BUDGET}}
+    seq = 0
+    by_node = {}
+
+    def stamp(event: dict, used: dict = None) -> dict:
+        # turn_id: unique within the run, stored with the event, the page's dedupe key
+        nonlocal seq
+        seq += 1
+        event["data"]["turn_id"] = f"{seq:02d}-{event['event']}"
+        if used is not None:
+            event["data"]["usage"] = used
+        return event
+
+    yield stamp({"event": "start", "data": {"ticker": ticker, "max_rounds": max_rounds,
+                                            "model": config.MODEL_NAME,
+                                            "token_budget": config.TOKEN_BUDGET}})
     try:
+        before_usage = _usage_snapshot()
         for chunk in app.stream(state, stream_mode="updates"):
             # one chunk per finished node: {node_name: update_dict}
             for node, update in chunk.items():
+                now = _usage_snapshot()
+                used = _usage_delta(before_usage, now)
+                before_usage = now
+                tot = by_node.setdefault(node, {k: 0 for k in used})
+                for k, v in used.items():
+                    tot[k] += v
                 before = state
                 state = apply_update(state, update or {})
-                yield event_for(node, update or {}, before, state)
+                yield stamp(event_for(node, update or {}, before, state), used)
+                if node == "research":
+                    # mirror of coverage_route on the same state: the gate's ruling, reported
+                    d = coverage_decision(state)
+                    yield stamp({"event": "coverage", "data": d}, _usage_delta(now, now))
                 if node == "judge":
                     # the graph's own conditional edge decides; we only report
                     # it. route_reason mirrors should_continue's priority order
                     # on the same state/TOKENS/budget — calling should_continue
                     # itself here printed every routing line twice.
                     reason = route_reason(state)
-                    yield {"event": "route", "data": {
+                    yield stamp({"event": "route", "data": {
                         "round": state["round"],
                         "decision": "continue" if reason == "looping back for rebuttal" else "done",
-                        "reason": reason}}
+                        "reason": reason}}, _usage_delta(now, now))
     except Exception as e:  # fail loudly to the page, never hang the stream
-        yield {"event": "error", "data": {"stage": "debate", "message": f"{type(e).__name__}: {e}",
-                                          "usage": usage()}}
+        yield stamp({"event": "error", "data": {"stage": "debate", "message": f"{type(e).__name__}: {e}",
+                                                "usage": usage(), "by_node": by_node}})
         return
-    yield {"event": "done", "data": {"rounds": state["round"], "converged": state["converged"],
-                                     "budget_exceeded": state.get("budget_exceeded", False),
-                                     "usage": usage()}}
+    print_token_log(by_node)
+    yield stamp({"event": "done", "data": {"rounds": state["round"], "converged": state["converged"],
+                                           "budget_exceeded": state.get("budget_exceeded", False),
+                                           "usage": usage(), "by_node": by_node}})
+
+
+def print_token_log(by_node: dict):
+    # the per-node token log: where every input token went
+    if not by_node:
+        return
+    print("TOKENS BY NODE:  node          calls    input  cache_w  cache_r   output")
+    for node, u in by_node.items():
+        print(f"                 {node:<12} {u.get('calls', 0):>6} {u.get('input', 0):>8,} {u.get('cache_write', 0):>8,} "
+              f"{u.get('cache_read', 0):>8,} {u.get('output', 0):>8,}")

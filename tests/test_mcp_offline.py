@@ -63,7 +63,7 @@ def test_mcp_offline_block():
         # each wrapper returns exactly the stub output — no added logic anywhere.
         def _stub_market(ticker):
             return f"[stub market {ticker}]"
-        def _stub_filings(ticker):
+        def _stub_filings(ticker, **kw):
             return f"[stub filings {ticker}]"
         def _stub_news(ticker):
             return f"[stub news {ticker}]"

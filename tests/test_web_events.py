@@ -79,13 +79,18 @@ def test_stream_debate_event_order_and_payloads():
     finally:
         llm.TOKENS.update(saved)
     names = [e["event"] for e in events]
-    assert names == ["start", "research", "bull", "bear", "judge", "route",
+    assert names == ["start", "research", "coverage", "bull", "bear", "judge", "route",
                      "news_verify", "review", "done"]
     by = {e["event"]: e["data"] for e in events}
     assert by["start"]["ticker"] == "NVDA"                  # normalized by validate_ticker
-    assert by["bull"] == {"round": 1, "text": "up"}
+    assert by["bull"]["round"] == 1 and by["bull"]["text"] == "up"
+    # every event carries a turn id unique within the run, and the tokens its node spent
+    ids = [e["data"]["turn_id"] for e in events]
+    assert len(ids) == len(set(ids)) and all(e["data"].get("usage") is not None for e in events[1:])
+    assert by["coverage"]["decision"] == "debate"           # no plan -> nothing to cover -> straight to the debate
+    assert by["done"]["by_node"]["research"]["calls"] == 0
     assert by["judge"]["round"] == 1 and by["judge"]["unsupported_claims"] == ["30-40%"]
-    assert by["route"] == {"round": 1, "decision": "done", "reason": "judge ruled the debate converged"}
+    assert {k: by["route"][k] for k in ("round", "decision", "reason")} == {"round": 1, "decision": "done", "reason": "judge ruled the debate converged"}
     assert by["review"]["stats"]["flagged"] == 1 and by["review"]["stats"]["annotated"] == 1
     assert by["done"]["converged"] is True and by["done"]["usage"]["calls"] == 0
     json.dumps(events)  # every payload must be JSON-serializable (SSE + record file)
@@ -95,7 +100,9 @@ def test_stream_debate_over_real_graph_with_patched_nodes(monkeypatch):
     # graph.py binds node functions by NAME at build time, so patching the
     # graph module's attributes swaps the agents while keeping LangGraph's
     # real routing, reducers and update-chunk shape in the loop.
-    monkeypatch.setattr(graph_mod, "research_node", lambda s: {"evidence": EVIDENCE})
+    monkeypatch.setattr(graph_mod, "profiler_node", lambda s: {"profile": {"archetype": "other"}, "profile_gaps": []})
+    monkeypatch.setattr(graph_mod, "planner_node", lambda s: {"plan": {"key_questions": [{"id": "Q1", "question": "q"}]}})
+    monkeypatch.setattr(graph_mod, "research_node", lambda s: {"evidence": EVIDENCE, "coverage": {"Q1": 1}, "research_pass": 1, "uncovered": []})
     monkeypatch.setattr(graph_mod, "bull_node", lambda s: {"bull_case": f"bull{s['round']+1}", "bull_history": [f"bull{s['round']+1}"]})
     monkeypatch.setattr(graph_mod, "bear_node", lambda s: {"bear_case": f"bear{s['round']+1}", "bear_history": [f"bear{s['round']+1}"]})
     def fake_judge(s):
@@ -111,7 +118,7 @@ def test_stream_debate_over_real_graph_with_patched_nodes(monkeypatch):
     finally:
         llm.TOKENS.update(saved)
     names = [e["event"] for e in events]
-    assert names == ["start", "research", "bull", "bear", "judge", "route",
+    assert names == ["start", "profiler", "planner", "research", "coverage", "bull", "bear", "judge", "route",
                      "bull", "bear", "judge", "route", "news_verify", "review", "done"]
     routes = [e["data"] for e in events if e["event"] == "route"]
     assert routes[0]["decision"] == "continue" and routes[1]["decision"] == "done"

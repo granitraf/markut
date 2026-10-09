@@ -6,9 +6,7 @@ from markut import config
 from markut.evidence.edgar import (ticker_to_cik, get_filing_index,
     find_latest_filings, fetch_filing_html, extract_10k_sections,
     extract_10q_sections, extract_8k_press_release, extract_risk_titles,
-    extract_outlook, extract_10k_business, business_overview,
-    extract_10q_commitments, dollar_sentences, extract_highlights,
-    concentration_sentences, normalize_dollars)
+    extract_10k_business, business_overview, html_to_text, normalize_dollars)
 from markut.guardrails.tracer import extract_numeric_claims
 
 import re
@@ -167,14 +165,16 @@ CHROMA = chromadb.Client()
 _FILING_INDEX_CACHE = {}
 
 
-def build_filing_index(ticker: str):
+def build_filing_index(ticker: str, extra_sections: list = None):
     # Full pipeline for one ticker: filings -> sections -> chunks -> vectors ->
     # a per-ticker Chroma collection. Returns the collection.
     # Besides the semantic chunks, TWO DETERMINISTIC blocks are stored under
-    # their own section names ("Item 1A titles", "Outlook"). They live in the
-    # same collection for provenance, but get_filings_evidence fetches them by
-    # metadata EQUALITY (coll.get), never by similarity search — and no theme
-    # fence includes those names, so semantic queries can't return them either.
+    # their own section names ("Item 1A titles", "Item 1 overview"). They live
+    # in the same collection for provenance, but are fetched by metadata
+    # EQUALITY (coll.get), never by similarity search.
+    # extra_sections = [{"section","text","form","filing_date","url"}]: text
+    # that is not a filing document — a transcribed slide deck — indexed one
+    # slide per chunk so question retrieval can reach it.
     symbol = ticker.upper().strip()
     cik = ticker_to_cik(symbol)
     recent = get_filing_index(cik)
@@ -182,12 +182,13 @@ def build_filing_index(ticker: str):
 
     # REUSE GUARD: same ticker + same filing vintage already indexed in this
     # kernel -> return it instead of re-fetching and re-embedding everything
-    # (a live harness run built the identical NVDA index twice). WHY the
+    # (a live harness run built one ticker's identical index twice). WHY the
     # fingerprint is the candidate filing URLs: each URL carries its
     # accession number, so a newly published filing — or a changed pick —
     # changes the fingerprint and forces a genuine rebuild.
     fingerprint = tuple(doc["url"] for form in ("10-K", "10-Q", "8-K")
-                        for doc in latest[form])
+                        for doc in latest[form]) + tuple(
+                            (x.get("url", ""), x.get("section", ""), len(x.get("text", ""))) for x in (extra_sections or []))
     _cached = _FILING_INDEX_CACHE.get(symbol)
     if _cached and _cached[0] == fingerprint:
         print(f"RAG: reusing existing collection for {symbol} — same filings, skipping re-embed")
@@ -225,14 +226,6 @@ def build_filing_index(ticker: str):
                              "filing_date": doc["filing_date"], "url": doc["url"]},
             })
         all_chunks += chunk_sections(sections, "10-K", doc["filing_date"], doc["url"])
-        # AUDIT (run #9, item 6): the 10-K's own concentration sentences, dated
-        conc_10k = concentration_sentences(sections.get("Item 1A", "") if "Item 1A" in sections else "")
-        if not conc_10k and titles:
-            conc_10k = concentration_sentences(" ".join(split_risk_factors(extract_10k_sections(html)["Item 1A"], titles)))
-        if conc_10k:
-            all_chunks.append({"text": "\n".join(f"- (10-K filed {doc['filing_date']}) {s}" for s in conc_10k),
-                               "metadata": {"form": "10-K", "section": "Concentration (dated)",
-                                            "filing_date": doc["filing_date"], "url": doc["url"]}})
         # AUDIT FIX (run #2): what the company SELLS — the head of Item 1,
         # stored as a deterministic block so every debate opens with it
         overview = business_overview(extract_10k_business(html))
@@ -252,57 +245,37 @@ def build_filing_index(ticker: str):
         doc = latest["10-Q"][0]
         q_html = fetch_filing_html(doc["url"])
         sections = extract_10q_sections(q_html)
-        # AUDIT FIX (run #2): the newest 10-Q's Commitments and Contingencies
-        # note — guarantees, backstops, purchase obligations — indexed under
-        # its own section name so the obligations theme can fence to it
-        sections["Commitments (10-Q note)"] = extract_10q_commitments(q_html)
+        # the notes that carry obligations and financing — commitments,
+        # guarantees, leases, debt — indexed under the heading actually found,
+        # so a question about guarantees or leverage can retrieve into them
+        from markut.evidence.sections import NOTE_HEADINGS, _NOTE_END, _best_section
+        plain = html_to_text(q_html)
+        for title, pat, _topics in NOTE_HEADINGS:
+            note = _best_section(plain, r"(?m)^\s*(?:note\s+)?(?:\d{1,2}\s*[.\-—:]?\s*)?" + pat + r"\b",
+                                 _NOTE_END, min_chars=300, max_chars=40000)
+            if note:
+                sections[f"{title} (10-Q note)"] = note
         all_chunks += chunk_sections(sections, "10-Q", doc["filing_date"], doc["url"])
-        # AUDIT (run #9, item 2): every dollar figure in the commitments note as
-        # its own line — never the truncated tail of a longer quote
-        dollars = dollar_sentences(sections["Commitments (10-Q note)"])
-        if dollars:
-            all_chunks.append({"text": "\n".join(f"- {s}" for s in dollars),
-                               "metadata": {"form": "10-Q", "section": "Commitments $ lines",
-                                            "filing_date": doc["filing_date"], "url": doc["url"]}})
-        # AUDIT (run #9, item 6): newer customer facts, dated by the 10-Q
-        conc_q = concentration_sentences(" ".join(v for k, v in sections.items() if not v.startswith("[section unavailable")))
-        if conc_q:
-            all_chunks.append({"text": "\n".join(f"- (10-Q filed {doc['filing_date']}) {s}" for s in conc_q),
-                               "metadata": {"form": "10-Q", "section": "Concentration (dated)",
-                                            "filing_date": doc["filing_date"], "url": doc["url"]}})
     else:
         print(f"RAG: no recent 10-Q for {symbol} — skipping")
 
-    # ---- 8-K press release: semantic chunks PLUS the deterministic Outlook
-    # block — guidance lives under a literal "Outlook" heading, and finding a
-    # labeled paragraph is a string problem, not a semantic-search problem.
+    # ---- 8-K press release: semantic chunks (guidance, segment figures and
+    # executive quotes are extracted deterministically by evidence.sections)
     pr = extract_8k_press_release(latest["8-K"])
     if not pr["text"].startswith("[press release unavailable"):
         all_chunks += chunk_sections({"press release": pr["text"]}, "8-K",
                                      pr["filing_date"], pr["url"])
-        # AUDIT (run #9, item 3): headline figures, segment/AI revenue lines and
-        # the CEO quote from the top of the release — deterministic, like Outlook
-        highlights = extract_highlights(pr["text"])
-        if highlights:
-            all_chunks.append({"text": highlights,
-                               "metadata": {"form": "8-K", "section": "8-K highlights",
-                                            "filing_date": pr["filing_date"], "url": pr["url"]}})
-        conc_pr = concentration_sentences(pr["text"])
-        if conc_pr:
-            all_chunks.append({"text": "\n".join(f"- (8-K filed {pr['filing_date']}) {s}" for s in conc_pr),
-                               "metadata": {"form": "8-K", "section": "Concentration (dated)",
-                                            "filing_date": pr["filing_date"], "url": pr["url"]}})
-        outlook = extract_outlook(pr["text"])
-        if outlook:
-            all_chunks.append({
-                "text": outlook,
-                "metadata": {"form": "8-K", "section": "Outlook",
-                             "filing_date": pr["filing_date"], "url": pr["url"]},
-            })
-        else:
-            print("RAG: no Outlook/Guidance heading in the press release — guidance block will be absent")
     else:
         print(f"RAG: {pr['text']}")
+
+    # ---- transcribed decks and any other non-document text: one slide per chunk
+    for extra in extra_sections or []:
+        text = extra.get("text") or ""
+        blocks = [b.strip() for b in re.split(r"(?=^Slide\s+\d+\s*[:\-—])", text, flags=re.MULTILINE | re.IGNORECASE) if b.strip()]
+        for b in blocks or ([text] if text.strip() else []):
+            all_chunks.append({"text": b[:1500], "embed_text": b[:1200],
+                               "metadata": {"form": extra.get("form", "8-K"), "section": extra.get("section", "8-K slides"),
+                                            "filing_date": extra.get("filing_date", ""), "url": extra.get("url", "")}})
 
     # WHY delete-then-create: "rebuild" must mean REPLACE — appending to an old
     # collection would mix chunks from different filing vintages of the same
@@ -348,8 +321,8 @@ SIM_FLOOR = 0.35
 POOL_PER_QUERY = 6  # candidates fetched per sub-query before re-ranking
 
 # ONE visible, tunable place for the retrieval-time boilerplate rules. Each
-# phrase is a named failure from the NVDA retrieval audit; the lists are tuned
-# on NVDA/KO filing style and may need additions for other filers.
+# phrase is a named failure from the first retrieval audit; the lists were
+# tuned on two filers' style and may need additions for others.
 BOILERPLATE_PHRASES = [
     # (a) cross-reference pointers — text ABOUT where disclosure lives,
     #     not disclosure itself (audit specimen S1)
@@ -385,7 +358,8 @@ def is_boilerplate_chunk(text: str) -> bool:
 
 
 def retrieve_theme(collection, rerank_query: str, sub_queries: list,
-                   section_filter: list, k: int = 4):
+                   section_filter: list = None, k: int = 4, floor: float = None,
+                   exclude=None, per_query: int = None, dup_overlap: float = 0.9):
     # Three retrieval stages, ALL local and free (zero API tokens):
     #   1. FAN-OUT — embed every concrete sub-query and pull POOL_PER_QUERY
     #      nearest chunks for each, inside the section fence. Embeddings match
@@ -408,17 +382,19 @@ def retrieve_theme(collection, rerank_query: str, sub_queries: list,
     # Factors section, which is exactly what its source tag will claim.
     if collection.count() == 0:
         return [], None
+    floor = SIM_FLOOR if floor is None else floor
     qvecs = get_embedder().encode(list(sub_queries), show_progress_bar=False)
     # WHY fetch at least 3*k per sub-query: the boilerplate filter below
     # discards candidates AFTER reranking, so the pool must be deep enough
     # that a theme can still fill k REAL slots once junk is skipped. Extra
     # candidates cost only local embedding lookups — zero API tokens.
-    per_query = max(POOL_PER_QUERY, 3 * k)
-    res = collection.query(
-        query_embeddings=[v.tolist() for v in qvecs],
-        n_results=min(per_query, collection.count()),
-        where={"section": {"$in": list(section_filter)}},
-    )
+    per_query = per_query or max(POOL_PER_QUERY, 3 * k)
+    query_kwargs = {"query_embeddings": [v.tolist() for v in qvecs],
+                    "n_results": min(per_query, collection.count())}
+    if section_filter:
+        # WHY the metadata fence: a source tag claims a section; the fence makes it true
+        query_kwargs["where"] = {"section": {"$in": list(section_filter)}}
+    res = collection.query(**query_kwargs)
     pool, best = {}, None
     for qi, sub_q in enumerate(sub_queries):
         rows = zip(res["ids"][qi], res["documents"][qi],
@@ -427,10 +403,10 @@ def retrieve_theme(collection, rerank_query: str, sub_queries: list,
             sim = round(1 - dist, 4)  # cosine distance -> similarity (higher = better)
             if best is None or sim > best:
                 best = sim
-            if sim < SIM_FLOOR:
+            if sim < floor:
                 continue
             if cid not in pool or sim > pool[cid]["similarity"]:
-                pool[cid] = {"text": doc, "metadata": meta,
+                pool[cid] = {"id": cid, "text": doc, "metadata": meta,
                              "similarity": sim, "matched": sub_q}
     if not pool:
         return [], best
@@ -473,6 +449,8 @@ def retrieve_theme(collection, rerank_query: str, sub_queries: list,
         if is_boilerplate_chunk(cand["text"]):
             skipped_boilerplate += 1
             continue
+        if exclude is not None and exclude(cand):
+            continue   # read-once: already in the packet (profiler section or an earlier question)
         meta = cand["metadata"]
         # WHY one-risk-one-slot: several sentence windows from the SAME long
         # risk factor can all rerank well (audit specimen S4: cybersecurity
@@ -487,7 +465,7 @@ def retrieve_theme(collection, rerank_query: str, sub_queries: list,
             continue
         words = set(cand["text"].lower().split())
         dup_at = next((i for i, prior_words in enumerate(picked_word_sets)
-                       if len(words & prior_words) > 0.9 * min(len(words), len(prior_words))), None)
+                       if len(words & prior_words) > dup_overlap * min(len(words), len(prior_words))), None)
         if dup_at is not None:
             # AUDIT FIX (run #2): prefer the NEWEST filing when a passage is
             # repeated — a 10-Q restating 10-K language supersedes it
@@ -518,72 +496,16 @@ from datetime import date
 CHARS_PER_TOKEN = 4
 GLOBAL_TOKEN_CAP = 4200  # hard ceiling for the whole [FILINGS] section (2500 -> 3300 audit pass -> 4200 with dollar lines, highlights, concentration)
 
-# SEMANTIC themes: (title, rerank query, sub-queries, section fence, k, cap).
-# WHY sub-query FAN-OUT instead of one abstract query per theme: embeddings
-# match like-to-like. "key business risks and threats" is abstract, so it
-# retrieved text that talks about risk in the ABSTRACT — intros, transitions,
-# boilerplate. Sub-queries phrased like actual filing sentences match actual
-# filing sentences. They are worded generically (no company names) so the same
-# THEMES work for any ticker; every extra sub-query is a free local embed.
-# WHY a fence per theme: the source tag on each excerpt claims a section, and
-# the fence makes that claim structurally true (a "risk" can only come from a
-# Risk Factors section).
-THEMES = [
-    ("Key risks",
-     "the most important specific business risks facing the company",
-     ["export controls, sanctions or government regulation restrict our sales in key markets",
-      "we depend on a limited number of customers and partners for a significant portion of revenue",
-      # WHY reworded (audit specimen S4): the old phrasing "we rely on
-      # third-party foundries and suppliers to manufacture and package our
-      # products" had its semantic center on RELYING ON THIRD PARTIES — which
-      # matched the third-party/vendor SECURITY risk factor, not supply chain.
-      # This wording centers the manufacturing activity itself (wafers,
-      # packaging, capacity) and stays company-agnostic for any ticker.
-      "foundry manufacturing capacity, wafer supply and packaging constraints at our suppliers",
-      "intense competition and rapid technological change could reduce our market share and margins",
-      "supply constraints, long-term purchase commitments and inventory write-downs"],
-     ["Item 1A", "Item 1A (10-Q update)"], 4, 850),
-    ("Results & drivers",
-     "what actually drove revenue, margins and segment results this period",
-     ["revenue increased compared with the prior year, driven by strong demand",
-      "gross margin changed due to product mix, costs and inventory charges",
-      "segment revenue grew to a record during the quarter",
-      "operating expenses increased due to compensation and infrastructure"],
-     ["Item 7", "Item 2 (10-Q MD&A)", "press release"], 4, 850),
-    # AUDIT FIX (run #2): targeted retrieval for guidance and OBLIGATIONS —
-    # the guarantee/backstop/residual-value language that a $29B maximum
-    # exposure lives in, plus forward guidance wherever it is stated.
-    ("Guidance, commitments & obligations",
-     "forward guidance, guarantees, backstops, purchase commitments and off-balance-sheet obligations",
-     ["we expect revenue for the next fiscal quarter to be approximately",
-      "guidance for the full fiscal year revenue and gross margin",
-      "we have guaranteed the obligations and our maximum exposure under the guarantee",
-      "backstop commitment and residual value guarantee",
-      "unconditional purchase obligations and contractual commitments",
-      "off-balance-sheet arrangements and contingent liabilities"],
-     ["press release", "Outlook", "Commitments (10-Q note)"], 2, 400),   # trimmed after run #6 (was 3 quotes/600 over MD&A too)
-]
-
 # DETERMINISTIC blocks: (title, section name in the index, token cap).
 # WHY no semantic search here: this content lives under a KNOWN label — the
-# press release's "Outlook" paragraph, the Item 1A caption list — and finding
-# a labeled block is a string problem. The old RAG approach scored 0.08-0.13
-# cosine (noise) trying to SEARCH for guidance that a string match finds
-# exactly. These are fetched by metadata equality (coll.get), never by query.
+# Item 1A caption list, the head of Item 1 — and finding a labeled block is a
+# string problem. These are fetched by metadata equality (coll.get), never by
+# query. Everything else in [FILINGS] is driven by the planner's questions
+# (evidence.questions) or extracted by heading (evidence.sections).
 DETERMINISTIC_BLOCKS = [
     ("Risk factor titles", "Item 1A titles", 300),
-    ("Guidance & outlook", "Outlook", 400),
-    ("Business overview", "Item 1 overview", 350),   # what the company sells (10-K Item 1 head)
-    ("Guarantees & commitments — dollar figures", "Commitments $ lines", 400),   # run #9 item 2
-    ("8-K highlights", "8-K highlights", 400),                                   # run #9 item 3
-    ("Customer concentration (dated)", "Concentration (dated)", 350),           # run #9 item 6
+    ("Business overview", "Item 1 overview", 350),
 ]
-
-# WHY these budgets: retrieved quotes carry the debate (850 + 850); the
-# caption list is so dense that 300 tokens covers a dozen-plus risks; the
-# outlook paragraph is short and numeric (400). Quote budgets sum to 2,400,
-# and the global enforcer below guarantees the WHOLE section — headers and
-# source tags included — fits GLOBAL_TOKEN_CAP.
 
 
 def truncate_to_budget(text: str, char_budget: int) -> str:
@@ -781,70 +703,80 @@ def deterministic_block(coll, title, section_name, cap) -> list:
         return [f"-- {title} --", f"[theme unavailable: {e}]"]
 
 
-def get_filings_evidence(ticker: str) -> str:
-    # Builds the [FILINGS] evidence section: index the ticker's latest filings,
-    # then assemble two RETRIEVED themes and two DETERMINISTIC blocks under
-    # per-theme and global token caps. Appended to market_snapshot's packet by
-    # research_node.
+def get_filings_evidence(ticker: str, plan: dict = None, profile: dict = None, profiled_text: str = "",
+                         relaxed_questions: list = None) -> str:
+    """The [FILINGS] evidence: question-driven excerpts for the planner's
+    Q1-Q5 (tagged with question id, source, filing date, period, basis and
+    segment), general evidence (risk captions, executive quotes, revenue and
+    segment figures, every dollar figure in the obligations notes) and the
+    generic guidance scan. Without a plan only the general and guidance
+    sections are produced. Never raises."""
+    from markut.evidence import sections as secs
+    from markut.evidence.questions import general_blocks, guidance_block, question_blocks
     try:
-        coll = build_filing_index(ticker)
+        fs = secs.filing_set(ticker)
+    except Exception as e:
+        return f"\n\n[FILINGS]\n[filings unavailable: {e}]"
+    transcripts = []
+    try:
+        transcripts = secs.transcripts_for(fs)
+    except Exception as e:
+        print(f"RAG: transcripts lookup skipped ({e})")
+    extra = [{"section": f"8-K {t.get('name', 'exhibit')} (slides, transcribed)", "text": t.get("text", ""),
+              "form": "8-K", "filing_date": t.get("filing_date", ""), "url": t.get("url", "")}
+             for t in transcripts if t.get("text")]
+    try:
+        coll = build_filing_index(ticker, extra_sections=extra)
     except Exception as e:
         # WHY fail soft: filings are ONE evidence layer — a dead EDGAR must not
         # kill the debate, which still has the full market_snapshot packet.
         return f"\n\n[FILINGS]\n[filings unavailable: {e}]"
 
     lines = ["[FILINGS]"]
-    # Header: every source document's date AND age in months. WHY: the debaters
-    # must know how stale each source is — a 10-K risk factor from 11 months ago
-    # and a 3-week-old press release deserve different weight.
     try:
         metas = coll.get(include=["metadatas"])["metadatas"] or []
         seen = {}
         for m in metas:
-            label = "8-K press release" if m["form"] == "8-K" else m["form"]
-            seen[(label, m["filing_date"])] = True
+            label = "8-K press release" if m["form"] == "8-K" and "slides" not in str(m.get("section", "")) else (
+                "8-K slides" if m["form"] == "8-K" else m["form"])
+            seen[(label, m["filing_date"])] = m.get("url", "")
         if seen:
             lines.append("Sources: " + " | ".join(
-                f"{label} filed {d} ({months_old(d)} months old)"
-                for (label, d) in sorted(seen)))
+                f"{label} filed {d} ({months_old(d)} months old) {seen[(label, d)]}" for (label, d) in sorted(seen) if d))
         else:
             lines.append("[no filing documents indexed]")
     except Exception as e:
         lines.append(f"[source header unavailable: {e}]")
 
-    # WHY a helper per block (each with its own try/except): one broken block
-    # costs exactly one block — the other three still make it in. Packet order
-    # is interleaved by hand so related blocks sit together: risk QUOTES, then
-    # the caption list that summarizes ALL the risks; results quotes, then the
-    # deterministic outlook.
-    blocks = [
-        deterministic_block(coll, *DETERMINISTIC_BLOCKS[2]),  # Business overview — first: what the company sells
-        semantic_block(coll, *THEMES[0]),            # Key risks (retrieved)
-        deterministic_block(coll, *DETERMINISTIC_BLOCKS[0]),  # Risk factor titles
-        semantic_block(coll, *THEMES[1]),            # Results & drivers (retrieved)
-        deterministic_block(coll, *DETERMINISTIC_BLOCKS[1]),  # Guidance & outlook
-        semantic_block(coll, *THEMES[2]),            # Guidance, commitments & obligations (retrieved)
-        deterministic_block(coll, *DETERMINISTIC_BLOCKS[3]),  # Guarantees & commitments — dollar figures
-        deterministic_block(coll, *DETERMINISTIC_BLOCKS[4]),  # 8-K highlights
-        deterministic_block(coll, *DETERMINISTIC_BLOCKS[5]),  # Customer concentration (dated)
-    ]
-
-    blocks = enforce_global_cap(blocks, GLOBAL_TOKEN_CAP * CHARS_PER_TOKEN)
-    for b in blocks:
-        lines.append("")  # blank line between themes for readability
-        lines.extend(b)
+    if plan and plan.get("key_questions"):
+        try:
+            qlines = question_blocks(coll, plan, profile or {}, profiled_text or "", relaxed=relaxed_questions or [])
+        except Exception as e:
+            qlines = [f"[question evidence unavailable: {e}]"]
+        lines.append("")
+        lines.extend(qlines)
+    try:
+        lines.append("")
+        lines.extend(general_blocks(coll, fs, profile or {}))
+    except Exception as e:
+        lines += ["", "[GENERAL EVIDENCE]", f"[general evidence unavailable: {e}]"]
+    try:
+        lines.append("")
+        lines.extend(guidance_block(fs, transcripts))
+    except Exception as e:
+        lines += ["", "[GUIDANCE]", f"[guidance scan unavailable: {e}]"]
     return "\n\n" + "\n".join(lines)
 
 
 # ---------------- AUDIT PASS (run #2): corroborate news-sourced claims against the filings ----------------
-# WHY: the judge flagged "221% AI revenue growth" and "$29B maximum guarantee
-# exposure" as untrusted NEWS — both sit in the filings (8-K press release,
-# 10-Q note). Before a flagged number is discarded, look for it VERBATIM in
-# the indexed filings; a hit promotes it to filing-backed evidence.
+# WHY: a judge once flagged a growth rate and a maximum guarantee exposure as
+# untrusted NEWS when both sat in the filings (8-K press release, 10-Q note).
+# Before a flagged number is discarded, look for it VERBATIM in the indexed
+# filings; a hit promotes it to filing-backed evidence.
 
 def number_variants(num: str) -> list:
     # PURE. Spellings a filing may use for a packet-style number.
-    # "221%" -> ["221%", "221 %", "221 percent"]; "$29B" -> ["$29 billion", "$29.0 billion", "29 billion", "$29B"]
+    # "21%" -> ["21%", "21 %", "21 percent"]; "$9B" -> ["$9 billion", "$9.0 billion", "9 billion", "$ 9 billion", "$9B"]
     raw = num.strip()
     out = [raw]
     m = re.fullmatch(r"(\d+(?:\.\d+)?)\s?%", raw)
@@ -886,11 +818,32 @@ def corroborate_claims(ticker: str, claims: list, coll=None, max_hits: int = 2) 
                 docs = got.get("documents") or []
                 if docs:
                     found = {"claim": str(claim), "number": num, "match": variant,
-                             "text": docs[0], "metadata": (got.get("metadatas") or [{}])[0]}
+                             "text": docs[0], "passage": passage_around(docs[0], variant),
+                             "metadata": (got.get("metadatas") or [{}])[0]}
                     break
             if found:
                 hits.append(found)
     return hits
+
+
+def passage_around(text: str, needle: str, width: int = 260) -> str:
+    """PURE. The sentence(s) of text that contain needle — what a reader needs
+    to see to accept a 'found verbatim' verdict — not the chunk's first words."""
+    text = text or ""
+    i = text.lower().find(needle.lower())
+    if i < 0:
+        return text[:width]
+    start = max(0, i - width // 2)
+    end = min(len(text), i + len(needle) + width // 2)
+    # widen to sentence boundaries where they are close
+    before = text.rfind(". ", 0, i)
+    if before >= 0 and i - before < width:
+        start = before + 2
+    after = text.find(". ", i)
+    if after >= 0 and after - i < width:
+        end = after + 1
+    out = text[start:end].strip()
+    return ("…" if start > 0 else "") + out + ("…" if end < len(text) else "")
 
 
 def format_corroboration_addendum(hits: list) -> str:
@@ -908,6 +861,6 @@ def format_corroboration_addendum(hits: list) -> str:
         seen.add(key)
         m = h["metadata"]
         lines.append(f"- {h['number']} (from claim: {truncate_to_budget(h['claim'], 160)})")
-        lines.append(f'- "{truncate_to_budget(h["text"], 600)}"')
+        lines.append(f'- "{truncate_to_budget(h.get("passage") or h["text"], 600)}"')
         lines.append(f"  [source: EDGAR/{m.get('form', '?')} {m.get('section', '?')}, filed {m.get('filing_date', '?')}, {m.get('url', '')}]")
     return "\n".join(lines)

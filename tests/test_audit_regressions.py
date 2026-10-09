@@ -46,7 +46,7 @@ def test_market_lines_name_period_and_basis():
     text = "\n".join(market.format_market_lines(info))
     assert "EPS (trailing TTM, GAAP): $8.12" in text
     assert "EPS (forward, consensus non-GAAP, next fiscal year): $19.39" in text
-    assert "P/E (forward, on next-FY consensus non-GAAP EPS): 19.38" in text
+    assert "P/E (forward, price / next-FY consensus non-GAAP EPS): 19.38" in text
     assert "Revenue growth (MRQ YoY, most recent quarter vs year-ago quarter): 85.50%" in text
     assert "Revenue growth (yoy)" not in text
     notes = "\n".join(market.basis_notes(info))
@@ -161,7 +161,7 @@ def test_judge_and_claim_review_request_schemas(stub_llm):
     state = {"ticker": "AVGO", "evidence": EVIDENCE, "bull_case": "b", "bear_case": "r",
              "bull_history": ["b"], "bear_history": ["r"], "round": 0, "verdict": ""}
     nodes.judge_node(state)
-    assert calls[0]["schema"]["required"] == ["bull_strongest", "bear_strongest", "unsupported_claims", "reasoning", "verdict", "converged"]
+    assert calls[0]["schema"]["required"] == ["questions", "bull_strongest", "bear_strongest", "unsupported_claims", "reasoning", "verdict", "converged", "planner_coverage"]
 
 
 def test_claim_review_repairs_once_and_logs_raw(stub_llm, monkeypatch, capsys):
@@ -212,36 +212,49 @@ def test_exhibit_picker_finds_broadcom_and_nvidia_releases():
     assert edgar.pick_exhibit(["primary.htm", "0001-index.html"]) is None
 
 
-def test_8k_guidance_chain_outlook_block():
-    # the exhibit picker + outlook extractor: guidance appears once the release is indexed
-    release = ("<html><body><p>Broadcom Inc. today reported results.</p><p>Outlook</p>"
+def test_8k_guidance_from_forward_looking_language():
+    # guidance detection works from forward-looking language, with or without a heading
+    from markut.evidence.sections import guidance_lines
+    release = ("<html><body><p>The company today reported results.</p>"
                "<p>Fourth quarter fiscal year 2026 revenue guidance of approximately $21.0 billion is expected, "
                "an increase of 24 percent from the prior year period.</p>"
                "<p>Adjusted EBITDA guidance of approximately 67 percent of projected revenue is expected.</p>"
-               "<p>Conference call details follow.</p></body></html>")
+               "<p>Conference call details follow at 2:00 p.m.</p></body></html>")
     text = edgar.html_to_text(release)
-    outlook = edgar.extract_outlook(text)
-    assert outlook.startswith("Outlook") and "$21.0 billion" in outlook and "Conference call" not in outlook
+    out = guidance_lines([{"label": "8-K ex99", "text": text, "form": "8-K", "filing_date": "2026-09-02", "url": "u", "kind": "text"}])
+    texts = [l["text"] for l in out["lines"]]
+    assert any("$21.0 billion" in t for t in texts) and any("67 percent" in t for t in texts)
+    assert not any("Conference call" in t for t in texts) and out["failures"] == []
 
 
-def test_item_1_business_overview_and_10q_commitments_extractors():
+def test_item_1_business_overview_and_note_dollar_blocks(monkeypatch):
     tenk = "<html><body>" + "<p>Item 1. Business</p><p>Item 1A. Risk Factors</p><p>Item 7. MD&A</p>" + \
         "<p>Item 1. Business</p><p>Overview</p>" + \
-        "<p>" + " ".join(["Broadcom designs, develops and supplies semiconductor and infrastructure software solutions, "
-                          "including custom AI accelerators (XPUs) designed for hyperscale customers."] * 6) + "</p>" + \
-        "<p>" + " ".join(["Our products are used in data center networking and custom silicon programs."] * 6) + "</p>" + \
+        "<p>" + " ".join(["The company designs, develops and supplies components and software solutions, "
+                          "including custom accelerators designed for large customers."] * 6) + "</p>" + \
+        "<p>" + " ".join(["Our products are used in networking and custom silicon programs."] * 6) + "</p>" + \
         "<p>Item 1A. Risk Factors</p><p>" + "Risks are many and varied in this business. " * 60 + "</p></body></html>"
     item1 = edgar.extract_10k_business(tenk)
     assert item1.startswith("Item 1. Business") and "Risks are many" not in item1
     overview = edgar.business_overview(item1, char_limit=400)
-    assert overview.startswith("Broadcom designs") and len(overview) <= 420 and overview.endswith(".")
-    tenq = "<html><body><p>Note 10. Debt</p><p>" + "Debt details here. " * 20 + "</p>" + \
+    assert overview.startswith("The company designs") and len(overview) <= 420 and overview.endswith(".")
+    # every dollar figure in the obligations notes, titled by the heading found, off-topic sentences dropped
+    from markut.evidence import sections
+    tenq = "<html><body><p>Note 10. Debt</p><p>" + "The senior notes bear interest at 4%. " * 10 + \
+        "The aggregate principal amount of notes outstanding was $4,500 million. </p>" + \
         "<p>Note 11. Commitments and Contingencies</p><p>" + ("We have guaranteed certain obligations of a customer financing arrangement. "
-        "Our maximum exposure under the guarantee was $29 billion as of August 2, 2026. ") * 4 + "</p>" + \
+        "Our maximum exposure under the guarantee was $29 billion as of August 2, 2026. ") * 4 + \
+        "Therefore, $1,755 million of unrecognized tax benefits have been excluded from the table above. </p>" + \
         "<p>Note 12. Segment Information</p><p>" + "Segments are described here. " * 20 + "</p></body></html>"
-    note = edgar.extract_10q_commitments(tenq)
-    assert note.startswith("Note 11. Commitments and Contingencies") and "$29 billion" in note and "Segment Information" not in note
-    assert edgar.extract_10q_commitments("<html><body><p>nothing here</p></body></html>").startswith("[section unavailable")
+    monkeypatch.setattr(sections, "fetch_filing_html", lambda url: tenq)
+    fs = {"10-Q": {"form": "10-Q", "filing_date": "2026-09-10", "url": "u", "accession": "a"}, "10-K": None}
+    blocks = sections.note_dollar_blocks(fs)
+    titles = [b["title"] for b in blocks]
+    assert "Commitments and contingencies (10-Q note)" in titles and "Debt (10-Q note)" in titles
+    comm = next(b for b in blocks if b["title"].startswith("Commitments"))
+    assert any("$29 billion" in l for l in comm["lines"]) and not any("$1,755 million" in l for l in comm["lines"])
+    debt = next(b for b in blocks if b["title"].startswith("Debt"))
+    assert any("$4,500 million" in l for l in debt["lines"])
 
 
 class _FakeColl:
@@ -290,7 +303,7 @@ def test_claim_review_corroborates_before_the_paid_reaudit(stub_llm, monkeypatch
                        "reasoning": "ok", "verdict_changed": False, "revised_verdict": "v"})
     calls = stub_llm([good])
     out = nodes.news_verify_node({"ticker": "AVGO", "evidence": EVIDENCE, "verdict": "v",
-                                  "judge_decision": {"unsupported_claims": ["c1 says 221% growth", "c2"]}})
+                                  "judge_decision": {"unsupported_claims": ["c1: the 221% growth figure appears only in a news item", "c2"]}})
     reviews = out["claim_verification"]["claim_reviews"]
     assert reviews[0]["status"] == "supported" and reviews[0]["claim"].startswith("c1") and reviews[0]["sources"] == ["u"]
     assert reviews[1]["claim"] == "c2"
@@ -300,8 +313,9 @@ def test_claim_review_corroborates_before_the_paid_reaudit(stub_llm, monkeypatch
     # all corroborated -> no paid call at all
     calls = stub_llm([])
     out = nodes.news_verify_node({"ticker": "AVGO", "evidence": EVIDENCE, "verdict": "v",
-                                  "judge_decision": {"unsupported_claims": ["only 221% here"]}})
+                                  "judge_decision": {"unsupported_claims": ["the 221% figure appears only in a news item"]}})
     assert calls == [] and out["claim_verification"]["claim_reviews"][0]["status"] == "supported"
+    assert out["claim_verification"]["claim_reviews"][0]["verdict"] == "flag overturned"
 
 
 def test_news_window_and_materiality_ranking():
@@ -336,13 +350,13 @@ def test_market_context_lines():
 
 @pytest.mark.live
 def test_live_avgo_packet_has_guidance_block():
-    # free (EDGAR + local models, no model calls): the fixed exhibit picker indexes
-    # Broadcom's 8-K and the Outlook block is no longer "[not extracted ...]"
+    # free (EDGAR + local models, no model calls): the release is indexed and the
+    # general guidance scan finds the guided figures; no plan -> general + guidance only
     from markut.evidence.rag import get_filings_evidence
     text = get_filings_evidence("AVGO")
     assert "8-K press release filed" in text
-    assert "-- Guidance & outlook --\n[not extracted" not in text
-    assert "-- Business overview --" in text
+    assert "[GUIDANCE]" in text and "- [guidance]" in text
+    assert "-- Risk factor titles --" in text and "[EVIDENCE Q1]" not in text
 
 
 # ================================================================ P2 — analytical depth
@@ -364,7 +378,7 @@ def test_valuation_block_is_deterministic_and_labeled():
     # the multiple band comes from the company's own history, and the grid crosses EPS cases with it
     assert "Trailing P/E band (company's own history" in text and "p25 22.2x | median 28.5x | p75 32.5x" in text
     rows = [l for l in text.splitlines() if l.startswith("- Implied price, EPS")]
-    assert [r.split(":")[0] for r in rows] == ["- Implied price, EPS -15% $16.48", "- Implied price, EPS consensus $19.39", "- Implied price, EPS +10% $21.33"]
+    assert [r.split(":")[0] for r in rows] == ["- Implied price, EPS consensus $19.39"]     # no low/high in this estimate table
     # no cell equals today's price by construction, and the old "today's multiple × current-FY EPS" rows are gone
     assert "$376.51 (" not in "\n".join(rows) and "Implied price from current-FY" not in text
     assert "peer" not in text.lower()
@@ -374,6 +388,13 @@ def test_valuation_block_is_deterministic_and_labeled():
     assert "equals today's price by construction" in fb and "fwd 19.4x = $376.17" in fb
     assert valuation.format_valuation_lines({}, {}) == []
     assert not hasattr(config, "PEERS")
+    # with the analysts' range the rows are low / consensus / high, on the SAME EPS field as the forward P/E
+    est2 = {"0y": {"avg": 11.66}, "+1y": {"avg": 19.39, "low": 17.47, "high": 22.44, "numberOfAnalysts": 48}}
+    text2 = "\n".join(valuation.format_valuation_lines(info, est2, 2026, {}))
+    rows2 = [l.split(":")[0] for l in text2.splitlines() if l.startswith("- Implied price, EPS")]
+    assert rows2 == ["- Implied price, EPS analyst low $17.47", "- Implied price, EPS consensus $19.39", "- Implied price, EPS analyst high $22.44"]
+    assert "analyst low / consensus / high from the estimate table, 48 analysts" in text2
+    assert "-15%" not in text2 and "+10%" not in text2
 
 
 def test_pe_band_needs_real_history():
@@ -383,12 +404,12 @@ def test_pe_band_needs_real_history():
 def test_judge_prompt_has_checklist_and_verdict_format():
     j = prompts.JUDGE_SYSTEM_PROMPT
     assert j.startswith(prompts.JUDGE_SYSTEM_PROMPT_NOTEBOOK)
-    for needle in ("Period and basis", "Overlapping categories", "48% + top-five end customers 40%",
-                   "Competitor or customer", "Which year's EPS", "[VALUATION] scenario table",
+    for needle in ("Period and basis", "Overlapping percentages", "Company relationships", "The scenario grid",
+                   "News-only claims", "PER-QUESTION RULINGS", '"planner_coverage"',
                    "Debates that move the stock:", "What would change this view:", "Next catalyst:"):
         assert needle in j, needle
-    assert "do not compute your own multiple" in j
-    assert prompts.BULL_SYSTEM_PROMPT.endswith(prompts.ANALYST_ADDENDUM) and "never call a" in prompts.BEAR_SYSTEM_PROMPT
+    assert "48%" not in j and "top-five" not in j                       # no company figures in the checklist
+    assert prompts.BULL_SYSTEM_PROMPT.endswith(prompts.ANALYST_ADDENDUM) and "[missed question]" in prompts.BEAR_SYSTEM_PROMPT
     assert "[FILINGS ADDENDUM" in prompts.NEWS_VERIFY_SYSTEM_PROMPT
 
 
@@ -482,8 +503,7 @@ def test_request_kwargs_cache_control_and_accounting(monkeypatch):
 
 def test_trims_after_run6():
     from markut.evidence import rag
-    title, _, _, fence, k, cap = rag.THEMES[2]
-    assert title.startswith("Guidance, commitments") and k == 2 and cap == 400 and "Item 7" not in fence
+    assert not hasattr(rag, "THEMES")          # company-shaped retrieval themes are gone; the planner's questions drive retrieval
     assert config.ARGUMENT_MAX_TOKENS == 1500 and news_mod.NEWS_BASELINE_TOKEN_CAP == 1000
     assert "under 450 words" in prompts.BULL_SYSTEM_PROMPT and "LENGTH LIMITS" in prompts.JUDGE_SYSTEM_PROMPT
     text = "\n".join(valuation.format_valuation_lines(
@@ -522,7 +542,7 @@ from markut.evidence import gaps as gaps_mod
 
 
 def test_data_gaps_block_names_sources_and_hides_raw_errors():
-    clean, found = gaps_mod.summarize_gaps(EVIDENCE6)                 # run #6 packet: four FMP sections failed
+    clean, found = gaps_mod.summarize_gaps(EVIDENCE6, position="start")                 # run #6 packet: four FMP sections failed
     assert clean.startswith("[DATA GAPS]\n- quote: upstream returned a non-JSON response")
     assert [g["source"] for g in found] == ["quote", "income-statement", "ratios", "dcf"]
     assert "Expecting value" not in clean and "char 0" not in clean
@@ -567,27 +587,25 @@ def test_commitments_dollar_lines_and_no_truncation_before_dollars():
 
 
 def test_8k_highlights_extraction():
-    release = ("EX-99.1 Document Exhibit 99.1 Broadcom Inc. Announces Third Quarter Fiscal Year 2026 Financial Results\n\n"
+    release = ("EX-99.1 Document Exhibit 99.1 Example Corp. Announces Third Quarter Fiscal Year 2026 Financial Results\n\n"
                "• Revenue of $ 29.6 billion for the third quarter, up 86 percent from the prior year period\n\n"
-               "• AI semiconductor revenue grew 221 percent year-on-year to $5.2 billion\n\n"
-               "\u201cWe delivered record results,\u201d said Hock Tan, President and CEO.\n\n"
+               "• Product-line revenue grew 221 percent year-on-year to $5.2 billion\n\n"
+               "\u201cWe delivered record results,\u201d said the President and CEO.\n\n"
                "Fourth Quarter Fiscal Year 2026 Business Outlook\n\nFourth quarter revenue guidance of approximately $34.8 billion is expected.\n\n"
-               "About Broadcom\n\nBroadcom Inc. is a global technology leader.")
+               "About Example\n\nExample Corp. is a global technology leader.")
     h = edgar.extract_highlights(release)
-    assert h.startswith("Broadcom Inc. Announces") and "EX-99.1" not in h
-    assert "$29.6 billion" in h and "221 percent" in h and "said Hock Tan" in h
-    assert "Outlook" not in h and "$34.8 billion" not in h and "About Broadcom" not in h   # outlook has its own block; boilerplate stops it
+    assert h.startswith("Example Corp. Announces") and "EX-99.1" not in h
+    assert "$29.6 billion" in h and "221 percent" in h and "said the President" in h
+    assert "Outlook" not in h and "$34.8 billion" not in h and "About Example" not in h   # guidance has its own block; boilerplate stops it
+    assert edgar.strip_exhibit_label("EXHIBIT 99.1 Exhibit 99.1 THE COMPANY REPORTS") == "THE COMPANY REPORTS"
 
 
-def test_concentration_sentences_are_dated_facts():
-    tenq = ("Financial Guarantee During the fiscal quarter ended August 2, 2026, we arranged for a financial partner to take on certain agreements to purchase AI racks for a customer. "
-            "In connection with this arrangement, we entered into a backstop agreement with the financial partner for the customer's lease obligations over the 5-year lease terms. "
-            "Gross margin was approximately flat sequentially. "
-            "We believe aggregate sales to our top five end customers accounted for approximately 40% of our net revenue for fiscal year 2025.")
-    got = edgar.concentration_sentences(tenq)
-    assert len(got) == 3 and got[0].startswith("Financial Guarantee") and got[-1].endswith("fiscal year 2025.")
-    assert all("customer" in s.lower() for s in got) and not any("Gross margin" in s for s in got)
-    assert edgar.concentration_sentences("Nothing about buyers here. Sales rose 10%.") == []
+def test_no_company_shaped_section_labels():
+    # section labels come from what is found: there is no fixed "customer
+    # concentration" heading and no heading-keyed outlook extractor any more
+    assert not hasattr(edgar, "concentration_sentences") and not hasattr(edgar, "extract_outlook")
+    from markut.evidence import rag
+    assert all("oncentration" not in title for title, _, _ in rag.DETERMINISTIC_BLOCKS)
 
 
 def test_all_time_high_from_daily_closes_with_sanity_check(capsys):
@@ -620,12 +638,9 @@ def test_dispersed_pe_history_is_information_not_the_grid():
     assert valuation.BAND_MAX_DISPERSION == 2.0
 
 
-def test_list_blocks_print_as_lines_and_concentration_skips_design_win_sentences():
+def test_list_blocks_print_as_lines():
     from markut.evidence import rag
-    block = rag.format_theme_block("t", [{"text": "- (10-K filed 2025-12-18) top five end customers 40%.\n- (10-Q filed 2026-09-10) backstop for the customer's lease obligations.",
-                                          "metadata": {"form": "10-Q", "section": "Concentration (dated)", "filing_date": "2026-09-10", "url": "u"}}], 400)
+    block = rag.format_theme_block("t", [{"text": "- (10-K filed 2025-12-18) first dated fact.\n- (10-Q filed 2026-09-10) second dated fact.",
+                                          "metadata": {"form": "10-Q", "section": "Dated facts", "filing_date": "2026-09-10", "url": "u"}}], 400)
     assert block[1].startswith("- (10-K filed") and block[2].startswith("- (10-Q filed") and block[3].startswith("  [source:")
     assert not any(l.startswith('- "') for l in block)
-    got = edgar.concentration_sentences("Winning a product design does not guarantee sales to a customer. "
-                                        "We believe sales to our top five end customers accounted for approximately 40% of our net revenue for fiscal year 2025.")
-    assert len(got) == 1 and got[0].startswith("We believe")

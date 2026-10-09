@@ -38,15 +38,21 @@ def market_snapshot_tool(ticker: str) -> str:
     return market_snapshot(ticker)
 
 
-def filings_evidence_tool(ticker: str) -> str:
-    """SEC filings evidence for one stock ticker: a token-capped [FILINGS]
-    section from the company's latest 10-K, 10-Q, and 8-K press release —
-    retrieved risk-factor and results/drivers excerpts plus deterministic
-    risk-caption and guidance blocks. Every excerpt carries a source tag
-    ([source: EDGAR/<form> <section>, filed <date>, <url>]) and the header
-    states each document's age in months. Never raises; degrades to bracketed
-    "[filings unavailable: ...]" or per-theme markers."""
-    return get_filings_evidence(ticker)
+def filings_evidence_tool(ticker: str, plan: dict = None, profile: dict = None, profiled_text: str = "",
+                          relaxed_questions: list = None) -> str:
+    """SEC filings evidence for one stock ticker from its latest 10-K, 10-Q
+    and earnings 8-K. With a planner `plan` ({"key_questions": [{"id","question",
+    "kpis","segments","search_queries"}]}) the section is organized under
+    [EVIDENCE Q1..Q5]: tagged excerpts (source, filing date, period, basis,
+    segment), each chunk used once, nothing in `profiled_text` retrieved
+    again, an explicit 'could not find' line when retrieval is empty;
+    `relaxed_questions` lists ids to retry with a wider net. Always followed by
+    [GENERAL EVIDENCE] (risk captions, executive quotes, revenue and segment
+    figures, every dollar figure in the obligations notes) and [GUIDANCE]
+    (forward-looking statements with a figure, or an EXTRACTION FAILURE line).
+    Never raises; degrades to bracketed "[filings unavailable: ...]" markers."""
+    return get_filings_evidence(ticker, plan=plan, profile=profile, profiled_text=profiled_text,
+                                relaxed_questions=relaxed_questions)
 
 
 def news_evidence_tool(ticker: str) -> str:

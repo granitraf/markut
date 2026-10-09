@@ -1,6 +1,6 @@
 """Step 6 baseline-comparison harness (notebook cells 36/62, verbatim
 bodies): same-ruler grading, LLM-judge recall scorer, stored-packet
-control. CLI: python -m markut.eval NVDA (runs a full debate first —
+control. CLI: python -m markut.eval TICKER (runs a full debate first —
 paid calls)."""
 import difflib
 import json
@@ -254,7 +254,7 @@ def run_baseline_comparison(final_state):
     print("EVAL: one baseline call (same evidence, judge-sized budget)...")
     _eval_baseline_verdict = llm.call_claude(
         prompts.BASELINE_SYSTEM_PROMPT,
-        f"EVIDENCE PACKET for NVDA:\n{_eval_packet}\n\nYour verdict:",
+        f"EVIDENCE PACKET for {final_state.get('ticker', 'the company')}:\n{_eval_packet}\n\nYour verdict:",
         max_tokens=2000)
     _eval_baseline_tokens = llm.TOKENS["input"] + llm.TOKENS["output"] - _eval_before
 

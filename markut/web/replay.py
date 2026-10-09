@@ -17,7 +17,8 @@ BUNDLED_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 # Replay pacing (seconds before each event) — long enough that a card visibly
 # "arrives", short enough that a whole demo plays in ~15s. The judge pauses
 # longest because that is where a viewer reads.
-DELAYS = {"start": 0.0, "research": 1.0, "bull": 1.6, "bear": 1.6, "judge": 1.4,
+DELAYS = {"start": 0.0, "profiler": 1.2, "planner": 1.2, "research": 1.0, "coverage": 0.5,
+          "bull": 1.6, "bear": 1.6, "judge": 1.4,
           "route": 0.6, "news_verify": 1.0, "review": 1.4, "done": 0.4, "error": 0.0}
 
 

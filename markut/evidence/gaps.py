@@ -55,10 +55,11 @@ def _name_for(m) -> str:
             "section unavailable": "filing section"}.get(kind, kind)
 
 
-def summarize_gaps(packet: str) -> tuple:
+def summarize_gaps(packet: str, position: str = "end") -> tuple:
     """-> (clean_packet, gaps). gaps = [{"source", "reason"}] in packet order,
     deduped. Raw error text inside markers is replaced by its clean reason;
-    the DATA GAPS block is prepended (or 'none')."""
+    the DATA GAPS block is appended (position="end", the packet's last
+    section beside the coverage gaps) or prepended (position="start")."""
     gaps, seen = [], set()
 
     def rewrite(m):
@@ -78,7 +79,7 @@ def summarize_gaps(packet: str) -> tuple:
         return f"[{name}: unavailable — {reason}]"
 
     body = _MARKER_RE.sub(rewrite, packet or "")
-    if body.lstrip().startswith("[DATA GAPS]"):
+    if "[DATA GAPS]" in body:
         return body, gaps  # already summarized
     lines = ["[DATA GAPS]"]
     if gaps:
@@ -86,7 +87,10 @@ def summarize_gaps(packet: str) -> tuple:
     else:
         lines.append("- none — every evidence source responded")
     lines += [f"- known gap (always): {k}" for k in KNOWN_GAPS]
-    return "\n".join(lines) + "\n\n" + body, gaps
+    block = "\n".join(lines)
+    if position == "start":
+        return block + "\n\n" + body, gaps
+    return body.rstrip() + "\n\n" + block, gaps
 
 
 def count_gaps(packet: str) -> int:
