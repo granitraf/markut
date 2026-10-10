@@ -93,8 +93,53 @@ _EVIDENCE_NUM_RE = re.compile(
     re.IGNORECASE)
 
 
+_PCT_LABEL_RE = re.compile(r"^\s*-\s+[^:]*(?:%|percent|margin|rate|ratio|yield|growth)[^:]*:", re.IGNORECASE)
+_UNIT_HINT_RE = re.compile(r"(?i)\(?(?:units?:\s*|in\s+)(thousands|millions|billions)\b")
+
+
 def extract_evidence_numbers(evidence: str) -> set:
-    return {normalize_number(m.group(0)) for m in _EVIDENCE_NUM_RE.finditer(evidence or "")}
+    """Every number in the evidence, normalized — plus the forms a verdict may
+    legitimately use for it: the percent form of a value whose LABEL carries
+    the unit ("Debt/Equity (mrq, %): 401.00" -> "401%"), and the scaled form
+    of a value whose line states its units ("$729,476 thousand" -> 729476000;
+    "(units: millions) 3,583" -> 3583000000)."""
+    out = set()
+    for line in (evidence or "").split("\n"):
+        pct_label = bool(_PCT_LABEL_RE.match(line))
+        hint = _UNIT_HINT_RE.search(line)
+        scale = _SCALE_FACTORS[hint.group(1).lower().rstrip("s")] if hint else None
+        for m in _EVIDENCE_NUM_RE.finditer(line):
+            raw = m.group(0)
+            key = normalize_number(raw)
+            out.add(key)
+            if pct_label and not key.endswith("%") and "[ambiguous" not in key and not re.search(r"[tbmk]\b|trillion|billion|million|thousand", raw.lower()):
+                out.add(key + "%")
+            if scale and re.fullmatch(r"\$?\s?\d{1,3}(?:,\d{3})+(?:\.\d+)?", raw.strip()):
+                try:
+                    out.add(_canonical_value(str(float(raw.replace("$", "").replace(",", "").strip()) * scale)))
+                except ValueError:
+                    pass
+    return out
+
+
+_ABSENCE_RE = re.compile(r"(?i)\b(?:does not|doesn't|did not|do not|never) (?:disclose|provide|report|give|publish|break out|quantify)|"
+                         r"\b(?:not disclosed|undisclosed|no (?:such )?(?:guidance|disclosure|figure|metric|number)|is absent|absent from|"
+                         r"provides no|offers no|gives no|has no (?:guidance|disclosure))\b")
+
+
+def find_absence_claims(verdict: str, evidence: str) -> list:
+    """PURE. Sentences that assert a figure is NOT disclosed while the packet
+    records an EXTRACTION FAILURE, a 'KPI value not found' or a 'could not
+    find' line — unknown argued as absent. Returns [{"sentence","reason"}]."""
+    ev = evidence or ""
+    if not re.search(r"EXTRACTION FAILURE|KPI value not found|could not find:", ev):
+        return []
+    out = []
+    for sentence in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9$(])", verdict or ""):
+        if _ABSENCE_RE.search(sentence) and "not retrieved" not in sentence.lower() and "UNKNOWN, NOT ABSENT" not in sentence:
+            out.append({"sentence": sentence.strip(),
+                        "reason": "the packet records an extraction failure or a not-found line, so the figure may exist but was not retrieved"})
+    return out
 
 
 _RANGE_RE = re.compile(r"^\s*[+-]?([\d.,]+)\s*(?:-|–|to)\s*([\d.,]+)\s*(%|x)?\s*$",
@@ -185,14 +230,20 @@ def has_disclaimer(text: str) -> bool:
 # A consensus estimate FOR FY2027 is both "forward" and "annual" — not a
 # conflict — while a quarterly rate presented as a fiscal-year rate is.
 PERIOD_MARKERS = [
-    ("quarter", r"\b(mrq|most recent quarter|quarter(?:ly)?|q[1-4](?:\s?fy)?\s?\d{0,4}|three months|three fiscal quarters|fiscal quarter)\b"),
+    ("quarter", r"\b(mrq|most recent quarter|quarter(?:ly)?|q[1-4](?:\s?fy)?\s?\d{0,4}|three months|fiscal quarter|1[2-4][- ]weeks?|thirteen weeks|twelve weeks)\b"),
+    # partial years are their own classes: a six-month or nine-month figure is never annual
+    ("ytd_h1",  r"\b(six months|six-month|2[67][- ]weeks?|twenty-six weeks|first half|h1|half[- ]year|year[- ]to[- ]date|ytd(?: \(h1\))?|first six months)\b"),
+    ("ytd_9m",  r"\b(nine months|nine-month|39[- ]weeks?|thirty-nine weeks|first nine months|three fiscal quarters|9m|ytd \(9m\))\b"),
     ("ttm",     r"\b(ttm|trailing(?:[- ]twelve[- ]months)?|last twelve months)\b"),
-    ("annual",  r"\b(fy\s?\d{2,4}|fiscal (?:year|20\d\d)|annual(?:ly|ized)?|full[- ]year|year ended|for the year|current[- ]fy|next[- ]fy)\b"),
+    ("annual",  r"\b(fy\s?\d{2,4}|fiscal (?:year|20\d\d)|annual(?:ly|ized)?|full[- ]year|year ended|for the year|current[- ]fy|next[- ]fy|52[- ]weeks?|53[- ]weeks?)\b"),
     ("forward", r"\b(forward|consensus|estimate[sd]?|expected|guidance|guide|outlook|next (?:12 months|year)|fy\s?\d{4}e)\b"),
 ]
+PERIOD_LABELS = {"quarter": "quarter", "ytd_h1": "YTD (H1)", "ytd_9m": "YTD (9M)", "ttm": "TTM", "annual": "annual", "forward": "forward"}
 # pairs that CANNOT describe the same number; everything else is compatible
 _CONFLICTS = {frozenset(p) for p in (("quarter", "ttm"), ("quarter", "annual"), ("quarter", "forward"),
-                                     ("ttm", "annual"), ("ttm", "forward"))}
+                                     ("ttm", "annual"), ("ttm", "forward"),
+                                     ("ytd_h1", "quarter"), ("ytd_h1", "ttm"), ("ytd_h1", "annual"), ("ytd_h1", "ytd_9m"),
+                                     ("ytd_9m", "quarter"), ("ytd_9m", "ttm"), ("ytd_9m", "annual"))}
 PERIOD_CLASSES = PERIOD_MARKERS   # name kept for callers of the first version
 
 
@@ -240,6 +291,12 @@ def nearest_period(clause: str, start: int, end: int) -> str:
     tail = clause[end:]
     if after and re.match(r"\s+(?:on|of|for|at|in|over)\s+", tail) and after[0] <= 40:
         return after[1]
+    # "in the first six months of fiscal 2026": the partial-year marker names
+    # the period; "fiscal 2026" only names the year it belongs to
+    found = [name for name, _, _ in period_markers(clause)]
+    for ytd in ("ytd_h1", "ytd_9m"):
+        if ytd in found and (before or after) and {before[1] if before else None, after[1] if after else None} <= {"annual", ytd, None}:
+            return ytd
     if before:
         return before[1]
     return after[1] if after else ""
@@ -321,8 +378,8 @@ def find_mislabeled(verdict: str, evidence: str) -> list:
         # period: the claim must be compatible with at least ONE label it could come from
         if claim_period and any(label_periods(l) for l in labels[key]) \
                 and not any(compatible(claim_period, label_periods(l)) for l in labels[key]):
-            packet_period = "/".join(sorted(label_periods(labels[key][0])))
-            reason = f"{claim} is {packet_period} in the evidence ({labels[key][0]}), not {claim_period}"
+            packet_period = "/".join(PERIOD_LABELS.get(p, p) for p in sorted(label_periods(labels[key][0])))
+            reason = f"{claim} is {packet_period} in the evidence ({labels[key][0]}), not {PERIOD_LABELS.get(claim_period, claim_period)}"
         else:
             bases = {classify_basis(l) for l in labels[key]} - {""}
             if claim_basis and bases and claim_basis not in bases:

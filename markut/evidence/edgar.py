@@ -576,3 +576,222 @@ def extract_highlights(press_text: str, char_limit: int = 1500) -> str:
     return text.strip()
 
 
+
+
+# ---------------- tables with their context (caption, units, group heading, period columns) ----------------
+# WHY a second table reader next to table_rows: html_to_text(keep_tables=True)
+# flattens rows into text for the narrative scanners; core extraction needs
+# each figure WITH the context a reader has — the table's caption and units,
+# the group heading a block of rows sits under ("North Italia operating
+# information:"), the row label, and the period heading of every column
+# ("13 Weeks Ended June 30, 2026"). Nothing here knows a company or a heading
+# only one filer uses.
+_UNITS_RE = re.compile(r"(?i)\b(?:in|\$ in|us\$ in|dollars in|amounts in)\s+(?:us\s*\$\s*|\$\s*|u\.s\. dollars? )?(thousands|millions|billions)\b")
+_PAGE_FIELD_RE = re.compile(r"^\s*Field:\s*/", re.IGNORECASE)
+_FOOTNOTE_MARK_RE = re.compile(r"\s*\(\d{1,2}\)\s*$|\s*\(\d{1,2}\)(?=\s*:)|\*+$")
+_PERIOD_WORDS_RE = re.compile(r"(?i)\b(?:weeks?|months?|quarter|year|fiscal|ended|ending|as of|q[1-4]\b|fy\s?\d|\d{4})")
+_DATE_RE = re.compile(r"(?i)\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b|\b\d{4}-\d{2}-\d{2}\b")
+
+
+def table_caption(table) -> tuple:
+    """(caption, units) from the text that precedes a table: up to three
+    non-empty strings back (skipping page fields), the last heading-like one
+    as caption, units from any of them or from the table's own first cells."""
+    prevs, node = [], table
+    for _ in range(20):
+        node = node.find_previous(string=re.compile(r"\S"))
+        if node is None:
+            break
+        if node.find_parent("table") is not None and node.find_parent("table") is not table:
+            break   # the previous table's cells are not this table's caption
+        s = _ZERO_WIDTH.sub("", str(node)).replace("\xa0", " ").strip()
+        s = re.sub(r"\s+", " ", s)
+        if not s or _PAGE_FIELD_RE.match(s):
+            continue
+        prevs.append(s)
+        if len(prevs) == 6:
+            break
+    head_text = " ".join(prevs) + " " + _ZERO_WIDTH.sub("", table.get_text(" ", strip=True))[:300]
+    units = ""
+    m = _UNITS_RE.search(head_text)
+    if m:
+        units = (m.group(1) or m.group(2) or "").lower()
+    caption = ""
+    for s in prevs:                      # nearest first
+        if _UNITS_RE.search(s) and len(s.split()) <= 9:
+            continue                     # a units-only line ("(In US $ millions, except percentages)") is not the caption
+        cleaned = _FOOTNOTE_MARK_RE.sub("", s).strip()
+        if not cleaned or re.fullmatch(r"[\(\)\d\s,*•·\-–—]+", cleaned) or len(cleaned) < 8 or not re.search(r"[A-Za-z]{3,}\s+[A-Za-z]{2,}", cleaned):
+            continue                     # a footnote marker, a bullet, or a stray word is not a caption
+        if len(s) <= 120 and not s.endswith("."):
+            caption = cleaned
+            break
+    return caption, units
+
+
+def _cells_positional(tr) -> list:
+    # [[col_start, col_end, text], ...] with colspans honoured, so header rows
+    # and value rows of one table line up by column even when iXBRL pads them
+    # with spacer cells; "$" / "(" fragments merge into the next cell and
+    # ")" / "%" into the previous one
+    col, out = 0, []
+    for td in tr.find_all(["td", "th"]):
+        try:
+            span = max(1, int(td.get("colspan", 1) or 1))
+        except (TypeError, ValueError):
+            span = 1
+        text = re.sub(r"\s+", " ", _ZERO_WIDTH.sub("", td.get_text(" ", strip=True)).replace("\xa0", " ")).strip()
+        if text:
+            out.append([col, col + span, text])
+        col += span
+    merged = []
+    for c0, c1, t in out:
+        if merged and t in (")", "%", ")%", "%)"):
+            merged[-1][1] = c1; merged[-1][2] += t
+        elif merged and merged[-1][2] in ("$", "(", "($", "$("):
+            merged[-1][1] = c1; merged[-1][2] += t
+        else:
+            merged.append([c0, c1, t])
+    return [m for m in merged if m[2] not in ("$", "(", ")", "—", "-", "–")]
+
+
+def _overlap(a, b) -> int:
+    return max(0, min(a[1], b[1]) - max(a[0], b[0]))
+
+
+def _stack_headers(headers: list, cells: list) -> list:
+    # a new header row under the current stack: every new cell inherits the
+    # text of the stacked cell above it (by column overlap); stacked cells no
+    # new cell covers are carried forward unchanged
+    out = []
+    for c0, c1, t in cells:
+        above = [h for h in headers if _overlap(h, (c0, c1))]
+        if above:
+            top = max(above, key=lambda h: _overlap(h, (c0, c1)))
+            text = t if top[2].lower() in t.lower() else (top[2] + " " + t).strip()
+        else:
+            text = t
+        out.append([c0, c1, text])
+    for h in headers:
+        if not any(_overlap(h, (c0, c1)) for c0, c1, _ in cells):
+            out.append(list(h))
+    return sorted(out, key=lambda x: x[0])
+
+
+def _heading_for(headers: list, span) -> str:
+    best = max(headers, key=lambda h: _overlap(h, span), default=None)
+    return best[2] if best is not None and _overlap(best, span) else ""
+
+
+def parse_tables(html: str) -> list:
+    """Every top-level table -> rows with context:
+    {"table": i, "caption", "units", "group", "label",
+     "cells": [{"heading", "period", "entity", "value"}], "periods": [column headings],
+     "duration": table-level duration heading, "has_period_headings": bool}.
+    Header rows (no figure cells) stack into column headings by column
+    position; a single-cell duration row ("For the 13 Weeks Ended June 30,
+    2026") is the table-level duration; any other single-cell text row is the
+    group heading for the rows that follow; each value maps to the heading
+    over its own columns, so a row label is never emitted without its
+    heading, group and period."""
+    soup = BeautifulSoup(html, "html.parser")
+    out = []
+    for ti, table in enumerate(soup.find_all("table")):
+        if table.find_parent("table") is not None:
+            continue
+        caption, units = table_caption(table)
+        headers, group, duration = [], "", ""
+        for tr in table.find_all("tr"):
+            cells = _cells_positional(tr)
+            if not cells:
+                continue
+            numeric = [is_figure_cell(c[2]) for c in cells]
+            if len(cells) == 1 and not numeric[0]:
+                text = cells[0][2]
+                label_col = min([h[0] for h in headers] + [cells[0][0]]) if headers else 0
+                if _DURATION_RE.search(text.lower()) and not text.rstrip().endswith(":") and len(text) < 80:
+                    duration = text
+                elif cells[0][0] > label_col or (headers and any(_overlap(h, cells[0]) for h in headers)):
+                    # a fragment of a stacked column heading (a brand name split over
+                    # three rows above one column): it sits over a value column
+                    headers = _stack_headers(headers, cells)
+                else:
+                    group = _FOOTNOTE_MARK_RE.sub("", text).rstrip(":").strip()
+                continue
+            if not any(numeric):
+                if all(len(c[2]) < 80 for c in cells):
+                    label_cell = cells[0] if cells[0][2].rstrip().endswith(":") else None
+                    if label_cell is not None:
+                        group = _FOOTNOTE_MARK_RE.sub("", label_cell[2]).rstrip(":").strip()
+                        cells = cells[1:]
+                    headers = _stack_headers(headers, cells) if cells else headers
+                continue
+            label = "" if numeric[0] else cells[0][2]
+            values = cells[1:] if label else cells
+            label = _FOOTNOTE_MARK_RE.sub("", label).strip() or (f"Total ({group}, unlabeled row)" if group else "(unlabeled row)")
+            row_cells = []
+            for c0, c1, v in values:
+                heading = _heading_for(headers, (c0, c1))
+                full = (duration + " " + heading).strip() if duration and heading and not _DURATION_RE.search(heading.lower()) else (heading or duration)
+                pf = period_from_heading(full) if full else {"period": "", "ended": ""}
+                entity = _strip_period_words(heading) if heading else ""
+                row_cells.append({"heading": full, "period": pf["period"] if full else "", "entity": entity, "value": v})
+            periods = [h[2] for h in headers]
+            has_periods = bool(duration) or any(_PERIOD_WORDS_RE.search(h) or _DATE_RE.search(h) for h in periods)
+            out.append({"table": ti, "caption": caption, "units": units, "group": group, "label": label,
+                        "cells": row_cells, "periods": periods, "duration": duration, "has_period_headings": has_periods})
+    return out
+
+
+def _strip_period_words(heading: str) -> str:
+    # the part of a column heading that names a thing (a brand, a segment,
+    # "Amount", "Percent of Revenues") once its duration and date are removed
+    t = _DATE_RE.sub("", heading or "")
+    t = re.sub(r"(?i)\b(?:for the\s+)?(?:\d{1,2}|three|six|nine|twelve|thirteen|twenty-six|thirty-nine)\s*[- ]?(?:weeks?|months?)\s+(?:ended|ending)\b", "", t)
+    t = re.sub(r"(?i)\b(?:year|years|quarter)\s+(?:ended|ending)\b|\bas of\b|\bended\b|\bending\b", "", t)
+    return re.sub(r"\s+", " ", t).strip(" ,")
+
+
+_DURATION_RE = re.compile(
+    r"(?i)(?P<n>\d{1,2}|three|six|nine|twelve|thirteen|twenty-six|thirty-nine|fifty-two|fifty-three)\s*[- ]?(?P<unit>weeks?|months?)|"
+    r"(?P<q>quarter(?:ly)?|q[1-4])|(?P<h>first half|six[- ]month|half[- ]year|h1)|(?P<nm>nine[- ]month|9m)|"
+    r"(?P<y>year ended|fiscal year|full year|twelve months|annual|fy\s?\d{2,4}|year ending|years? ended)")
+_WORD_NUM = {"three": 3, "six": 6, "nine": 9, "twelve": 12, "thirteen": 13, "twenty-six": 26, "thirty-nine": 39,
+             "fifty-two": 52, "fifty-three": 53}
+
+
+def period_from_heading(heading: str, fallback: str = "") -> dict:
+    """PURE. A column heading -> {"period": class, "label": heading, "ended": date}.
+    Classes: quarter, YTD (H1), YTD (9M), annual, ttm, forward. A date-only
+    heading takes the duration from `fallback` (the table caption or the
+    release headline); otherwise it is 'period ended <date>' — never
+    'unstated' when the table has period headings."""
+    h = (heading or "").strip()
+    low = h.lower()
+    ended = _DATE_RE.search(h)
+    period = ""
+    if re.search(r"(?i)\b(ttm|trailing|last twelve months)\b", low):
+        period = "ttm"
+    for m in _DURATION_RE.finditer(low):
+        if m.group("n"):
+            n = _WORD_NUM.get(m.group("n"), None)
+            n = int(m.group("n")) if n is None and m.group("n").isdigit() else n
+            unit = m.group("unit")
+            if unit.startswith("week"):
+                period = "quarter" if n and n <= 14 else "YTD (H1)" if n and n <= 27 else "YTD (9M)" if n and n <= 40 else "annual"
+            else:
+                period = "quarter" if n and n <= 3 else "YTD (H1)" if n and n <= 6 else "YTD (9M)" if n and n <= 9 else "annual"
+            break
+        if m.group("q"):
+            period = "quarter"; break
+        if m.group("h"):
+            period = "YTD (H1)"; break
+        if m.group("nm"):
+            period = "YTD (9M)"; break
+        if m.group("y"):
+            period = "annual"; break
+    if not period and fallback:
+        period = period_from_heading(fallback)["period"] if not fallback.startswith(("quarter", "YTD", "annual", "ttm")) else fallback
+    if not period and ended:
+        period = f"period ended {ended.group(0)}"
+    return {"period": period or "unstated", "label": h, "ended": ended.group(0) if ended else ""}

@@ -32,6 +32,7 @@ takes for the CLI — one code path, three entry points.
 import asyncio
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -50,6 +51,33 @@ from markut.web import replay
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 CONTENT_DIR = os.path.join(os.path.dirname(__file__), "content")
+
+
+def _asset_version() -> str:
+    # a short hash of the shared page script and stylesheet: the HTML pages
+    # reference them as /static/debate.js?v=<hash>, so a deploy can never
+    # leave a browser running the previous page script from its cache
+    import hashlib
+    h = hashlib.sha1()
+    for name in ("debate.js", "debate.css", "terminal.css"):
+        try:
+            with open(os.path.join(STATIC_DIR, name), "rb") as f:
+                h.update(f.read())
+        except OSError:
+            pass
+    return h.hexdigest()[:10]
+
+
+ASSET_VERSION = _asset_version()
+_HTML_HEADERS = {"Cache-Control": "no-cache"}
+
+
+def _page(name: str):
+    # serve a page with versioned asset URLs and a no-cache header
+    with open(os.path.join(STATIC_DIR, name), encoding="utf-8") as f:
+        html = f.read()
+    html = re.sub(r'(/static/(?:debate\.js|debate\.css|terminal\.css))(?:\?v=[^"]*)?"', rf'\1?v={ASSET_VERSION}"', html)
+    return Response(html, media_type="text/html; charset=utf-8", headers=_HTML_HEADERS)
 MAX_ROUNDS_CAP = 4  # a web form must not be able to request a 40-round debate
 
 # EXECUTION GUARDRAIL for the web layer: one live debate at a time. Each one
@@ -125,7 +153,15 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="Markut", docs_url=None, redoc_url=None, lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+class _RevalidatingStatic(StaticFiles):
+    # the browser may cache the script, but must revalidate it on every page load
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
+app.mount("/static", _RevalidatingStatic(directory=STATIC_DIR), name="static")
 
 # ---- operator-side gate (HTTP Basic; the browser prompts once and remembers) ----
 _basic = HTTPBasic(auto_error=False)
@@ -168,17 +204,17 @@ SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 # ---------------------------------------------------------------- pages
 @app.get("/")
 def public():
-    return FileResponse(os.path.join(STATIC_DIR, "public.html"))
+    return _page("public.html")
 
 
 @app.get("/console", dependencies=OPERATOR)
 def console():
-    return FileResponse(os.path.join(STATIC_DIR, "console.html"))
+    return _page("console.html")
 
 
 @app.get("/console/library", dependencies=OPERATOR)
 def library():
-    return FileResponse(os.path.join(STATIC_DIR, "library.html"))
+    return _page("library.html")
 
 
 # ---------------------------------------------------------------- public api

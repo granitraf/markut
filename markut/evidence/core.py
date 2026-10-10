@@ -1,0 +1,478 @@
+"""Core extraction: the figures every debate needs, read from the latest
+earnings exhibits and the latest 10-Q by TABLE STRUCTURE, before any question
+is asked — income statement summary, the company's KPI table, segment /
+revenue-line tables, cash flow summary — each figure as its own line with
+its current and year-ago values, period, basis, units, segment and source.
+Then every profiled KPI gets a value or an explicit "not found", derived
+metrics are computed in code with their formula, and sanity checks compare
+segment sums and stated growth rates with the values they come from.
+Nothing here names a company, a brand or a heading one filer uses."""
+import re
+
+from markut.evidence.edgar import (fetch_filing_html, html_to_text, is_figure_cell, parse_tables,
+    period_from_heading)
+
+# generic row-label patterns for the income statement and cash flow summaries
+INCOME_ROWS = [
+    ("Revenue", r"^(?:total\s+)?(?:net\s+)?(?:operating\s+)?(?:revenues?|sales|net sales|total net revenue|net revenue)(?: and other income)?(?:\s*\(.*\))?$"),
+    ("Gross profit", r"^gross (?:profit|margin)(?:\s*\(.*\))?$"),
+    ("Operating income", r"^(?:income|loss|income/\(loss\)|earnings)\s+from operations|^operating (?:income|profit|loss)(?:\s*\(.*\))?$|^income \(loss\) from operations"),
+    ("Net income", r"^net (?:income|earnings|loss|income \(loss\)|loss \(income\))(?!.*(?:noncontrolling|non-controlling|including))(?:\s+attributable to[^,]*)?$"),
+    ("Diluted EPS", r"^diluted (?:net )?(?:income|earnings|loss)?\s*(?:\(loss\)\s*)?per (?:common )?share|^(?:net )?(?:income|earnings) per (?:diluted|common) share.*diluted|^diluted eps"),
+    ("Adjusted net income", r"^adjusted net (?:income|earnings)|^non-gaap net income"),
+    ("Adjusted diluted EPS", r"^adjusted (?:diluted )?(?:net income|earnings|eps)? ?per (?:diluted )?share|^non-gaap (?:diluted )?(?:eps|earnings per share|net income per share)"),
+    ("Adjusted EBITDA", r"^adjusted ebitda$|^ebitda$"),
+]
+CASH_ROWS = [
+    ("Operating cash flow", r"net cash (?:provided by|from|used in) operating activities|^cash (?:flows? )?from operations|^operating cash flow"),
+    ("Capital expenditures", r"capital expenditures|purchases? of property|additions to property|payments? for property"),
+    ("Free cash flow", r"^free cash flow$"),
+]
+KPI_TABLE_RE = re.compile(r"(?i)key (?:performance|operating|financial|business)|operating (?:information|metrics|data|statistics)|"
+                          r"selected (?:operating|financial|business)|performance information|business performance|financial highlights|"
+                          r"supplemental (?:information|data|metrics)|\bmetrics\b|\bkpis?\b")
+SEGMENT_ROW_RE = re.compile(r"(?i)revenue|sales|income|profit|margin|comparable|same[- ]store|operating weeks|units|volume|members|subscribers|customers")
+SEGMENT_TABLE_RE = re.compile(r"(?i)segment|revenues? by|disaggregat|revenue (?:line|mix|type)|by (?:product|geograph|brand|concept|category)")
+NON_GAAP_RE = re.compile(r"(?i)non-?gaap|adjusted|excluding|ex\.?\s|constant currency")
+PERCENT_COL_RE = re.compile(r"(?i)percent(?:age)? of (?:total )?(?:revenues?|sales|net sales)|% of (?:revenues?|sales)|as a percentage of")
+BOILERPLATE_LABEL_RE = re.compile(r"(?i)^\(?\d+\)?$|^note|^see |weighted[- ]average|shares outstanding")
+MAX_LINES = {"income": 12, "kpi": 12, "segment": 10, "cash": 8, "derived": 10}
+_LEGEND = {}   # per extraction: (form, name, caption, date) -> "T1"
+
+_NUM_RE = re.compile(r"^\(?[-+]?\$?\s?(\d[\d,]*(?:\.\d+)?)\s?\)?\s?(%|x)?\)?$")
+
+
+def num_of(value: str):
+    """PURE. '(2,057)' -> -2057.0; '$1,029,633' -> 1029633.0; '21.8%' -> 21.8; '—' -> None."""
+    v = (value or "").strip()
+    if not v or v in ("—", "-", "–", "n/a", "N/A", "nm", "NM"):
+        return None
+    neg = v.startswith("(") or v.startswith("-") or v.startswith("−")
+    m = _NUM_RE.match(v.replace("−", "-"))
+    if not m:
+        return None
+    try:
+        x = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    return -x if neg else x
+
+
+def _words(text: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) > 2 and w not in
+            ("the", "and", "for", "per", "net", "total", "our", "company", "restaurants", "restaurant")}
+
+
+def aliases(name: str) -> list:
+    name = (name or "").strip()
+    out = [name]
+    m = re.match(r"^(.*?)\s*\(([^)]{2,14})\)\s*$", name)
+    if m:
+        out += [m.group(1).strip(), m.group(2).strip()]
+    return [a for a in out if len(a) > 1]
+
+
+def label_matches(label: str, name: str) -> float:
+    """PURE. 0..1 how well a table row label matches a KPI / metric name:
+    exact alias or abbreviation 1.0, else word-set Jaccard."""
+    low = (label or "").lower().strip()
+    for a in aliases(name):
+        al = a.lower()
+        if low == al or (len(al) <= 6 and re.search(r"\b" + re.escape(al) + r"\b", low)):
+            return 1.0
+        if len(al) > 6 and al in low:
+            return 0.9
+    wl, wn = _words(label), _words(name)
+    if not wl or not wn:
+        return 0.0
+    return len(wl & wn) / len(wl | wn)
+
+
+_UNIT_WORD = {"thousands": "thousand", "millions": "million", "billions": "billion"}
+
+
+def _fmt_value(value: str, units: str, label: str) -> str:
+    v = (value or "").strip()
+    if not v or not units or "%" in v or re.search(r"(?i)per share|per unit|ratio|rate|margin|weeks|count|number of|days|restaurants|stores|locations|"
+                                                      r"\((?:kbd|koebd|kboed|mboe|bcf|mcf|bbl|tons?|tonnes|units|x)\)|per day|barrels|\bboe\b|employees|headcount", label):
+        return v
+    if "$" in v or re.match(r"^\(?[\d,]+(?:\.\d+)?\)?$", v):
+        return f"{v} {_UNIT_WORD.get(units, units)}"
+    return v
+
+
+def _entity_key(cell: dict) -> str:
+    # the column's thing, ignoring amount/percent markers and period words
+    e = (cell.get("entity") or "").lower()
+    e = re.sub(r"(?i)amount|percent(?:age)? of (?:total )?(?:revenues?|sales)|% of (?:revenues?|sales)|as a percentage of", "", e)
+    return re.sub(r"\s+", " ", e).strip()
+
+
+def _pair_cells(cells: list, prefer_percent: bool = False, entity: str = None):
+    """(current, year_ago) cells: the shortest period class present, the same
+    column entity (a brand or segment column never pairs with its neighbour),
+    amount columns unless percent-of-revenue columns are asked for, ordered by
+    date. entity=None means the consolidated / Total column when the table has
+    entity columns, else whatever column there is."""
+    classes = [c for c in cells if c.get("period") and c["period"] not in ("", "unstated")]
+    if not classes:
+        return (cells[0] if cells else None), None
+    order = {"quarter": 0, "YTD (H1)": 1, "YTD (9M)": 2, "annual": 3, "ttm": 4}
+    def rank(c):
+        p = c["period"]
+        return order.get(p, 5 if p.startswith("period ended") else 6)
+    best = min(rank(c) for c in classes)
+    same = [c for c in classes if rank(c) == best]
+    pct = [c for c in same if PERCENT_COL_RE.search(c.get("entity", ""))]
+    amount = [c for c in same if c not in pct]
+    use = (pct or amount) if prefer_percent else (amount or same)
+    keys = {_entity_key(c) for c in use}
+    if entity is not None:
+        use = [c for c in use if _entity_key(c) == entity.lower()] or use
+    elif len(keys) > 1:
+        tot = [c for c in use if re.search(r"(?i)^total|consolidated|^company", _entity_key(c))]
+        use = tot or [c for c in use if _entity_key(c) == sorted(keys, key=len)[0]]
+    def key(c):
+        d = period_from_heading(c.get("heading", "")).get("ended") or ""
+        m = re.search(r"(\d{4})", d)
+        return -int(m.group(1)) if m else 0
+    use = sorted(use, key=key)
+    cur = use[0] if use else None
+    prev = next((c for c in use[1:] if _entity_key(c) == _entity_key(cur)), None) if cur else None
+    return cur, prev
+
+
+def _change(cur, prev):
+    a, b = num_of(cur), num_of(prev)
+    if a is None or b is None or b == 0:
+        return ""
+    if "%" in (cur or "") and "%" in (prev or ""):
+        return f"{a - b:+.1f} pts (DERIVED: {a:g}% − {b:g}%)"
+    return f"{(a / b - 1) * 100:+.1f}% (DERIVED: {cur.strip()} / {prev.strip()} − 1)"
+
+
+def _source(src: dict, rec: dict) -> str:
+    # one short tag per table; the legend under the block header spells it out
+    key = (src["form"], src["name"], rec.get("caption", ""), src["filing_date"])
+    if key not in _LEGEND:
+        _LEGEND[key] = f"T{len(_LEGEND) + 1}"
+    return f"[source: {_LEGEND[key]}]"
+
+
+def legend_lines() -> list:
+    return [f"  {tag} = EDGAR/{form} {name}" + (f' "{cap}"' if cap else "") + f", filed {date}"
+            for (form, name, cap, date), tag in _LEGEND.items()]
+
+
+def _period_text(cell: dict, src: dict) -> str:
+    p = cell.get("period") or "unstated"
+    if p.startswith("period ended") and src.get("headline_period"):
+        p = f"{src['headline_period']} ({p}; duration from the release headline)"
+    head = re.sub(r"(?i)\b(?:amount|percent(?:age)? of (?:total )?(?:revenues?|sales))\b", "", cell.get("heading", "")).strip(" ,;")
+    head = re.sub(r"\s+", " ", head)
+    return f"{p}, {head}" if head and head.lower() not in p.lower() else p
+
+
+def figure_line(label: str, rec: dict, cur: dict, prev, src: dict, segment: str, basis: str, kind: str = "") -> str:
+    units = rec.get("units", "")
+    cur_v = _fmt_value(cur["value"], units, label)
+    if prev is not None:
+        prev_v = _fmt_value(prev["value"], units, label)
+        change = _change(cur["value"], prev["value"])
+        prev_p = _period_text(prev, src)
+        if prev.get("period") == cur.get("period"):
+            d = period_from_heading(prev.get("heading", "")).get("ended")
+            prev_p = d or prev_p
+        body = f"{cur_v} ({_period_text(cur, src)}) vs {prev_v} year-ago ({prev_p})" + (f"; change {change}" if change else "")
+    else:
+        body = f"{cur_v} ({_period_text(cur, src)}); no year-ago column in this table"
+    if "%" in (cur.get("value") or ""):
+        units = "percent"
+    grp = f" [{rec['group']}]" if rec.get("group") and rec["group"].lower() not in label.lower() else ""
+    kind_t = f"{kind}: " if kind and label_matches(label, kind.replace("KPI ", "")) < 0.9 else ("" if not kind.startswith("KPI ") else f"{kind}: ")
+    return (f"- {kind_t}{label}{grp}: {body}  ({units or 'as printed'}; {basis}; {segment})  {_source(src, rec)}")
+
+
+def _basis(rec: dict, label: str) -> str:
+    text = " ".join([rec.get("caption", ""), rec.get("group", ""), label])
+    return "non-GAAP" if NON_GAAP_RE.search(text) else "GAAP"
+
+
+def _segment_of(text: str, segments: list) -> str:
+    low = (text or "").lower()
+    for s in segments:
+        for a in aliases(s):
+            if len(a) <= 6 and re.search(r"\b" + re.escape(a.lower()) + r"\b", low) or (len(a) > 6 and a.lower() in low):
+                return s
+    return ""
+
+
+def headline_period(text: str) -> str:
+    """PURE. The reporting period a release announces in its first lines:
+    'results for the quarter ended June 30, 2026' -> quarter; 'second quarter'
+    -> quarter; 'fiscal year' -> annual; 'six months' -> YTD (H1)."""
+    head = (text or "")[:700].lower()
+    if re.search(r"\b(?:six[- ]month|first half|26 weeks|26-week)\b", head):
+        return "YTD (H1)"
+    if re.search(r"\b(?:nine[- ]month|39 weeks|39-week)\b", head):
+        return "YTD (9M)"
+    if re.search(r"\b(?:first|second|third|fourth|q[1-4])\b.{0,20}\bquarter|\bquarter(?:ly)? (?:ended|results|of)|\b13 weeks\b|\bthree months\b", head):
+        return "quarter"
+    if re.search(r"\b(?:full[- ]year|fiscal year|year ended|annual) (?:results|ended)?", head):
+        return "annual"
+    return ""
+
+
+def core_sources(fs: dict) -> list:
+    """[{form, name, filing_date, url, html, text, headline_period}] for the
+    earnings 8-K's text exhibits and the latest 10-Q."""
+    from markut.evidence.sections import exhibits_of
+    out = []
+    if fs.get("8-K"):
+        for exh in exhibits_of(fs["8-K"]):
+            if exh["image_only"]:
+                continue
+            raw = fetch_filing_html(exh["url"])
+            out.append({"form": "8-K", "name": exh["name"], "filing_date": exh["filing_date"], "url": exh["url"],
+                        "html": raw, "text": exh["text"], "headline_period": headline_period(exh["text"])})
+    if fs.get("10-Q"):
+        raw = fetch_filing_html(fs["10-Q"]["url"])
+        out.append({"form": "10-Q", "name": fs["10-Q"].get("primary_doc", "10-Q"), "filing_date": fs["10-Q"]["filing_date"],
+                    "url": fs["10-Q"]["url"], "html": raw, "text": "", "headline_period": "quarter"})
+    return out
+
+
+def classify_tables(records: list) -> dict:
+    """{table index: {"income","cash","kpi","segment","percent"}} by caption and row labels."""
+    by_table = {}
+    for r in records:
+        by_table.setdefault(r["table"], []).append(r)
+    kinds = {}
+    for t, rows in by_table.items():
+        labels = [r["label"] for r in rows]
+        caption = rows[0].get("caption", "")
+        k = set()
+        income_hits = sum(1 for lab in labels if any(re.search(p, lab.strip().lower()) for _, p in INCOME_ROWS))
+        cash_hits = sum(1 for lab in labels if any(re.search(p, lab.strip().lower()) for _, p in CASH_ROWS))
+        if income_hits >= 2:
+            k.add("income")
+        if cash_hits >= 2 or (cash_hits >= 1 and re.search(r"(?i)cash flow", caption)):
+            k.add("cash")
+        if KPI_TABLE_RE.search(caption) or KPI_TABLE_RE.search(" ".join(r.get("group", "") for r in rows)):
+            k.add("kpi")
+        if SEGMENT_TABLE_RE.search(caption) or any(SEGMENT_TABLE_RE.search(r.get("group", "")) for r in rows):
+            k.add("segment")
+        if any(PERCENT_COL_RE.search(c.get("entity", "")) for r in rows for c in r["cells"]):
+            k.add("percent")
+        kinds[t] = k
+    return kinds
+
+
+def extract_core(fs: dict, profile: dict, plan: dict = None) -> dict:
+    """-> {"text": the [CORE FIGURES] section, "kpi_values": {name: bool},
+    "lines": [...], "checks": [...]}."""
+    profile = profile or {}
+    _LEGEND.clear()
+    segments = [s.get("name", "") for s in profile.get("segments", []) if isinstance(s, dict) and s.get("name")]
+    kpi_names = [k.get("name", "") for k in profile.get("company_kpis", []) if isinstance(k, dict) and k.get("name")]
+    for q in (plan or {}).get("key_questions", []):
+        for k in q.get("kpis") or []:
+            if isinstance(k, str) and k.strip() and all(label_matches(k, n) < 0.6 for n in kpi_names):
+                kpi_names.append(k.strip())
+    blocks = {"income": [], "kpi": [], "segment": [], "cash": [], "derived": []}
+    seen = set()
+    all_records = []          # (src, rec)
+    for src in core_sources(fs):
+        try:
+            records = parse_tables(src["html"])
+        except Exception as e:
+            blocks["income"].append(f"- [table parsing failed for {src['form']} {src['name']}: {e}]")
+            continue
+        kinds = classify_tables(records)
+        for rec in records:
+            all_records.append((src, rec))
+            if BOILERPLATE_LABEL_RE.search(rec["label"]):
+                continue
+            k = kinds.get(rec["table"], set())
+            label = rec["label"]
+            low = label.strip().lower()
+            cur, prev = _pair_cells(rec["cells"])
+            if cur is None or num_of(cur["value"]) is None:
+                continue
+            # entity tables (a column per segment / brand): one line per matching entity for revenue-type rows
+            entity_cells = [c for c in rec["cells"] if c.get("entity") and _segment_of(c["entity"], segments)]
+            if entity_cells and SEGMENT_ROW_RE.search(label) and not re.search(r"(?i)cost|expense", label):
+                for c in entity_cells:
+                    ent = _segment_of(c["entity"], segments)
+                    cur_e, prev_e = _pair_cells(rec["cells"], entity=_entity_key(c))
+                    key = ("seg", label, ent, c["period"])
+                    if key in seen or len(blocks["segment"]) >= MAX_LINES["segment"] or cur_e is None:
+                        continue
+                    seen.add(key)
+                    blocks["segment"].append(figure_line(label, rec, cur_e, prev_e, src, ent, _basis(rec, label), ""))
+            if entity_cells and not re.search(r"(?i)^total|consolidated|^company", _entity_key(cur)):
+                continue      # a brand/segment column value is not a consolidated figure
+            seg_label = _segment_of(" ".join([rec.get("group", ""), label]), segments)
+            seg = seg_label or "company-wide"
+            basis = _basis(rec, label)
+            placed = False
+            if seg_label and (SEGMENT_ROW_RE.search(label) or re.search(r"(?i)revenue|sales|income|profit", rec.get("group", ""))) and not re.search(r"(?i)cost|expense", label):
+                key = ("seg", label, seg, cur["period"])
+                if key not in seen and len(blocks["segment"]) < MAX_LINES["segment"]:
+                    seen.add(key)
+                    blocks["segment"].append(figure_line(label, rec, cur, prev, src, seg, basis, ""))
+                continue
+            for name, pat in INCOME_ROWS:
+                if re.search(pat, low) and ("income" in k or "kpi" in k) and len(blocks["income"]) < MAX_LINES["income"]:
+                    key = ("inc", name, seg, cur["period"], basis)
+                    if key not in seen:
+                        seen.add(key)
+                        blocks["income"].append(figure_line(label, rec, cur, prev, src, seg, basis, name if name.lower() != low else ""))
+                    placed = True
+                    break
+            if not placed:
+                for name, pat in CASH_ROWS:
+                    if re.search(pat, low) and len(blocks["cash"]) < MAX_LINES["cash"]:
+                        key = ("cash", name, cur["period"])
+                        if key not in seen:
+                            seen.add(key)
+                            blocks["cash"].append(figure_line(label, rec, cur, prev, src, seg, basis, name if name.lower() != low else ""))
+                        placed = True
+                        break
+            if not placed and "kpi" in k and len(blocks["kpi"]) < MAX_LINES["kpi"]:
+                key = ("kpi", low, rec.get("group", ""), cur["period"])
+                if key not in seen:
+                    seen.add(key)
+                    blocks["kpi"].append(figure_line(label, rec, cur, prev, src, seg, "company-defined", ""))
+
+    # KPI values for every profiled (and planner-linked) KPI
+    kpi_lines, kpi_values = [], {}
+    for name in kpi_names:
+        best, best_score = None, 0.0
+        for src, rec in all_records:
+            if BOILERPLATE_LABEL_RE.search(rec["label"]):
+                continue
+            score = label_matches(rec["label"], re.sub(r"(?i)\s*(?:%|percent(?:age)?)\s*of\s*(?:total\s+)?(?:revenues?|sales)\s*$", "", name))
+            if score > best_score:
+                wants_pct = bool(re.search(r"(?i)%|percent|margin|ratio|rate|penetration|mix", name))
+                cur, prev = _pair_cells(rec["cells"], prefer_percent=wants_pct)
+                if wants_pct and cur is not None and "%" not in (cur.get("value") or "") and not PERCENT_COL_RE.search(cur.get("entity", "")):
+                    score -= 0.3                     # a percent metric matched an amount row: weaker
+                if cur is not None and num_of(cur["value"]) is not None and score > best_score:
+                    best, best_score = (src, rec, cur, prev), score
+        if best and best_score >= 0.5:
+            src, rec, cur, prev = best
+            seg = _segment_of(" ".join([rec.get("group", ""), rec["label"], cur.get("entity", "")]), segments) or "company-wide"
+            kpi_lines.append(figure_line(rec["label"], rec, cur, prev, src, seg, "company-defined", f"KPI {name}"))
+            kpi_values[name] = True
+        else:
+            kpi_lines.append(f"- KPI value not found: {name} (no table row in the latest 8-K exhibits or 10-Q matched this metric)")
+            kpi_values[name] = False
+    derived, seen_d = [], set()
+    for ln in derived_lines(all_records, segments):
+        # one line per (metric, value, period): the same margin computed from
+        # two tables of the same release is one fact
+        m = re.match(r"^- (DERIVED [A-Za-z ]+?|SANITY CHECK [a-z ]+?)(?: OK| MISMATCH[^:]*)?: ([-\d.,]+%?)", ln)
+        per = re.search(r"\((quarter|YTD \(H1\)|YTD \(9M\)|annual|ttm)[;)]", ln)
+        key = (m.group(1), m.group(2), per.group(1) if per else "") if m else re.sub(r"\s*\[source:.*$", "", ln)[:120]
+        if key not in seen_d:
+            seen_d.add(key); derived.append(ln)
+    blocks["derived"] = derived
+    lines = ["[CORE FIGURES] (extracted by code from the tables of the latest earnings exhibits and 10-Q before any question was asked; "
+             "each line: figure (period) vs year-ago; change — then (units; basis; segment) and its source table; "
+             "'KPI value not found' means the metric was not in a table, not that it does not exist)"]
+    for title, key in (("Income statement summary", "income"), ("KPI / operating metrics table", "kpi"),
+                       ("Segment and revenue lines", "segment"), ("Cash flow summary", "cash")):
+        lines.append(f"-- {title} --")
+        lines.extend(blocks[key] or [f"- none found by table structure in the latest 8-K exhibits or 10-Q"])
+    lines.append("-- KPI values for the profiled metrics --")
+    lines.extend(kpi_lines or ["- the profile listed no KPIs"])
+    lines.append("-- Derived metrics and sanity checks (computed in code) --")
+    lines.extend(blocks["derived"] or ["- no derivable pairs found"])
+    if _LEGEND:
+        lines.append("-- Source tables --")
+        lines.extend(legend_lines())
+    return {"text": "\n".join(lines), "kpi_values": kpi_values, "lines": lines,
+            "checks": [l for l in blocks["derived"] if "SANITY" in l]}
+
+
+def derived_lines(all_records: list, segments: list) -> list:
+    """Margins from revenue + profit rows in the same table and period, the
+    residual margin after listed cost ratios, segment-sum and stated-growth
+    sanity checks. Every line shows its formula and inputs."""
+    out = []
+    by_table = {}
+    for src, rec in all_records:
+        by_table.setdefault((id(src), rec["table"]), []).append((src, rec))
+    for (_, _t), rows in by_table.items():
+        src = rows[0][0]
+        recs = [r for _, r in rows]
+        def find(pat):
+            for r in recs:
+                if re.search(pat, r["label"].strip().lower()):
+                    return r
+            return None
+        rev = find(INCOME_ROWS[0][1])
+        if rev:
+            rc, _ = _pair_cells(rev["cells"])
+            rv = num_of(rc["value"]) if rc else None
+            if rv:
+                for name, pat in (("Gross margin", INCOME_ROWS[1][1]), ("Operating margin", INCOME_ROWS[2][1]), ("Net margin", INCOME_ROWS[3][1])):
+                    r = find(pat)
+                    if not r:
+                        continue
+                    c, _ = _pair_cells(r["cells"])
+                    v = num_of(c["value"]) if c and c["period"] == rc["period"] else None
+                    if v is not None and len(out) < MAX_LINES["derived"]:
+                        out.append(f"- DERIVED {name}: {v / rv * 100:.1f}% = {r['label']} {c['value']} / {rev['label']} {rc['value']} ({rc['period']})  {_source(src, rev)}")
+        # residual margin after cost ratios printed as % of revenue
+        pct_rows = []
+        for r in recs:
+            if not re.search(r"(?i)cost|expense|labor|labour|occupancy|food|beverage", r["label"]) or re.search(r"(?i)total|income|tax|interest|depreciation|amortization|impairment|preopening|general and administrative|g&a", r["label"]):
+                continue
+            pc = [c for c in r["cells"] if PERCENT_COL_RE.search(c.get("entity", "")) and "%" in (c.get("value") or "")]
+            if pc:
+                pct_rows.append((r["label"], pc[0]))
+        if len(pct_rows) >= 2 and len(out) < MAX_LINES["derived"]:
+            vals = [(lab, num_of(c["value"])) for lab, c in pct_rows]
+            vals = [(lab, v) for lab, v in vals if v is not None]
+            if vals:
+                total = sum(v for _, v in vals)
+                out.append(f"- DERIVED residual margin after the listed cost ratios: {100 - total:.1f}% = 100% − "
+                           + " − ".join(f"{lab} {v:g}%" for lab, v in vals) + f" ({pct_rows[0][1]['period']}; the cost lines a filer prints as % of revenue; "
+                           f"not a reported margin)  {_source(src, recs[0])}")
+        # segment sum: entity columns of a revenue row vs its Total column
+        for r in recs:
+            if not re.search(INCOME_ROWS[0][1], r["label"].strip().lower()):
+                continue
+            ents = [c for c in r["cells"] if c.get("entity") and _segment_of(c["entity"], segments)]
+            tot = next((c for c in r["cells"] if re.search(r"(?i)^total|consolidated", c.get("entity", ""))), None)
+            if len(ents) >= 2 and tot and len(out) < MAX_LINES["derived"]:
+                parts = [(c["entity"], num_of(c["value"])) for c in ents]
+                tv = num_of(tot["value"])
+                if tv and all(v is not None for _, v in parts):
+                    s = sum(v for _, v in parts)
+                    gap = (s / tv - 1) * 100
+                    other = [c for c in r["cells"] if c.get("entity") and c not in ents and c is not tot]
+                    verdict = "OK" if abs(gap) <= 1.0 or other else f"MISMATCH ({gap:+.1f}%)"
+                    out.append(f"- SANITY CHECK segment sum {verdict}: " + " + ".join(f"{e} {v:,.0f}" for e, v in parts)
+                               + (f" + other columns {', '.join(c['entity'] for c in other)}" if other else "")
+                               + f" vs {tot['entity']} {tv:,.0f} ({r['label']}, {tot['period']})  {_source(src, r)}")
+        # stated growth vs computed from the two values of a matching value row
+        for r in recs:
+            if not re.search(r"(?i)growth|change|vs\.? prior|year[- ]over[- ]year|yoy", r["label"]):
+                continue
+            gcell, _ = _pair_cells(r["cells"])
+            if not gcell or "%" not in (gcell.get("value") or ""):
+                continue
+            base_label = re.sub(r"(?i)\b(?:yoy|growth|rate|change|vs\.? prior year|year[- ]over[- ]year)\b", "", r["label"]).strip(" :-")
+            base = next((b for b in recs if b is not r and label_matches(b["label"], base_label) >= 0.6 and "%" not in (b["cells"][0]["value"] if b["cells"] else "%")), None)
+            if base and len(out) < MAX_LINES["derived"]:
+                bc, bp = _pair_cells(base["cells"])
+                a, b = (num_of(bc["value"]) if bc else None), (num_of(bp["value"]) if bp else None)
+                g = num_of(gcell["value"])
+                if a is not None and b and g is not None:
+                    implied = (a / b - 1) * 100
+                    verdict = "OK" if abs(implied - g) <= 0.6 else f"MISMATCH (stated {g:g}%, implied {implied:.1f}%)"
+                    out.append(f"- SANITY CHECK stated growth {verdict}: {r['label']} {gcell['value']} vs {base['label']} {bc['value']} / {bp['value']} − 1 = {implied:.1f}%  {_source(src, r)}")
+    return out

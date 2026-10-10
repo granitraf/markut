@@ -306,7 +306,10 @@ _FORWARD_VERB_RE = re.compile(r"(?i)\b(?:expect\w*|anticipat\w*|outlook|guidance
 # not a date, an address or a footnote marker
 FIGURE_RE = re.compile(
     r"\$\s?\d|\d(?:\.\d+)?\s?%|\b\d[\d,.]*\s*(?:billion|million|thousand|percent|basis points|bps|cents)\b|\b\d+(?:\.\d+)?x\b|"
-    r"\b\d+\s+(?:\w+\s+){0,2}(?:restaurants|locations|stores|units|openings|new units|rigs|aircraft|vessels|branches|wells|markets)\b",
+    r"\b\d+\s+(?:\w+\s+){0,2}(?:restaurants|locations|stores|units|openings|new units|rigs|aircraft|vessels|branches|wells|markets)\b|"
+    r"\b(?:low|mid|high)[- ](?:to[- ](?:low|mid|high)[- ])?(?:single[- ]digits?|teens|twenties|thirties|forties|fifties|sixties|seventies|eighties|nineties)\b|"
+    r"\b(?:roughly |approximately |about )?flat\b|"
+    r"\b(?:similar to|in line with|consistent with|comparable to|unchanged from)\s+(?:the\s+)?(?:first|second|third|fourth|prior|previous)\s+quarter\b",
     re.IGNORECASE)
 _EXCLUDE_RE = re.compile(
     r"(?i)forward-looking statements?|safe harbor|private securities litigation|unrecognized compensation|"
@@ -328,11 +331,17 @@ def forward_language_present(text: str) -> bool:
     return bool(FORWARD_RE.search(text or ""))
 
 
+_BULLET_SPLIT = re.compile(r"\s+[•●▪]\s+|(?<=[.!?;])\s+(?=[A-Z0-9\"'(“])")
+
+
 def _split_statements(text: str) -> list:
     # sentences, bullets and table rows as separate statements; a numeric row
-    # carries the last header row seen so its columns keep their names
+    # carries the last header row seen so its columns keep their names; a
+    # lead-in that ends with ":" ("For the third quarter of 2026, we expect:")
+    # is carried into each bullet that follows it, so a bullet keeps the
+    # forward verb and the period of its lead-in
     text = normalize_dollars(re.sub(r"[ \t]+", " ", text or ""))
-    pieces, header = [], ""
+    pieces, header, lead, lead_uses = [], "", "", 0
     for para in re.split(r"\n+", text):
         para = para.strip()
         if not para:
@@ -345,10 +354,67 @@ def _split_statements(text: str) -> list:
             continue
         para = re.split(r"_{5,}", para)[0]                      # a footnote rule ends the statement
         para = re.sub(r"\s*\(\d\)\s+The Company is not readily able.*$", "", para)
-        for part in re.split(r"\s+[•●▪]\s+|(?<=[.!?])\s+(?=[A-Z0-9\"'(“])", para):
-            if part.strip():
-                pieces.append(part.strip(" •●▪"))
+        bulleted = bool(re.match(r"^[•●▪\-–]\s", para)) or " • " in para
+        if lead and not bulleted and not re.match(r"^[a-z]", para):
+            lead, lead_uses = "", 0                                  # a new ordinary paragraph ends the lead-in
+        parts = [p.strip(" •●▪-–") for p in _BULLET_SPLIT.split(para) if p.strip(" •●▪-–")]
+        if parts and parts[0].endswith(":") and len(parts[0]) < 220:
+            lead = parts[0].rstrip(":").strip()
+            lead_uses = 0
+            parts = parts[1:]
+        for part in parts:
+            if lead and lead_uses < 12:
+                pieces.append(f"{lead}: {part}")
+                lead_uses += 1
+            else:
+                pieces.append(part)
     return pieces
+
+
+# ---- worded guidance ranges -> an interpreted numeric band ----
+_TENS = {"single digit": (1, 9), "single-digit": (1, 9), "single digits": (1, 9), "teens": (10, 19), "twenties": (20, 29),
+         "thirties": (30, 39), "forties": (40, 49), "fifties": (50, 59), "sixties": (60, 69), "seventies": (70, 79),
+         "eighties": (80, 89), "nineties": (90, 99)}
+# offsets within a ten-span: low 0-3, mid 4-6, high 7-9 (twenties: 20-23 / 24-26 / 27-29)
+_THIRDS = {"low": (0, 3), "mid": (4, 6), "high": (7, 9)}
+_WORDED_RE = re.compile(r"(?i)\b(?:(low|mid|high)(?:[- ]to[- ](low|mid|high))?[- ])?(single[- ]digits?|teens|twenties|thirties|forties|fifties|sixties|seventies|eighties|nineties)\b(?:\s*(?:percent(?:age)?(?:\s+rate)?|%))?")
+_RANGE_RE = re.compile(r"(?i)\b(?:between\s+)?(\d+(?:\.\d+)?)\s?%?\s*(?:to|and|-|–)\s*(\d+(?:\.\d+)?)\s?%")
+_APPROX_RE = re.compile(r"(?i)\b(?:approximately|about|around|roughly|~)\s*(\$?\d[\d,]*(?:\.\d+)?\s?(?:%|percent|billion|million|thousand|[bBmMkK])?)")
+
+
+def interpret_band(text: str) -> list:
+    """PURE. Worded or ranged guidance -> [(original phrase, interpreted band)].
+    'low-thirties percentage rate' -> 30–33%; 'mid-to-high twenties' -> 24–29%;
+    '33% to 34%' -> 33–34%; 'approximately $4.0 billion' -> ≈$4.0 billion;
+    'flat' -> 0%."""
+    out = []
+    for m in _WORDED_RE.finditer(text or ""):
+        q1, q2, tens = (m.group(1) or "").lower(), (m.group(2) or "").lower(), m.group(3).lower().replace("-", " ")
+        lo, hi = _TENS.get(tens, _TENS.get(tens.rstrip("s"), (None, None)))
+        if lo is None:
+            continue
+        base = 0 if lo == 1 else lo                      # single digits count from 0
+        if q1:
+            a = max(lo, base + _THIRDS[q1][0])
+            b = min(hi, base + _THIRDS[q2 or q1][1])
+        else:
+            a, b = lo, hi
+        out.append((m.group(0).strip(), f"{a}–{b}%"))
+    # "similar to / in line with / consistent with the second quarter": the
+    # prior period's value is the guide
+    for m in re.finditer(r"(?i)\b(?:similar to|in line with|consistent with|comparable to|unchanged from)\s+(?:the\s+)?((?:first|second|third|fourth|prior|previous)\s+quarter(?:\s+of\s+\d{4})?|(?:fiscal|full)\s+(?:year\s+)?\d{4}|last year|the prior year)", text or ""):
+        out.append((m.group(0).strip(), f"≈ the {m.group(1)} value (see the core figures)"))
+    for m in _RANGE_RE.finditer(text or ""):
+        out.append((m.group(0).strip(), f"{m.group(1)}–{m.group(2)}%"))
+    for m in _APPROX_RE.finditer(text or ""):
+        out.append((m.group(0).strip(), f"≈{m.group(1).strip()}"))
+    if re.search(r"(?i)\b(?:roughly |approximately |about )?flat\b", text or ""):
+        out.append(("flat", "≈0%"))
+    seen, uniq = set(), []
+    for phrase, band in out:
+        if phrase.lower() not in seen:
+            seen.add(phrase.lower()); uniq.append((phrase, band))
+    return uniq
 
 
 def _key(s: str) -> str:
@@ -407,7 +473,9 @@ def guidance_lines(sources: list, max_lines: int = 40) -> dict:
                     continue
                 if _PAST_TENSE_RE.search(stmt) and not _FORWARD_VERB_RE.search(stmt):
                     continue
-                add(stmt, "text", src)
+                bands = interpret_band(stmt)
+                worded = [(p, b) for p, b in bands if not re.match(r"^(?:approximately|about|around|roughly|~)", p, re.I)]
+                add(stmt + (f"  (interpreted: {'; '.join(f'{p} → {b}' for p, b in worded)})" if worded else ""), "text", src)
                 found_here += 1
         if not found_here and forward_language_present(text):
             failures.append(f"{src['label']}: forward-looking language is present but no guided figure could be extracted")

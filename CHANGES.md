@@ -149,3 +149,150 @@ once per filing when a slide deck has to be transcribed) and the planner
   profile and market summary it was shown (rounding tolerated); the profile's
   figures against the filing sections. Unverifiable figures are replaced by a
   visible marker and counted as a profile gap.
+
+
+# Changes — reliable numbers and labels (2026-10-09)
+
+Runs #19 and #20 showed the profiler and planner generalizing (right business
+type, KPIs and questions) while the data underneath failed: KPI values and
+worded guidance present in filings were not extracted, table rows lost their
+section and period labels, six-month figures were tagged annual, the coverage
+gate counted filler, extraction failures were argued as "doesn't exist", and
+a planner note stated a wrong fact about how a data field is computed.
+
+## What changed
+
+1. **Table parser with context** (`edgar.parse_tables`, `period_from_heading`).
+   Every row carries the table caption, its units ("in thousands"), the group
+   heading it sits under (a single-cell row in the label column, or a label
+   cell shared with the header row), and one period heading per value column
+   built from stacked header rows by column position with colspans. Date-only
+   headings take their duration from the table or the release headline and
+   otherwise read "period ended <date>"; never "unstated" under headings.
+2. **Core extraction first** (`evidence/core.py`, new `[CORE FIGURES]` block
+   after `[KEY QUESTIONS]`). Before any question: income summary (revenue,
+   gross profit, operating income, net income, EPS, adjusted variants), the
+   company's KPI table, segment / revenue-line rows (one per segment column or
+   per segment-named row), cash flow summary. Each figure is one line with
+   current and year-ago values (paired within the same column entity and
+   period class), the change computed in code, period, basis, units, segment
+   and source. Every profiled and planner-linked KPI gets a value line or
+   "KPI value not found". Derived metrics (gross/operating/net margin from the
+   same table and period; the residual margin after cost ratios printed as %
+   of revenue) and sanity checks (segment columns vs the Total column; stated
+   growth vs the two values) show their formula and inputs. Core lines are
+   tagged `[Qn]` where their label or segment matches a question's KPIs,
+   segments or key terms. The old "revenue and segment figures" block is
+   gone; prose revenue statements from the release stay in general evidence.
+3. **Guidance in words and ranges** (`sections.interpret_band`). A lead-in
+   ending with ":" travels into each of its bullets, so "we expect: • Revenue
+   to grow at a low-thirties percentage rate" keeps its verb. Worded ranges
+   become interpreted bands beside the original wording: low-thirties →
+   30–33%, mid-to-high twenties → 24–29%, high-single-digit → 7–9%, "33% to
+   34%" → 33–34%, flat → ≈0%, "similar to the second quarter" → the prior
+   period's value. EXTRACTION FAILURE only when nothing parses.
+4. **Period classes** YTD (H1) and YTD (9M) in the tracer and every tag; a
+   partial-year marker outranks the fiscal year it sits in ("first six months
+   of fiscal 2026" is H1, not annual); "three fiscal quarters" is 9M; the
+   classes conflict with quarter, TTM and annual in the label check.
+5. **Unknown is not absent.** Bull, bear and judge prompts say an EXTRACTION
+   FAILURE / not-found line means "not retrieved", judge checklist item 6; the
+   governor finds sentences asserting non-disclosure while the packet records
+   a failure, hands them to the revision and stamps survivors
+   `[UNKNOWN, NOT ABSENT — …]`.
+6. **Coverage gate counts real answers.** A question is covered only when a
+   candidate line (question-tagged excerpt or tagged core figure, boilerplate
+   and risk captions excluded) holds a figure or a direct factual statement
+   AND every KPI the planner linked to it has a value or an explicit
+   not-found; one cheap model call (`COVERAGE_SCHEMA`, ~800 output tokens)
+   rates relevance across all five questions; the routing stays in
+   `graph.coverage_decision`.
+7. **Leverage from the balance sheet** (`market.leverage_lines`): debt/equity
+   including and excluding lease obligations from the latest quarterly
+   balance sheet, each component in dollars, the one matching the provider's
+   figure labeled. The provider line now says it is a data-provider field.
+   Planner "what would mislead" items that describe how a field is computed
+   are rewritten by code to "Check whether …" unless they cite a packet line;
+   the planner prompt says so.
+8. **Derived KPIs in code** — see 2. Models never do this arithmetic.
+9. **Profile trimming** cuts KPI definitions, then the business text; never
+   accounting flags, segment figures or KPI names.
+10. **Governor normalization**: a value whose label carries % ("Debt/Equity
+    (mrq, %): 401.00") also anchors "401%"/"401.00%"; a value on a line that
+    states its units ("$729,476 thousand", "(units: millions)") also anchors
+    its scaled form ("$729.476M", "$3.583B").
+11. **Third-party models**: a DCF more than 50% from price is labeled
+    "unverified third-party model, assumptions not disclosed; excluded from
+    the verdict"; judge checklist item 7 gives it no weight.
+12. **Housekeeping**: pages reference `/static/debate.js?v=<hash>` and are
+    served with `Cache-Control: no-cache`, static files revalidate on every
+    load (a browser can no longer keep the previous page script, which is
+    the only duplicate-render path left: the stored runs hold one event per
+    turn); the PDF renders the judge's per-question rulings and planner
+    coverage and the claim-review verdict labels.
+
+Fixtures: `tests/fixtures/cake_release_tables.html`,
+`tests/fixtures/shop_release_tables.html` (real release tables: stacked
+period headers, brand group headings, units captions, KPI table).
+Tests: `tests/test_reliable_numbers.py`.
+
+## Measured (2026-10-10; baseline = AVGO run #10, 98.7K input tokens)
+
+| run | ticker | state | input tokens | × baseline | coverage (relevant/candidates) | governor flags |
+|---|---|---|---|---|---|---|
+| #21 | SHOP | profile + plan cached | 160.4K | 1.63× | 4/5 covered (Q2 held back: a linked KPI had no value) | 0 |
+| #22 | CAKE | profile + plan cached | 238.3K | 2.41× | 4/5 | 0 |
+| #23 | AVGO | profile + plan cached | 184.8K | 1.87× | 4/5 | 0 |
+| #24 | XOM | held out, cold | 172.2K | 1.74× | 4/5 | 0 |
+
+Done-when checks: SHOP's core block carries GMV 115,567 vs 87,837, MRR 221 vs
+185, gross profit 1,708 vs 1,302, operating income 488 vs 291 (all quarter,
+US$ millions, with the change computed in code) and all five Q3 guided items
+as interpreted bands (low-thirties → 30–33%, mid-to-high twenties → 24–29%,
+33% to 34%, $150 million, high-teens to low-twenties → 17–19% / 20–23%).
+CAKE's brand rows are labeled by brand, its six-month lines are tagged
+YTD (H1) with zero tagged annual, debt/equity is shown including (401.0%,
+matching the provider) and excluding (108.5%) lease obligations, and the
+residual margin after cost ratios is a DERIVED line. AVGO's packet carries
+the AI semiconductor revenue line, the Q4 guide, the ~$29B maximum liability
+and the up-to-$42B convertible notes. Zero governor false positives and unique
+turn ids on all four.
+
+CAKE #22 ran at 2.41× because the first core block was verbose (69 lines,
+20.8K characters, a repeated source caption on every line) and question
+words over-tagged core lines (Q3 had 41 candidates). Both fixed after the
+run: a source-table legend with short tags, compact attribute triples,
+tighter caps, and tagging by KPI / segment aliases only (two question words
+needed otherwise). The CAKE rerun after the fix (#25) came in at 208.0K input (2.11×) with 5/5 questions covered and zero governor flags.
+
+### Held-out XOM (not tuned)
+
+- Archetype `energy_commodity`; segments Upstream and Energy Products (the
+  Chemical and Specialty Products segments were not read because the 10-K
+  Item 1 and the segment note were not located; see below); seven KPIs the
+  company itself reports (earnings excluding identified items, structural
+  cost savings, cash capex, advantaged volume growth, production, cash flow
+  excluding margin postings, debt-to-capital).
+- Core extraction found guidance (capex $27–29B for 2026, $20B of
+  repurchases in 2026, structural cost savings reaching $20B by 2030) and the
+  segment table of the 10-Q, but only one of seven KPI values. General
+  patterns: (1) the release's KPI tables have bullet or missing captions and
+  labels that differ from the KPI names the company uses in prose ("Earnings
+  excluding Identified Items" in text vs a table row "Earnings excl.
+  Identified Items"); (2) the income summary first picked the
+  "attributable to noncontrolling interests" row because its label matched
+  the net-income pattern before the company's own row — fixed generally
+  (rows mentioning noncontrolling interests are skipped, "total revenues and
+  other income" counts as revenue); (3) a volume row printed "(kbd)" got the
+  table's dollar units appended — fixed generally (a parenthetical unit in
+  the label wins); (4) a bullet character and a stray word were taken as
+  table captions — fixed generally (a caption needs two real words).
+- Profiler sections: the 10-K Item 1 and the segment note were not located by
+  the line-anchored heading patterns; the profile was built from the 10-Q MD&A
+  and the release. Pattern: filers whose item headings are not on their own
+  line or whose segment note is titled differently. Proposed fix: fall back to
+  the first paragraph that starts with "Item 1" followed by business language,
+  and accept "segment" anywhere in a note heading; not applied here.
+- Labels fit the company (quarter, YTD (H1), "Guarantees (10-K note)"); no
+  restaurant- or semiconductor-shaped label appeared. The planner's mislead
+  items were already phrased as checks.

@@ -263,6 +263,26 @@ def fallback_plan(profile: dict) -> dict:
     return {"key_questions": qs, "what_would_mislead": [], "peer_tickers": [], "fallback": True}
 
 
+_MECHANICS_RE = _re.compile(r"(?i)\b(?:ignores?|includes?|excludes?|is (?:computed|calculated|based on|derived from)|counts?|measures?|"
+                            r"uses?|does not (?:include|count|capture)|omits?|captures?)\b")
+
+
+def enforce_mislead_rules(items: list) -> list:
+    """PURE. A what-would-mislead item may not state how a data field is
+    computed or what it includes; unless it cites a packet line it is
+    rephrased as a check ('check whether ...')."""
+    out = []
+    for item in items or []:
+        t = str(item).strip()
+        if not t:
+            continue
+        cites = bool(_re.search(r"(?i)\[source|per the (?:packet|market)|the packet (?:line|shows|says)|market summary line", t))
+        if _MECHANICS_RE.search(t) and not cites and not t.lower().startswith("check whether"):
+            t = "Check whether " + t[0].lower() + t[1:]
+        out.append(t)
+    return out
+
+
 def normalize_plan(plan: dict) -> dict:
     """PURE. Exactly five questions ids Q1..Q5 (renumbered in order, padded
     with an explicit placeholder if the model returned fewer), 1-3 pitfalls,
@@ -274,7 +294,7 @@ def normalize_plan(plan: dict) -> dict:
     for i, q in enumerate(qs, 1):
         q["id"] = f"Q{i}"
         q.setdefault("kpis", []); q.setdefault("segments", []); q.setdefault("search_queries", []); q.setdefault("why", "")
-    mislead = [str(x) for x in (plan or {}).get("what_would_mislead", []) if str(x).strip()][:3]
+    mislead = enforce_mislead_rules([str(x) for x in (plan or {}).get("what_would_mislead", []) if str(x).strip()][:3])
     peers = [str(x).upper().strip() for x in (plan or {}).get("peer_tickers", []) if str(x).strip()][:6]
     return {"key_questions": qs, "what_would_mislead": mislead, "peer_tickers": peers}
 
@@ -294,6 +314,8 @@ def planner_node(state: DebateState) -> dict:
     cached = store.cache_get(key)
     if cached and cached.get("key_questions"):
         print(f"PLANNER: cache hit ({fp}) — the model call skipped")
+        cached = dict(cached)
+        cached["what_would_mislead"] = enforce_mislead_rules(cached.get("what_would_mislead") or [])
         return {"plan": cached, "market_evidence": market, "plan_cached": True}
     user = (f"Ticker: {ticker}\n\nPROFILE (JSON):\n{json.dumps(state.get('profile') or {}, ensure_ascii=False)}\n\n"
             f"MARKET DATA (summary):\n{market_summary(market)}\n\n"

@@ -156,3 +156,26 @@ REVIEW_SCHEMA = {
     "required": ["verdict", "resolutions"],
     "additionalProperties": False,
 }
+
+
+COVERAGE_SCHEMA = {
+    # one cheap call: which candidate lines actually answer each question
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "answering_lines": {"type": "array", "items": {"type": "integer"}},
+                    "note": {"type": "string"},
+                },
+                "required": ["id", "answering_lines", "note"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["questions"],
+    "additionalProperties": False,
+}

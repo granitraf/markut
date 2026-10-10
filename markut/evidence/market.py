@@ -105,7 +105,8 @@ def format_market_lines(info: dict) -> list:
     # WHY no fmt_pct here: yfinance reports debtToEquity ALREADY scaled as a
     # percent-style number (e.g. 12.95 means 12.95%). Multiplying by 100 again
     # would print a wildly wrong figure the agents would happily argue about.
-    add("Debt/Equity (mrq, %)", fmt_ratio(info.get("debtToEquity")))
+    add("Debt/Equity (mrq, %, data-provider field; the computed lines below show what it includes)", fmt_ratio(info.get("debtToEquity")))
+    lines.extend(info.get("_leverage_lines") or [])
     fcf = info.get("_fcf_quarters") or {}
     if fcf.get("fcf") is not None:
         add(f"Free cash flow (TTM: last 4 quarters of operating cash flow {fmt_big(fcf['ocf'])} less capex {fmt_big(-fcf['capex'])}, "
@@ -151,6 +152,47 @@ def fcf_from_quarterly(cf) -> dict:
                 "quarters": [str(c)[:10] for c in cols]}
     except Exception:
         return {}
+
+
+def leverage_lines(bs, info: dict) -> list:
+    """PURE over a yfinance quarterly_balance_sheet frame (latest column):
+    debt/equity WITH and WITHOUT lease obligations, every component in
+    dollars, and which of the two matches the provider's Debt/Equity figure —
+    so nobody has to guess what that field includes."""
+    try:
+        if bs is None or len(bs.columns) == 0:
+            return []
+        col = bs.columns[0]
+        def g(row):
+            if row in bs.index:
+                v = bs.loc[row, col]
+                return float(v) if v == v else None
+            return None
+        total_debt = g("Total Debt")
+        leases = g("Capital Lease Obligations")
+        if leases is None:
+            lt, cur = g("Long Term Capital Lease Obligation"), g("Current Capital Lease Obligation")
+            leases = (lt or 0) + (cur or 0) if (lt is not None or cur is not None) else None
+        equity = g("Stockholders Equity") or g("Common Stock Equity") or g("Total Equity Gross Minority Interest")
+        if not total_debt or not equity or equity <= 0:
+            return []
+        asof = col.strftime("%Y-%m-%d") if hasattr(col, "strftime") else str(col)[:10]
+        provider = info.get("debtToEquity")
+        with_l = total_debt / equity * 100
+        ex_l = (total_debt - (leases or 0)) / equity * 100
+        def tag(v):
+            try:
+                return "  (matches the yfinance Debt/Equity figure)" if provider and abs(v - float(provider)) / float(provider) < 0.03 else ""
+            except (TypeError, ValueError, ZeroDivisionError):
+                return ""
+        lines = [f"- Debt/Equity including lease obligations (computed, balance sheet {asof}): {with_l:.1f}% = total debt {fmt_big(total_debt)} "
+                 f"(of which lease obligations {fmt_big(leases or 0)}) / stockholders' equity {fmt_big(equity)}  [source: yfinance/quarterly_balance_sheet, computed]{tag(with_l)}"]
+        if leases:
+            lines.append(f"- Debt/Equity excluding lease obligations (computed, balance sheet {asof}): {ex_l:.1f}% = debt ex-leases {fmt_big(total_debt - leases)} "
+                         f"/ stockholders' equity {fmt_big(equity)}  [source: yfinance/quarterly_balance_sheet, computed]{tag(ex_l)}")
+        return lines
+    except Exception:
+        return []
 
 
 def fy_growth_lines(annuals: list) -> list:
@@ -332,6 +374,12 @@ def market_snapshot(ticker: str) -> str:
     except Exception as e:
         info["_fcf_quarters"] = {}
         out.append(f"[quarterly cash flow unavailable: {e}]")
+    # leverage from the balance sheet, with and without leases
+    try:
+        info["_leverage_lines"] = leverage_lines(t.quarterly_balance_sheet, info)
+    except Exception as e:
+        info["_leverage_lines"] = []
+        out.append(f"[quarterly balance sheet unavailable: {e}]")
 
     # ---- 1 & 2. QUOTE & VALUATION + FUNDAMENTALS (info-derived, pure part) ----
     try:
@@ -501,9 +549,14 @@ def market_snapshot(ticker: str) -> str:
         if isinstance(dcf, list) and dcf:
             d = dcf[0]
             dcf_val = d.get("dcf")
-            add_line("DCF fair value", fmt_price(dcf_val), "FMP/dcf")
             price = info.get("currentPrice")
-            if dcf_val is not None and price is not None:
+            far = dcf_val is not None and price and abs(float(dcf_val) / float(price) - 1) > 0.5
+            if far:
+                add_line("DCF fair value (unverified third-party model, assumptions not disclosed; excluded from the verdict)",
+                         fmt_price(dcf_val), "FMP/dcf")
+            else:
+                add_line("DCF fair value", fmt_price(dcf_val), "FMP/dcf")
+            if dcf_val is not None and price is not None and not far:
                 # WHY spell out the direction: leaving "247.17 vs 197.58" as raw
                 # numbers forces each agent to do the comparison itself; stating
                 # ABOVE/BELOW with the % gap removes an arithmetic step a model

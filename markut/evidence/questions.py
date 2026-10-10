@@ -22,7 +22,15 @@ def _norm(text: str) -> str:
 
 
 def tag_period(text: str) -> str:
-    return classify_period(text) or "unstated"
+    from markut.guardrails.tracer import PERIOD_LABELS, period_markers
+    found = period_markers(text)
+    if not found:
+        return "unstated"
+    names = [n for n, _, _ in found]
+    for ytd in ("ytd_h1", "ytd_9m"):          # a partial-year marker outranks the fiscal year it sits in
+        if ytd in names and "quarter" not in names:
+            return PERIOD_LABELS[ytd]
+    return PERIOD_LABELS.get(names[0], names[0])
 
 
 def tag_basis(text: str) -> str:
@@ -153,13 +161,130 @@ def question_blocks(coll, plan: dict, profile: dict, profiled_text: str, relaxed
 
 
 def coverage_from_text(filings_text: str, qids: list) -> dict:
-    """Count sourced evidence lines per question (count-only gate, no model)."""
+    """Count sourced evidence lines per question (count-only, no model)."""
     counts = {q: 0 for q in qids}
     for line in (filings_text or "").splitlines():
-        m = QID_RE.match(line.strip())
-        if m and "[source:" in line:
+        t = line.strip()
+        m = QID_RE.match(t)
+        if m and "[source:" in t:
             counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+        elif t.startswith("- ") and "[source:" in t:
+            for tag in re.findall(r"\[(Q\d)\]", t.split("[source:")[0]):
+                counts[tag] = counts.get(tag, 0) + 1
     return counts
+
+
+def _aliases(name: str) -> list:
+    name = (name or "").strip()
+    out = [name]
+    m = re.match(r"^(.*?)\s*\(([^)]{2,14})\)\s*$", name)
+    if m:
+        out += [m.group(1).strip(), m.group(2).strip()]
+    return out
+
+
+_STOP = {"which", "where", "while", "their", "these", "those", "about", "could", "would", "should", "versus", "given",
+         "growth", "company", "business", "margin", "margins", "revenue", "sales", "quarter", "fiscal", "whether", "against"}
+
+
+def _question_terms(q: dict) -> tuple:
+    """(strong terms = KPI and segment aliases, weak terms = question words)."""
+    strong = []
+    for k in (q.get("kpis") or []) + (q.get("segments") or []):
+        if isinstance(k, str):
+            strong += [a for a in _aliases(k) if len(a) > 2]
+    weak = [w for w in re.findall(r"[a-z][a-z-]{5,}", (q.get("question") or "").lower()) if w not in _STOP]
+    return strong, weak
+
+
+def tag_core_lines(core_text: str, plan: dict) -> str:
+    """Append [Qn] tags to core figure lines whose label or segment mentions a
+    KPI, segment or key term of a planner question — the coverage gate and
+    the debaters then see which core figures answer which question."""
+    qterms = [(q.get("id"), _question_terms(q)) for q in (plan or {}).get("key_questions", []) if q.get("id")]
+    if not qterms:
+        return core_text
+    def hit(term, text):
+        tl = term.lower()
+        return bool(re.search(r"\b" + re.escape(tl) + r"\b", text)) if len(tl) <= 6 else tl in text
+    out = []
+    for line in (core_text or "").splitlines():
+        if line.startswith("- ") and "[source:" in line and "not found" not in line:
+            attrs = re.search(r"\(([^()]*; [^()]*; [^()]*)\)\s+\[source", line)
+            seg = attrs.group(1).split(";")[-1].strip().lower() if attrs else ""
+            head = line.split(":")[0].lower() + " " + seg
+            tags = []
+            for qid, (strong, weak) in qterms:
+                if any(hit(t, head) for t in strong) or sum(1 for w in set(weak) if hit(w, head)) >= 2:
+                    tags.append(qid)
+            if tags:
+                line = line.replace("  [source:", "  " + "".join(f"[{t}]" for t in tags) + "  [source:", 1)
+        out.append(line)
+    return "\n".join(out)
+
+
+BOILERPLATE_LINE_RE = re.compile(r"(?i)forward-looking statements?|safe harbor|non-gaap (?:financial )?measures?|private securities litigation|"
+                                 r"not (?:a )?(?:substitute|comparable to similarly)|reconciliation of|should not be considered in isolation|"
+                                 r"table of contents|^- \[Q\d\] Risk:")
+_DIRECT_RE = re.compile(r"(?i)\b(?:increased|decreased|grew|declined|rose|fell|opened|closed|launched|repaid|issued|repurchased|expects?|guided|was|were)\b")
+
+
+def candidate_lines(filings_text: str, qids: list) -> dict:
+    """{qid: [lines that could answer it]}: question-tagged excerpts and core
+    figures carrying the tag, minus boilerplate; a line must hold a figure or
+    a direct factual statement to count."""
+    from markut.evidence.sections import FIGURE_RE
+    cands = {q: [] for q in qids}
+    for line in (filings_text or "").splitlines():
+        t = line.strip()
+        if not t.startswith("- ") or "[source:" not in t or BOILERPLATE_LINE_RE.search(t):
+            continue
+        body = t.split("[source:")[0]
+        tags = re.findall(r"^- \[(Q\d)\]", t) or re.findall(r"\[(Q\d)\]", body)
+        if not tags:
+            continue
+        if not (FIGURE_RE.search(body) or re.search(r"\d", body) or _DIRECT_RE.search(body)):
+            continue
+        for q in set(tags):
+            if q in cands:
+                cands[q].append(t)
+    return cands
+
+
+def _kpi_match(a: str, b: str) -> bool:
+    # the same metric under its name, its abbreviation or its name without
+    # the parenthetical ("GMV" ~ "Gross merchandise volume (GMV)")
+    al = {x.lower() for x in _aliases(a)}
+    bl = {x.lower() for x in _aliases(b)}
+    if al & bl:
+        return True
+    wa = {w for w in re.findall(r"[a-z0-9]+", a.lower()) if len(w) > 2}
+    wb = {w for w in re.findall(r"[a-z0-9]+", b.lower()) if len(w) > 2}
+    return bool(wa and wb) and len(wa & wb) / len(wa | wb) >= 0.5
+
+
+def coverage_assess(filings_text: str, plan: dict, kpi_values: dict, relevance: dict = None) -> dict:
+    """{qid: {"lines", "relevant", "kpis_ok", "covered"}}. A question is covered
+    only when at least one candidate line answers it (per the model's
+    relevance call when available, else every real candidate counts) AND every
+    KPI the planner linked to it has a value or an explicit not-found entry.
+    The routing decision itself stays in code (graph.coverage_decision)."""
+    qs = (plan or {}).get("key_questions", [])
+    qids = [q.get("id") for q in qs if q.get("id")]
+    cands = candidate_lines(filings_text, qids)
+    out = {}
+    for q in qs:
+        qid = q.get("id")
+        lines = cands.get(qid, [])
+        if relevance is not None and qid in relevance:
+            idx = {i for i in relevance[qid] if isinstance(i, int)}
+            relevant = sum(1 for i in range(len(lines)) if i in idx)
+        else:
+            relevant = len(lines)
+        linked = [k for k in (q.get("kpis") or []) if isinstance(k, str) and k.strip()]
+        kpis_ok = all(any(_kpi_match(k, name) for name in (kpi_values or {})) for k in linked)
+        out[qid] = {"lines": len(lines), "relevant": relevant, "kpis_ok": kpis_ok, "covered": relevant >= 1 and kpis_ok}
+    return out
 
 
 def general_blocks(coll, fs: dict, profile: dict) -> list:
@@ -192,9 +317,11 @@ def general_blocks(coll, fs: dict, profile: dict) -> list:
             for qt in rl["quotes"]:
                 lines.append(f'- "{qt}"')
             lines.append(f"  {src}")
-        if rl["figures"]:
-            lines.append(f"-- Revenue and segment figures (8-K filed {release['filing_date']}) --")
-            for f in rl["figures"]:
+        # prose revenue statements only: table figures live in [CORE FIGURES] with their context
+        prose = [f for f in rl["figures"] if f.get("kind") == "sentence"][:6]
+        if prose:
+            lines.append(f"-- Revenue statements in the release (8-K filed {release['filing_date']}) --")
+            for f in prose:
                 period = tag_period(f["text"])
                 if period == "unstated" and f.get("default_period"):
                     period = f["default_period"]

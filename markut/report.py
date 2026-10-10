@@ -362,6 +362,16 @@ def build_report(run: dict) -> bytes:
                                     ("LEFTPADDING", (0, 0), (-1, -1), 8), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
                                     ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
             block = [Paragraph(f"Judge — round {d.get('round', round_no)} · {'converged' if d.get('converged') else 'not converged'}", st["h2"]), jt]
+            qs = [q for q in (d.get("questions") or []) if isinstance(q, dict) and q.get("id")]
+            if qs:
+                block.append(Paragraph("Rulings per question", st["pt"]))
+                for q in qs:
+                    block.append(Paragraph(f"<b>{escape(str(q.get('id')))}</b> {_inline(q.get('answer', ''))} "
+                                           f"<font name='Mono' size='7.5'>[{escape(str(q.get('stronger_side', '')))}, {escape(str(q.get('confidence', '')))} confidence]</font>"
+                                           + (f" <i>unsupported: {_inline(' · '.join(str(c) for c in q.get('unsupported_claims') or []))}</i>" if q.get("unsupported_claims") else ""),
+                                           st["bullet"], bulletText="•"))
+            if d.get("planner_coverage"):
+                block.append(Paragraph(f"<b>Planner coverage:</b> {_inline(str(d['planner_coverage']))}", st["small"]))
             claims = d.get("unsupported_claims") or []
             if claims:
                 block.append(Paragraph(f"Flagged as unsupported ({len(claims)})", st["pt"]))
@@ -377,7 +387,7 @@ def build_report(run: dict) -> bytes:
             reviews = d.get("claim_reviews") or []
             if reviews:
                 for r in reviews:
-                    story.append(Paragraph(f"<font name='Mono' size='8'>[{escape(r.get('status', '?'))}]</font> {_inline(r.get('claim', ''))}"
+                    story.append(Paragraph(f"<font name='Mono' size='8'>[{escape(r.get('verdict') or r.get('status', '?'))}]</font> {_inline(r.get('claim', ''))}"
                                            + (f" — {_inline(r.get('evidence_summary', ''))}" if r.get("evidence_summary") else ""), st["bullet"], bulletText="•"))
             else:
                 story.append(Paragraph(_inline(d.get("reasoning") or "No unsupported claims to re-audit."), st["body"]))

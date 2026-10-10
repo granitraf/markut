@@ -11,7 +11,7 @@ from markut.agents.state import DebateState
 from markut.evidence.gaps import count_gaps
 from markut.guardrails.parsing import parse_review_json
 from markut.guardrails.tracer import (DISCLAIMER_TEXT, _as_float, check_scenarios,
-    extract_numeric_claims, find_advice_language, find_mislabeled, has_disclaimer,
+    extract_numeric_claims, find_absence_claims, find_advice_language, find_mislabeled, has_disclaimer,
     normalize_number, recompute_derived, trace_claim)
 
 
@@ -24,7 +24,7 @@ def _close(a, b, pct: bool) -> bool:
 
 
 # our own inline tags; numbers INSIDE them are never claims to re-trace
-_TAG_RE = re.compile(r"\s?\[(?:UNGROUNDED|MISLABELED|MISCOMPUTED|SCENARIO CHECK)[^\]]*\]")
+_TAG_RE = re.compile(r"\s?\[(?:UNGROUNDED|MISLABELED|MISCOMPUTED|SCENARIO CHECK|UNKNOWN, NOT ABSENT)[^\]]*\]")
 
 
 def _sub_outside_tags(pattern, repl, text: str, count: int = 0) -> tuple:
@@ -39,6 +39,16 @@ def _sub_outside_tags(pattern, repl, text: str, count: int = 0) -> tuple:
         return repl(m) if callable(repl) else m.expand(repl)
     out = pattern.sub(guard, text)
     return out, done
+
+
+def stamp_absence(text: str, absences: list) -> tuple:
+    count = 0
+    for a in absences:
+        sent = a.get("sentence", "")
+        if sent and sent in text and "[UNKNOWN, NOT ABSENT" not in sent:
+            text = text.replace(sent, sent + " [UNKNOWN, NOT ABSENT — " + a["reason"] + "]", 1)
+            count += 1
+    return text, count
 
 
 def stamp_findings(text: str, mislabeled: list, scenarios: list) -> tuple:
@@ -92,6 +102,7 @@ def review_node(state: DebateState) -> dict:
     # arithmetic contradicts, are findings too (deterministic, offline).
     mislabeled = find_mislabeled(verdict, evidence)
     scenarios = check_scenarios(verdict, evidence)
+    absences = find_absence_claims(verdict, evidence)
     for f in mislabeled:
         # keep the sentence so the stamper can place the tag inside it
         f.setdefault("sentence", next((c["sentence"] for c in _claim_sentences(verdict) if c["claim"] == f["claim"]), ""))
@@ -99,10 +110,11 @@ def review_node(state: DebateState) -> dict:
     sources_unavailable = count_gaps(evidence)
     report = {"initial_flags": list(flagged), "advice_phrases": list(advice),
               "mislabeled": [dict(f) for f in mislabeled], "scenario_flags": [dict(f) for f in scenarios],
+              "absence_flags": [dict(a) for a in absences],
               "miscomputed": [], "resolutions": [], "final_status": "clean", "revision_used": False,
               "sources_unavailable": sources_unavailable}
 
-    if not flagged and not advice and not mislabeled and not scenarios and has_disclaimer(verdict):
+    if not flagged and not advice and not mislabeled and not scenarios and not absences and has_disclaimer(verdict):
         print(f"REVIEW STATS: claims={len(claims)} cited={cited_count} flagged=0 | "
               f"derived=0 labeled=0 annotated=0 | mislabeled=0 scenario=0 miscomputed=0 | "
               f"sources_unavailable={sources_unavailable} | status=clean"
@@ -111,7 +123,7 @@ def review_node(state: DebateState) -> dict:
                 "budget_exceeded": budget_exceeded}
 
     print(f"REVIEW: {len(flagged)} flagged claim(s), {len(advice)} advice phrase(s), "
-          f"{len(mislabeled)} mislabeled, {len(scenarios)} scenario contradiction(s), "
+          f"{len(mislabeled)} mislabeled, {len(scenarios)} scenario contradiction(s), {len(absences)} absence claim(s), "
           f"disclaimer {'present' if has_disclaimer(verdict) else 'absent'} — one revision call")
     report["revision_used"] = True
     # WHY the judge must PROVE derivations: trace_claim deliberately flags
@@ -145,6 +157,9 @@ def review_node(state: DebateState) -> dict:
         + "\n\nSCENARIO ARITHMETIC CHECK (recomputed from your own numbers — the stated direction does not "
           "follow; fix the direction, use a different multiple from the evidence, or drop the scenario):\n"
         + ("\n".join(f"- {f['reason']}" for f in scenarios) or "- (none)")
+        + "\n\nUNKNOWN ARGUED AS ABSENT (the packet records an extraction failure or a not-found line for this; the figure may "
+          "exist but was not retrieved — say 'not retrieved from the filings', never 'not disclosed'):\n"
+        + ("\n".join(f"- {a['sentence']}" for a in absences) or "- (none)")
         + "\n\nThe EVIDENCE PACKET (the only permissible source of numbers) is in your system context above."
         + (("\n\n" + _addendum) if _addendum else "")
     )
@@ -189,6 +204,8 @@ def review_node(state: DebateState) -> dict:
             revised = revised.replace(claim, f"{claim} [UNGROUNDED — no evidence anchor]")
             annotated_count += 1
         revised, extra = stamp_findings(revised, mislabeled, scenarios)
+        annotated_count += extra
+        revised, extra = stamp_absence(revised, absences)
         annotated_count += extra
         report["final_status"] = "annotated"
     else:
@@ -296,8 +313,10 @@ def review_node(state: DebateState) -> dict:
         for f in still_mis:
             f["sentence"] = next((c["sentence"] for c in _claim_sentences(revised) if c["claim"] == f["claim"]), "")
         still_sc = check_scenarios(revised, evidence)
+        still_abs = find_absence_claims(revised, evidence)
         report["mislabeled_after"] = [dict(f) for f in still_mis]
         report["scenario_flags_after"] = [dict(f) for f in still_sc]
+        report["absence_flags_after"] = [dict(a) for a in still_abs]
         # 2. which numbers still need an UNGROUNDED tag — decided on clean text,
         #    excluding numbers a MISCOMPUTED resolution already explains
         to_tag = [claim for claim in extract_numeric_claims(revised)
@@ -306,6 +325,8 @@ def review_node(state: DebateState) -> dict:
                               for r in miscomputed for c in _claim_numbers(r))]
         # 3. stamps, each pass blind to the tags the previous one wrote
         revised, extra = stamp_findings(revised, still_mis, still_sc)
+        annotated_count += extra
+        revised, extra = stamp_absence(revised, still_abs)
         annotated_count += extra
         for res in miscomputed:
             implied = res["recomputed"]["implied"]

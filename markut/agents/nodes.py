@@ -1,3 +1,4 @@
+import re
 """Debate agents: research/bull/bear/judge/news_verify (notebook nodes
 cell, verbatim; prompts hoisted to markut.agents.prompts, call_claude and
 TOKENS module-qualified so tests can patch markut.agents.llm)."""
@@ -64,7 +65,7 @@ def research_node(state: DebateState) -> dict:
     tool with a wider net on the uncovered questions only."""
     from markut.mcp.client import gather_evidence
     from markut.evidence.assembly import assemble_packet
-    from markut.evidence.questions import coverage_from_text
+    from markut.evidence.questions import candidate_lines, coverage_assess
     ticker = state["ticker"]
     pass_no = (state.get("research_pass") or 0) + 1
     plan, profile = state.get("plan") or {}, state.get("profile") or {}
@@ -85,15 +86,52 @@ def research_node(state: DebateState) -> dict:
     # a tool this layer does not know yet rides after the news section
     extra = "".join(v for k, v in results.items()
                     if k not in ("market_snapshot_tool", "filings_evidence_tool", "news_evidence_tool"))
-    coverage = coverage_from_text(filings, qids)
+    # coverage: a question is covered only by lines that answer it (figures or
+    # direct statements, boilerplate excluded) AND when every KPI the planner
+    # linked to it has a value or an explicit "not found"; one cheap model call
+    # rates relevance across all five questions — the routing stays in code
+    kpi_values = {}
+    for ln in filings.splitlines():
+        m = re.match(r"^- KPI (?:value not found: )?(.+?)(?:: |\s\(no table)", ln.strip())
+        if m:
+            kpi_values[m.group(1).strip()] = "not found" not in ln
+    relevance = assess_relevance(plan, candidate_lines(filings, qids)) if qids else None
+    assessment = coverage_assess(filings, plan, kpi_values, relevance)
+    coverage = {q: (a["relevant"] if a["kpis_ok"] else 0) for q, a in assessment.items()}
     packet, gaps = assemble_packet(profile, plan, filings, market, (news or "") + extra, coverage,
                                    research_pass=pass_no, profile_gaps=state.get("profile_gaps") or [],
                                    profile_sources=state.get("profile_sources") or [])
     if gaps:
         print("RESEARCH: data gaps — " + "; ".join(f"{g['source']} ({g['reason']})" for g in gaps))
-    print("RESEARCH: coverage " + " ".join(f"{q}:{n}" for q, n in coverage.items()) + f"  (packet {len(packet) // 4:,} tok)")
+    print("RESEARCH: coverage " + " ".join(f"{q}:{a['relevant']}/{a['lines']}{'' if a['kpis_ok'] else ' (KPI missing)'}" for q, a in assessment.items())
+          + f"  (packet {len(packet) // 4:,} tok est.)")
     return {"evidence": packet, "coverage": coverage, "uncovered": [q for q, n in coverage.items() if not n],
-            "research_pass": pass_no, "market_evidence": market}
+            "research_pass": pass_no, "market_evidence": market, "coverage_detail": assessment}
+
+
+def assess_relevance(plan: dict, cands: dict) -> dict:
+    """One model call over every question's candidate lines -> {qid: [indexes
+    that answer it]}. None when the call fails (the gate then counts every
+    real candidate). Lines are numbered per question; at most 10 each."""
+    import json as _json
+    from markut.agents.schemas import COVERAGE_SCHEMA
+    parts = []
+    for q in plan.get("key_questions", []):
+        qid = q.get("id")
+        lines = (cands.get(qid) or [])[:12]
+        if not lines:
+            continue
+        parts.append(f"{qid}: {q.get('question', '')}\n" + "\n".join(f"  [{i}] {re.sub(r'\s*\[source:.*$', '', ln)[:300]}" for i, ln in enumerate(lines)))
+    if not parts:
+        return None
+    try:
+        raw = llm.call_claude(prompts.COVERAGE_SYSTEM_PROMPT, "QUESTIONS AND CANDIDATE LINES:\n\n" + "\n\n".join(parts),
+                              max_tokens=800, schema=COVERAGE_SCHEMA)
+        data = _json.loads(raw)
+        return {q.get("id"): list(q.get("answering_lines") or []) for q in data.get("questions", []) if q.get("id")}
+    except Exception as e:
+        print(f"RESEARCH: relevance check skipped ({e}) — counting every real candidate line")
+        return None
 
 
 def complete_argument(system_prompt: str, user_content: str, label: str, cached_prefix: str = None) -> str:

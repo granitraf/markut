@@ -748,6 +748,16 @@ def get_filings_evidence(ticker: str, plan: dict = None, profile: dict = None, p
     except Exception as e:
         lines.append(f"[source header unavailable: {e}]")
 
+    # CORE FIGURES first: income, KPI table, segments, cash flow, KPI values,
+    # derived metrics — by table structure, independent of the questions
+    try:
+        from markut.evidence.core import extract_core
+        from markut.evidence.questions import tag_core_lines
+        core = extract_core(fs, profile or {}, plan or {})
+        lines.append("")
+        lines.append(tag_core_lines(core["text"], plan or {}))
+    except Exception as e:
+        lines += ["", "[CORE FIGURES]", f"[core extraction unavailable: {e}]"]
     if plan and plan.get("key_questions"):
         try:
             qlines = question_blocks(coll, plan, profile or {}, profiled_text or "", relaxed=relaxed_questions or [])

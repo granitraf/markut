@@ -49,14 +49,25 @@ def profile_block(profile: dict, gaps: list = None, sources: list = None) -> str
     text = "\n".join(lines)
     limit = PROFILE_TOKEN_CAP * 4
     if len(text) > limit:
-        kept = []
-        for ln in lines:
-            if sum(len(x) + 1 for x in kept) + len(ln) > limit:
-                kept.append("- [profile trimmed to its token cap]")
-                break
-            kept.append(ln)
-        text = "\n".join(kept)
+        # cut descriptions first (KPI definitions, then the business text);
+        # never drop accounting flags, segment figures or KPI names/values
+        lines = [_re_sub_kpi_def(ln) if ln.startswith("- KPI:") else ln for ln in lines]
+        text = "\n".join(lines)
+        if len(text) > limit:
+            lines = [(_one_line(ln.split(".")[0]) + ".") if ln.startswith("- Business:") else ln for ln in lines]
+            text = "\n".join(lines)
+        if len(text) > limit:
+            text = text[:limit].rsplit("\n", 1)[0] + "\n- [profile trimmed to its token cap; figures and flags kept, descriptions cut]"
     return text
+
+
+def _re_sub_kpi_def(line: str) -> str:
+    # "- KPI: name — definition; unit: u; segment: s  [source: id]" -> keep name, unit, segment, source
+    m = re.match(r"^- KPI: ([^—]+) — .*?((?:; unit: [^;\]]+)?(?:; segment: [^\]]+?)?)\s*(\[source: [^\]]+\])?\s*$", line)
+    if not m:
+        return line
+    tail = (m.group(2) or "").lstrip("; ")
+    return f"- KPI: {m.group(1).strip()}" + (f" ({tail})" if tail else "") + (f"  {m.group(3)}" if m.group(3) else "")
 
 
 def questions_block(plan: dict) -> str:

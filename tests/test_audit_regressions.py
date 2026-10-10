@@ -442,7 +442,7 @@ def test_run6_label_check_no_longer_over_fires():
     assert tracer.find_mislabeled("given TTM GAAP profit margin of 42.94% and FY2025 net income growth of +292.3%", EVIDENCE6) == []    # modifier before the number wins
     # and the real mislabel is still caught
     assert [f["claim"] for f in tracer.find_mislabeled("Revenue grew 85.5% in fiscal year 2025.", EVIDENCE6)] == ["85.5%"]
-    assert tracer.find_mislabeled("Trailing EPS of $19.39 supports the multiple.", EVIDENCE6)[0]["reason"].endswith("not ttm")
+    assert tracer.find_mislabeled("Trailing EPS of $19.39 supports the multiple.", EVIDENCE6)[0]["reason"].endswith("not TTM")
 
 
 def test_judge_truncation_gets_a_shorter_retry_then_salvage(stub_llm):
