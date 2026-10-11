@@ -229,7 +229,10 @@ window.Markut = (function () {
     const words = s ? [[s.upgrades, "upgrade"], [s.downgrades, "downgrade"], [s.initiations, "initiation"], [s.target_raises, "price-target raise"],
       [s.target_cuts, "price-target cut"]].filter(([n]) => n).map(([n, w]) => `${n} ${w}${n === 1 ? "" : "s"}`) : [];
     const kindCls = (k) => k === "downgrade" || k === "target_cut" ? "down" : k === "upgrade" || k === "target_raise" ? "up" : "flat";
-    const list = items.length
+    // a run saved before the actions were collected: unknown, never "none"
+    const list = !("actions" in c)
+      ? `<p class="acts-sum">Upgrades, downgrades and price-target changes were not recorded for this run (it predates that feature); a new run shows them.</p>`
+      : items.length
       ? `${words.length ? `<p class="acts-sum">${esc(words.join(" · "))} in the last ${s.days} days</p>` : ""}<ul class="acts">` +
         items.map((i) => `<li class="${kindCls(i.kind)}"><span class="dt">${esc(i.date)}</span> ${esc(i.text)}</li>`).join("") + `</ul>`
       : `<p class="acts-sum">${acts.latest ? `None in the last 90 days; the latest: ${esc(acts.latest.text)} (${esc(acts.latest.date)}).` : "No upgrades, downgrades or price-target changes reported by the data provider."}</p>`;

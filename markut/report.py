@@ -295,7 +295,11 @@ def analyst_section(consensus: dict, width: float, st: dict) -> list:
         out.append(Paragraph(escape(line), st["small"]))
     acts = c.get("actions") or {}
     out.append(Paragraph("Recent analyst actions", st["label"]))
-    if acts.get("items"):
+    if "actions" not in c:
+        # a run saved before the actions were collected: unknown, not "none"
+        out.append(Paragraph("Upgrades, downgrades and price-target changes were not recorded for this run (it predates "
+                             "that feature); a new run shows them.", st["foot"]))
+    elif acts.get("items"):
         if actions_summary(acts.get("summary")):
             out.append(Paragraph(escape(actions_summary(acts["summary"])), st["small"]))
         for i in acts["items"]:

@@ -90,3 +90,24 @@ def test_the_page_data_and_the_pdf_show_the_section():
                                                                              "lean": {"lean": "neutral", "confidence": "low", "reason": "x"}}}])
     t2 = " ".join(pdfium.PdfDocument(build_report(none))[i].get_textpage().get_text_range() for i in range(1))
     check("no coverage: no section", "Analyst price targets" not in t2)
+
+
+def test_a_run_saved_before_actions_were_recorded_never_says_there_were_none():
+    # run #30 (CELH) ran 50 minutes before this feature was deployed: its
+    # consensus has targets but no "actions" — the section said "No upgrades,
+    # downgrades or price-target changes reported", which was false
+    import re
+    import pypdfium2 as pdfium
+    from markut.report import build_report
+    old = {"mean": 1.75, "n": 21, "target_low": 26.0, "target_mean": 42.19, "target_high": 64.0, "price": 28.58}
+    run = {"id": 30, "ticker": "CELH", "started_at": "2026-10-11", "events": [
+        {"event": "start", "data": {"ticker": "CELH", "max_rounds": 2}},
+        {"event": "review", "data": {"verdict": "v. Research, not investment advice.", "stats": {}, "consensus": old,
+                                     "lean": {"lean": "bearish", "confidence": "medium", "reason": "r"}}}]}
+    doc = pdfium.PdfDocument(build_report(run))
+    t = re.sub(r"\s+", " ", " ".join(doc[i].get_textpage().get_text_range() for i in range(len(doc))))
+    check("the chart still shows", "Analyst price targets" in t and "$42.19" in t)
+    check(f"…and the list says it was not recorded for this run, never that there were none ({t[t.find('Recent analyst'):][:200]!r})",
+          "not recorded for this run" in t and "No upgrades, downgrades" not in t)
+    js = open("markut/web/static/debate.js").read()
+    check("the page says the same", "not recorded for this run" in js)
