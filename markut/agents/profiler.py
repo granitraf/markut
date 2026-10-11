@@ -386,6 +386,23 @@ def sections_prompt(sections: list) -> str:
     return "\n\n".join(parts) if parts else "(no filing sections could be extracted)"
 
 
+def cached_sections(cached: dict) -> list:
+    """PURE. The sections a cached profile was read from, each with its name
+    and filing date, rebuilt from the stored text and spans. A profile cached
+    before the spans were stored (2026-10-11) keeps its text under a name that
+    says the section was not recorded — never a guessed one."""
+    text = (cached or {}).get("profiled_text") or ""
+    spans = (cached or {}).get("spans") or []
+    out, at = [], 0
+    for sp in spans:
+        out.append({"name": sp.get("name", ""), "filing_date": sp.get("filing_date", ""), "text": text[at:at + sp.get("chars", 0)]})
+        at += sp.get("chars", 0) + 2          # the "\n\n" profiled_text joins them with
+    if spans and at - 2 == len(text):
+        return out
+    return [{"name": "filing sections the profiler read (section not recorded in this cached profile)", "filing_date": "",
+             "text": text}] if text.strip() else []
+
+
 def profiler_node(state: DebateState) -> dict:
     from markut.evidence import sections as secs
     ticker = state["ticker"]
@@ -413,7 +430,8 @@ def profiler_node(state: DebateState) -> dict:
             store.cache_put(key, cached)
         return {"profile": cached["profile"], "profile_gaps": cached.get("gaps", []),
                 "profiled_text": cached.get("profiled_text", ""), "filing_fingerprint": fs["fingerprint"],
-                "profile_cached": True, "profile_sources": cached.get("sources", [])}
+                "profile_cached": True, "profile_sources": cached.get("sources", []),
+                "profiled_sections": cached_sections(cached)}
     sections = secs.profile_sections(fs)
     print("PROFILER: sections — " + (", ".join(f"{s['name']} ({len(s['text']) // 4} tok)" for s in sections) or "none"))
     if not sections:
@@ -467,11 +485,15 @@ def profiler_node(state: DebateState) -> dict:
             print(f"PROFILER: not disclosed in the latest filings: {profile['undisclosed_metrics']}")
     if profile:
         store.cache_put(key, {"profile": profile, "gaps": gaps, "profiled_text": profiled_text, "sources": sources,
-                              "section_ids": [s["id"] for s in sections]})
+                              "section_ids": [s["id"] for s in sections],
+                              # after run #29: where each section starts, so a cached
+                              # profile's figures keep their source (no text duplicated)
+                              "spans": [{"name": s["name"], "filing_date": s["filing_date"], "chars": len(s["text"])} for s in sections]})
     print(f"PROFILER: archetype={profile.get('archetype', '?')} segments={len(profile.get('segments') or [])} "
           f"kpis={len(profile.get('company_kpis') or [])} flags={profile.get('accounting_flags') or []}")
     return {"profile": profile, "profile_gaps": gaps, "profiled_text": profiled_text,
-            "filing_fingerprint": fs["fingerprint"], "profile_cached": False, "profile_sources": sources}
+            "filing_fingerprint": fs["fingerprint"], "profile_cached": False, "profile_sources": sources,
+            "profiled_sections": [{"name": s["name"], "filing_date": s["filing_date"], "text": s["text"]} for s in sections]}
 
 
 def market_summary(market_text: str, max_lines: int = 45) -> str:

@@ -92,6 +92,42 @@ def share_basis_ok(trailing_eps_quote, annual_eps_report, ctx: dict) -> tuple:
                    f"({per_unit(trailing_eps_quote, ctx.get('quote'))}) — likely ordinary shares vs depositary shares")
 
 
+def normalize_estimates(rows: dict, info: dict, ctx: dict) -> tuple:
+    """PURE. (rows, note): the analysts' EPS estimate table on the traded unit
+    in the trading currency (2026-10-11). The provider states no currency for
+    it: for some foreign filers it is the reporting currency, for others the
+    trading one. The trailing EPS (per traded unit, trading currency) decides:
+    an estimate within 0.2x-5x of it is on the same basis; one that fits only
+    after conversion at the rate is converted (and the note says so); one that
+    fits neither is left out (said so) — a forward P/E of 0.96 from yuan
+    estimates on a dollar price is never shown. A loss, or no trailing EPS,
+    cannot be judged this way and the table is kept as given. Close
+    currencies (EUR, GBP vs USD) are within the band either way and are not
+    told apart."""
+    rows = rows or {}
+    key = "0y" if "0y" in rows else "+1y" if "+1y" in rows else None
+    try:
+        est = float(rows[key]["avg"]) if key else None
+        trail = float((info or {}).get("trailingEps"))
+    except (TypeError, ValueError, KeyError):
+        return rows, ""
+    if est is None or est != est or not trail or trail <= 0 or est <= 0:
+        return rows, ""
+    lo, hi = 0.2, 5.0
+    if lo <= est / trail <= hi:
+        return rows, ""
+    fx = ctx.get("fx") if ctx and ctx.get("mixed") else None
+    if fx and lo <= est * fx / trail <= hi:
+        scaled = {k: {c: (float(v) * fx if c in ("avg", "low", "high", "yearAgoEps") and v == v and v is not None else v)
+                      for c, v in r.items()} for k, r in rows.items()}
+        return scaled, (f"- CURRENCY NOTE: the analyst EPS estimates are in {ctx['report']} (consensus {per_unit(est, ctx['report'])} against a "
+                        f"trailing EPS of {per_unit(trail, ctx['quote'])}); converted to {ctx['quote']} at {fx:.5f} before any multiple  "
+                        f"[source: computed]")
+    return {}, (f"- CURRENCY NOTE: analyst EPS estimates omitted — the consensus ({est:,.2f}) is {est / trail:.1f}x the trailing EPS of "
+                f"{per_unit(trail, (ctx or {}).get('quote', 'USD'))}, so its currency or per-share basis does not match the traded unit  "
+                f"[source: computed]")
+
+
 def fetch_fx(report: str, quote: str) -> tuple:
     """(rate report->quote, date, source) from the free yfinance FX pair; the
     inverse pair as fallback. (None, None, None) when neither has a close."""

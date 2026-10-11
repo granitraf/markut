@@ -104,7 +104,8 @@ def research_node(state: DebateState) -> dict:
     coverage = {q: (max(1, a["current"]) if a["covered"] else 0) for q, a in assessment.items()}
     packet, gaps = assemble_packet(profile, plan, filings, market, (news or "") + extra, coverage,
                                    research_pass=pass_no, profile_gaps=state.get("profile_gaps") or [],
-                                   profile_sources=state.get("profile_sources") or [], detail=assessment)
+                                   profile_sources=state.get("profile_sources") or [], detail=assessment,
+                                   profile_sections=state.get("profiled_sections") or [])
     if gaps:
         print("RESEARCH: data gaps — " + "; ".join(f"{g['source']} ({g['reason']})" for g in gaps))
     print("RESEARCH: coverage " + " ".join(f"{q}:{a['current']}cur/{a['relevant']}rel{'' if a['covered'] else ' GAP'}" for q, a in assessment.items())
@@ -196,6 +197,30 @@ def bear_node(state: DebateState) -> dict:
     case = complete_argument(system_prompt, user_content, f"BEAR  (round {round_num})",
                              cached_prefix=evidence_prefix(state["evidence"]))
     return {"bear_case": case, "bear_history": [case]}
+
+def ensure_cases(verdict: str, bull: str, bear: str) -> str:
+    """PURE. The verdict with '**The case for**' and '**The case against**'
+    after its opening paragraph; a missing one is filled from the judge's
+    strongest point for that side. An existing one is left as written."""
+    v = verdict or ""
+    add = []
+    if "**The case for**" not in v and (bull or "").strip():
+        add.append(f"**The case for**\n- {bull.strip()}")
+    if "**The case against**" not in v and (bear or "").strip():
+        add.append(f"**The case against**\n- {bear.strip()}")
+    if not add:
+        return v
+    if "**The case for**" in v and add[0].startswith("**The case against**"):
+        # only the case against is missing: put it after the case for's block
+        i = v.index("**The case for**")
+        j = v.find("\n\n", i)
+        j = len(v) if j < 0 else j
+        return v[:j] + "\n\n" + add[0] + v[j:]
+    k = v.find("\n\n")
+    if k < 0:
+        return v + "\n\n" + "\n\n".join(add)
+    return v[:k] + "\n\n" + "\n\n".join(add) + v[k:]
+
 
 def coverage_gap_note(evidence: str) -> str:
     """Run #26 (P1): the judge is told, in its own input, which questions the
@@ -292,6 +317,9 @@ def judge_node(state: DebateState) -> dict:
     # run #28: the evidence gate is code — a withheld lean is None whatever the
     # judge returned; at the coverage floor the confidence is capped at low
     decision = apply_gate(decision, lean_gate(state))
+    # 2026-10-11 (after run #29): both sides are stated in the verdict — when
+    # the model leaves a case line out, its own strongest point fills it
+    decision["verdict"] = ensure_cases(decision.get("verdict", ""), decision.get("bull_strongest", ""), decision.get("bear_strongest", ""))
     print(f"JUDGE LEAN: {decision.get('lean') or 'not recorded'} ({decision.get('lean_confidence') or '—'}) — {decision.get('lean_reason', '')}")
     return {
         "verdict": decision["verdict"],

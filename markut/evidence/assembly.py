@@ -1,5 +1,6 @@
 """Packet assembly in the order every agent reads it:
-profile -> key questions -> evidence under Q1-Q5 -> general evidence ->
+profile -> key questions -> evidence quality -> profile evidence ->
+evidence under Q1-Q5 -> general evidence ->
 guidance -> valuation and market data -> news -> what would mislead ->
 coverage gaps -> data gaps. PURE: strings in, one packet out."""
 import re
@@ -184,6 +185,9 @@ def coverage_block(coverage: dict, plan: dict, research_pass: int, profile_gaps:
             why += "; only prior-year excerpts"
         elif not d.get("relevant"):
             why += f"; no sourced evidence after {research_pass} pass(es)"
+        if d.get("searched"):
+            # run #29: say that the gap was looked for, not just retrieved past
+            why += "; searched the full text of the current filings"
         lines.append(f"- COVERAGE GAP {q}: {why} — {_one_line(qtext.get(q, ''))}")
     for g in profile_gaps or []:
         lines.append(f"- COVERAGE GAP profile: {g}")
@@ -193,7 +197,8 @@ def coverage_block(coverage: dict, plan: dict, research_pass: int, profile_gaps:
 
 
 def assemble_packet(profile: dict, plan: dict, filings: str, market: str, news: str, coverage: dict,
-                    research_pass: int = 1, profile_gaps: list = None, profile_sources: list = None, detail: dict = None) -> tuple:
+                    research_pass: int = 1, profile_gaps: list = None, profile_sources: list = None, detail: dict = None,
+                    profile_sections: list = None) -> tuple:
     """-> (packet, data_gaps). Order per the spec; the DATA GAPS block goes
     last beside the coverage gaps, with every raw error marker rewritten."""
     parts = [profile_block(profile, profile_gaps, profile_sources), questions_block(plan)]
@@ -206,5 +211,13 @@ def assemble_packet(profile: dict, plan: dict, filings: str, market: str, news: 
     parts.append((news or "").strip())
     parts.append(mislead_block(plan))
     parts.append(coverage_block(coverage, plan, research_pass, profile_gaps, detail))
+    # after run #29: the filing sentences behind the profiler's and planner's
+    # figures, then how complete and consistent the whole packet is — both
+    # computed from the finished packet, both read right after the questions
+    from markut.evidence.quality import profile_evidence, quality_block
+    body = "\n\n".join(p for p in parts if p)
+    carried, unanchored = profile_evidence(body, profile_sections or [])
+    quality, _ = quality_block(body + ("\n\n" + carried if carried else ""), unanchored, coverage)
+    parts[2:2] = [quality, carried]
     body = "\n\n".join(p for p in parts if p)
     return summarize_gaps(body, position="end")

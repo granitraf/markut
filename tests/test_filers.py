@@ -206,3 +206,47 @@ def test_interim_statement_assumptions_are_not_guidance():
     real = sections.guidance_lines([src("Revenue is expected to be between US$44.6 billion and US$45.8 billion.", "6-K a2q26e.htm")])
     lines = questions.format_guidance(real, "the latest 6-K results release")
     check(f"the source tag names the form once ({lines[1][-120:]!r})", "EDGAR/6-K a2q26e.htm" in lines[1] and "6-K 6-K" not in lines[1])
+
+
+def test_6k_classification_by_what_the_document_is():
+    # 2026-10-11 (readiness sample): two Canadian filers' interim slots held a
+    # rating note and a loan refinancing, and a miner's results release was "other"
+    from markut.evidence import filers
+    pad = " The company operates mines in several countries and reports in U.S. dollars." * 80
+    release = ("PRESS RELEASE EXHIBIT 99.1 Acme Gold reports strong 2026 second-quarter results Disciplined cost management supports "
+               "robust margins and over $725 million in free cash flow. Returned ~40% of free cash flow to shareholders; operating cash flow "
+               "of $1.1 billion; attributable net earnings of $480 million." + pad)
+    assert filers.classify_current_report(release) == "quarterly_results", "a miner's results release, in its own words"
+    note = "PRESS RELEASE Acme Gold upgraded to BBB by a rating agency. See our consolidated financial statements and management's discussion and analysis. Q2 revenue $2.1 billion, net earnings $480 million."
+    assert filers.classify_current_report(note) == "other", "a short note that mentions the statements is not an interim report"
+    notice = "PRESS RELEASE Acme Gold to announce Q3 results on October 28, 2026. A conference call will discuss revenue and net earnings of $1 billion."
+    assert filers.classify_current_report(notice) == "other", "a notice of the results date is not the results"
+    interim = ("Acme Gold Corporation management's discussion and analysis For the three and six months ended June 30, 2026. Revenue $2.1 billion, "
+               "net earnings $480 million." + pad * 3)
+    assert filers.classify_current_report(interim) == "interim_report", "a long document that opens with the MD&A is the interim report"
+
+
+def test_a_footnote_naming_the_balance_sheet_is_not_an_interim_report():
+    # the real rating note: "…net debt as reported on the condensed consolidated
+    # balance sheet as at June 30, 2026" in a footnote of a short press release
+    from markut.evidence import filers
+    note = ("PRESS RELEASE Acme Gold upgraded to BBB by S&P Global Ratings (All dollar amounts are expressed in U.S. dollars). "
+            "The upgrade reflects lower leverage, with net debt of $1.2 billion and margins near record levels. " * 6 +
+            "1 Net debt as reported on the condensed consolidated balance sheet as at June 30, 2026. 2 The condensed consolidated balance sheets "
+            "are in our second-quarter report.")
+    assert filers.classify_current_report(note, docs=[note]) == "other"
+    mda = "Acme Gold Corporation management's discussion and analysis For the three and six months ended June 30, 2026. Revenue $2.1 billion."
+    cover = "FORM 6-K REPORT OF FOREIGN PRIVATE ISSUER Exhibits attached. " * 20
+    assert filers.classify_current_report(cover + " " + mda, docs=[cover, mda]) == "interim_report", "the title opens its own exhibit"
+
+
+def test_a_long_report_behind_an_sec_cover_is_the_interim_report():
+    # the real report: one 55,000-character file — the SEC cover page, then the
+    # financial report naming its statements once — no "reports … results" headline
+    from markut.evidence import filers
+    body = ("Financial report for the period 1 January 2026 to 30 June 2026. Sales increased by 6% to DKK 175,311 million and operating profit "
+            "was DKK 86,679 million in the first six months; Q2 sales were DKK 78,488 million. ") * 140
+    doc = ("6-K UNITED STATES SECURITIES AND EXCHANGE COMMISSION Washington, D.C. 20549 FORM 6-K REPORT OF FOREIGN PRIVATE ISSUER. " + body +
+           " The condensed consolidated financial statements are presented in DKK millions.")
+    assert len(doc) > 20000
+    assert filers.classify_current_report(doc, docs=[doc]) == "interim_report"

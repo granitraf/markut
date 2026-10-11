@@ -155,6 +155,7 @@ ANALYST_ADDENDUM = (
     "scenario rows, never from your own multiple x EPS arithmetic; assert a relationship between companies "
     "(customer, supplier, competitor, partner) only where the evidence states it; cite guidance only from the "
     "[GUIDANCE] lines."
+    " QUALITY: build no point on a figure the [EVIDENCE QUALITY] block lists as SUSPECT, DISPUTED or not evidence."
 )
 BULL_SYSTEM_PROMPT = BULL_SYSTEM_PROMPT_NOTEBOOK + ANALYST_ADDENDUM
 BEAR_SYSTEM_PROMPT = BEAR_SYSTEM_PROMPT_NOTEBOOK + ANALYST_ADDENDUM
@@ -193,15 +194,25 @@ JUDGE_CHECKLIST = (
     "may exist but was not retrieved. A side arguing that the company does not disclose or lacks it is unsupported; say "
     "'not retrieved' yourself, never 'not disclosed'.\n"
     "  7. Third-party models: a line labeled 'unverified third-party model' gets no weight in the verdict.\n"
+    "  8. Evidence quality (after run #29): the [EVIDENCE QUALITY] block is computed by code. A figure it lists as SUSPECT "
+    "(out of range, the mark of a unit or currency error), DISPUTED (filing and provider disagree for the same period) or "
+    "'not evidence' (written by the profiler or planner, stated nowhere in the data) gets no weight, and a claim resting on "
+    "one is unsupported. A statement marked ✗ was not retrieved, which is not the same as not disclosed.\n"
     "\nLENGTH LIMITS (hard — a reply that overruns is cut off and discarded): each question answer under 40 words; "
     "bull_strongest and bear_strongest under 60 words each; reasoning under 120 words; unsupported_claims at most 6 "
-    "entries of one sentence each; verdict under 230 words INCLUDING its labeled parts.\n"
+    "entries of one sentence each; verdict under 300 words INCLUDING its labeled parts.\n"
     "\nVERDICT FORMAT (2026-10-11 — a reader should finish it in a minute; the per-question rulings already hold the "
     "detail, so do not repeat them). Write it in this exact shape:\n"
     "  First, ONE short paragraph of 3-4 sentences, each under 25 words, that explains the lean in plain language: what "
     "the evidence shows about the business, then what today's price already assumes. Use only the 3-5 figures that matter "
     "most. No parentheses inside sentences, no strings of numbers, no source labels; write each figure itself and never "
     "refer to the page, a source list or where a figure is shown (code lists every figure's source beneath the verdict).\n"
+    "  Then both sides, each label on its own line exactly as written, one or two plain sentences each with the key figures "
+    "(2026-10-11: a reader must see the downside stated, whatever the lean):\n"
+    "  **The case for**\n"
+    "  - the strongest evidence-backed reasons the stock could do well.\n"
+    "  **The case against**\n"
+    "  - the strongest evidence-backed risks and downsides, named plainly with their figures.\n"
     "  Then these three parts, each label on its own line exactly as written, each item a complete plain sentence:\n"
     "  **What moves the stock**\n"
     "  - 2-3 bullets, each naming one open question and why it matters, e.g. '- Whether the latest growth comes from "
@@ -229,8 +240,8 @@ NEWS_VERIFY_SYSTEM_PROMPT = NEWS_VERIFY_SYSTEM_PROMPT_NOTEBOOK + (
     " LENGTH LIMITS (hard): each evidence_summary under 50 words; reasoning under 100 words; "
     "revised_verdict must be an EMPTY string unless verdict_changed is true — never restate an "
     "unchanged verdict. A revised_verdict keeps the verdict's shape: its opening paragraph, the bold labels "
-    "**What moves the stock**, **What would change this view**, **Next catalyst** with their bullet points, and "
-    "its length."
+    "**The case for**, **The case against**, **What moves the stock**, **What would change this view**, **Next catalyst** "
+    "with their bullet points, and its length."
 )
 
 

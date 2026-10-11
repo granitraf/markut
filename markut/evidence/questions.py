@@ -259,7 +259,8 @@ def period_label(meta: dict, dates: dict) -> str:
     return f"earlier filing ({form} filed {d})"
 
 
-def question_blocks(coll, plan: dict, profile: dict, profiled_text: str, relaxed: list = None) -> list:
+def question_blocks(coll, plan: dict, profile: dict, profiled_text: str, relaxed: list = None, sweep_docs: list = None,
+                    known_kpis: dict = None) -> list:
     """[EVIDENCE Qn] sections: up to EXCERPTS_PER_QUESTION tagged lines per
     question, every chunk used at most once across the run, current-period
     filings ranked ahead of prior-year text for a question about now, every
@@ -302,6 +303,17 @@ def question_blocks(coll, plan: dict, profile: dict, profiled_text: str, relaxed
                 lines.append(f"{prefix}Risk: {m['risk_title']}")
             lines.append(f'{prefix}"{text}"  {source_tag(m, period, basis, segment)}')
             kept += 1
+        # run #29: no current-period excerpt for a question about now -> search
+        # the current filings' full text before the packet calls it a gap
+        q_lines = [l for l in lines[lines.index(f"[EVIDENCE {qid}] {q.get('question', '')}"):] if l.startswith(f"- [{qid}] ")]
+        still = missing_kpis(q, known_kpis or {})
+        if about_now and sweep_docs is not None and still and not any("current period (" in l for l in q_lines):
+            found = full_text_sweep(dict(q, kpis=still), sweep_docs, names)
+            lines.extend(found)
+            kept += len(found)
+            if not found:
+                lines.append(f"- [{qid}] searched the full text of the current filings: no sentence states "
+                             f"{', '.join(still)} with a figure")
         if not kept:
             why = (f"best match {best:.2f} below the {RELAXED_FLOOR if is_relaxed else SIM_FLOOR} floor"
                    if best is not None and best < (RELAXED_FLOOR if is_relaxed else SIM_FLOOR) else
@@ -409,12 +421,16 @@ def _kpi_match(a: str, b: str) -> bool:
     bl = {x.lower() for x in _aliases(b)}
     if al & bl:
         return True
-    wa = {w for w in re.findall(r"[a-z0-9]+", a.lower()) if len(w) > 2}
-    wb = {w for w in re.findall(r"[a-z0-9]+", b.lower()) if len(w) > 2}
+    # "EPS" is "earnings per share" (the core resolver already reads it so)
+    expand = lambda t: re.sub(r"(?i)\beps\b", "earnings per share", t)
+    wa = {w for w in re.findall(r"[a-z0-9]+", expand(a).lower()) if len(w) > 2}
+    wb = {w for w in re.findall(r"[a-z0-9]+", expand(b).lower()) if len(w) > 2}
     return bool(wa and wb) and len(wa & wb) / len(wa | wb) >= 0.5
 
 
-_CURRENT_PERIOD_RE = re.compile(r"\((?:quarter|YTD \(H1\)|YTD \(9M\)|ttm)\b")
+# run #29: "\b" after "(YTD (H1)" never matched (")" then "," is no word
+# boundary), so half-year and nine-month figures were never current
+_CURRENT_PERIOD_RE = re.compile(r"\((?:quarter\b|YTD \(H1\)|YTD \(9M\)|ttm\b)")
 
 
 def _line_is_current(line: str, annual_is_current: bool) -> bool:
@@ -462,7 +478,8 @@ def coverage_assess(filings_text: str, plan: dict, kpi_values: dict, relevance: 
         covered = bool(current_kpis) or bool(current)
         out[qid] = {"lines": len(lines), "relevant": len(chosen), "current": len(current), "kpis_ok": kpis_ok,
                     "covered": covered, "missing": [k for k in linked if k not in current_kpis],
-                    "prior_only": bool(chosen) and not current}
+                    "prior_only": bool(chosen) and not current,
+                    "searched": f"- [{qid}] searched the full text of the current filings" in text}
     return out
 
 
@@ -551,3 +568,49 @@ def format_guidance(g: dict, sources: str = "the latest 8-K exhibits or 10-Q") -
                      "deferred-revenue, lease and debt-maturity tables are excluded). A company that gives guidance only on its "
                      "earnings call is a known gap: no call transcript is available.")
     return lines
+
+
+
+def missing_kpis(q: dict, known: dict) -> list:
+    """PURE. The question's linked metrics with no value found in the core
+    figures (known = {kpi name: found?}) — what a full-text search should
+    still look for, and the only metrics its note should name."""
+    found = [n for n, ok in (known or {}).items() if ok]
+    return [k for k in (q.get("kpis") or []) if isinstance(k, str) and k.strip() and not any(_kpi_match(k, n) for n in found)]
+
+
+def full_text_sweep(q: dict, docs: list, segments: list, max_lines: int = 2) -> list:
+    """Run #29 (2026-10-11): look before declaring a gap. Similarity
+    retrieval can miss a current-period figure the filings state plainly (TSM's
+    capex question became a coverage gap). Every sentence of the CURRENT
+    filings (interim report, results release, monthly reports) is scanned for
+    a linked metric — at least two thirds of its distinctive words — with a
+    figure in the same sentence; a named segment must be named too. Found
+    sentences become current-period excerpts marked "found by full-text
+    search". docs: [{"form","name","filing_date","url","text"}]."""
+    from markut.evidence.core import _distinctive, _norm_words
+    from markut.evidence.sections import FIGURE_RE
+    qid = q.get("id", "Q?")
+    targets = [t for t in (_distinctive(k, []) or _norm_words(k) for k in (q.get("kpis") or []) if isinstance(k, str) and k.strip()) if t]
+    if not targets:
+        return []
+    ents = question_entities(q, segments)
+    out, seen = [], set()
+    for doc in docs or []:
+        text = normalize_dollars(re.sub(r"\s+", " ", doc.get("text") or ""))
+        for sent in split_sentences(text):
+            s = sent.strip()
+            if not (30 <= len(s) <= 500) or not FIGURE_RE.search(s) or s in seen:
+                continue
+            words = _norm_words(s)
+            if not any(len(t & words) / len(t) >= 0.67 for t in targets):
+                continue
+            if ents and not any(_mentions(s.lower(), e) for e in ents):
+                continue
+            seen.add(s)
+            form, date = doc.get("form", "?"), doc.get("filing_date", "?")
+            out.append(f'- [{qid}] "{s}"  [source: EDGAR/{form} {doc.get("name", "")}, filed {date}; current period ({form} filed {date}); '
+                       f'found by full-text search; {doc.get("url", "")}]')
+            if len(out) >= max_lines:
+                return out
+    return out

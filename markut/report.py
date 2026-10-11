@@ -222,6 +222,12 @@ def parse_packet(evidence: str) -> tuple:
 
 
 # ---------------------------------------------------------------- lean scale (2026-10-11)
+def _consensus_caption(consensus: dict) -> str:
+    from markut.evidence.consensus import explain_consensus
+    note = explain_consensus(consensus)
+    return ("Analyst rating: " + note + ".") if note else ""
+
+
 def lean_scale_drawing(lean: dict, consensus: dict, width: float):
     """The debate's lean and the analyst consensus on one five-point scale:
     a red-to-green track from strongly bearish / strong sell to strongly
@@ -418,11 +424,24 @@ def build_report(run: dict) -> bytes:
     # 2026-10-11: the stance first — the debate's lean on the evidence, placed
     # on a scale next to the analyst consensus the agents never saw
     lean, consensus = review.get("lean") or None, review.get("consensus") or None
+    # after run #29: how the lean was reached — the five question rulings
+    rul = review.get("rulings") or {}
+    if rul.get("tally"):
+        t = rul["tally"]
+        per = ", ".join(f"{q['id']} {q.get('side', '')}" + (f" ({q['confidence']})" if q.get("confidence") == "low" else "")
+                        for q in rul.get("questions") or [])
+        story.append(Paragraph(f"<b>Question rulings: bull {t.get('bull', 0)} · bear {t.get('bear', 0)} · neither {t.get('neither', 0)}</b>"
+                               + (f" — {escape(per)}" if per else ""), st["small"]))
+    if review.get("quality"):
+        # after run #29: how complete and consistent the evidence under the verdict was
+        story.append(Paragraph("<b>Evidence:</b> " + escape(review["quality"]), st["small"]))
     if lean and not lean.get("lean") and lean.get("withheld"):
         # run #28: no lean, said plainly — the analysts' marker stays for reference
         story.append(Paragraph("<b>No lean</b> · withheld by the evidence gate", st["h2"]))
         story.append(Paragraph("The evidence could not support a lean: " + escape(lean["withheld"]) + ".", st["verdict"]))
         story.append(lean_scale_drawing(lean, consensus, width))
+        if _consensus_caption(consensus):
+            story.append(Paragraph(escape(_consensus_caption(consensus)), st["small"]))
         if review.get("comparison"):
             story.append(Paragraph(escape(review["comparison"]), st["small"]))
         story.append(Spacer(1, 6))
@@ -433,6 +452,8 @@ def build_report(run: dict) -> bytes:
         if lean.get("reason"):
             story.append(Paragraph(_inline(lean["reason"]), st["verdict"]))
         story.append(lean_scale_drawing(lean, consensus, width))
+        if _consensus_caption(consensus):
+            story.append(Paragraph(escape(_consensus_caption(consensus)), st["small"]))
         if review.get("comparison"):
             story.append(Paragraph(escape(review["comparison"]), st["small"]))
         if consensus and consensus.get("target_mean") and consensus.get("price"):

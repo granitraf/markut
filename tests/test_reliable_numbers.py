@@ -89,7 +89,8 @@ def test_core_extraction_brand_rows_and_residual_margin(monkeypatch):
     assert "- Revenues: $98,440 thousand (quarter, For the 13 Weeks Ended June 30, 2026 North Italia)" in t and "; North Italia)" in t
     assert "- Revenues: $729,476 thousand" in t and "; The Cheesecake Factory restaurants)" in t
     assert "641.0%" not in t                                                # brand columns never pair as current vs year-ago
-    assert "- KPI Food and beverage costs % of revenues: Food and beverage costs: 21.8% (quarter" in t and "vs 21.6% year-ago" in t and "T1 = EDGAR/8-K" in t
+    # 2026-10-11: "Costs and expenses:" is the rows' section heading (it was stacked into the column headings before)
+    assert "- KPI Food and beverage costs % of revenues: Food and beverage costs [Costs and expenses]: 21.8% (quarter" in t and "vs 21.6% year-ago" in t and "T1 = EDGAR/8-K" in t
     assert "DERIVED residual margin after the listed cost ratios: 17.6% = 100% − Food and beverage costs 21.8% − Labor expenses 34.1% − Other operating costs and expenses 26.5%" in t
     assert "SANITY CHECK segment sum OK" in t
     assert "- KPI value not found: Comparable restaurant sales" in t      # not in these two tables -> explicit, not silent

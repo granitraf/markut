@@ -485,6 +485,20 @@ def market_snapshot(ticker: str) -> str:
         rate, rate_date, rate_src = fetch_fx(ccx["report"], ccx["quote"])
         ccx = currency_context(info, fx=rate, fx_date=rate_date, fx_source=rate_src)
     info["_ccy"] = ccx
+    # the analysts' estimate table, fetched once and put on the traded unit in
+    # the trading currency before any line or multiple uses it (2026-10-11)
+    est_note = ""
+    try:
+        _est = t.earnings_estimate
+        est_rows = {str(k): {c: _est.loc[k, c] for c in _est.columns} for k in _est.index} if _est is not None and len(_est.index) > 0 else {}
+    except Exception as e:
+        est_rows = {}
+        out.append(f"[earnings_estimate unavailable: {e}]")
+    if est_rows:
+        from markut.evidence.currency import normalize_estimates
+        est_rows, est_note = normalize_estimates(est_rows, info, ccx)
+        if not est_rows:
+            info["forwardEps"] = info["forwardPE"] = None     # the provider's single field is on the same basis
 
     # one daily price series for the run (all-time high, returns, P/E band)
     try:
@@ -504,12 +518,10 @@ def market_snapshot(ticker: str) -> str:
         out.append(f"[quarterly cash flow unavailable: {e}]")
     # the canonical forward EPS: the estimate table's next-FY average, before any line is formatted
     try:
-        _est = t.earnings_estimate
-        if _est is not None and "+1y" in [str(k) for k in _est.index]:
-            _row = {c: _est.loc["+1y", c] for c in _est.columns}
-            if _row.get("avg") == _row.get("avg") and _row.get("avg") is not None:
-                info["_fwd_eps_canonical"] = {"value": float(_row["avg"]), "source": "yfinance/earnings_estimate",
-                                              "analysts": _row.get("numberOfAnalysts") if _row.get("numberOfAnalysts") == _row.get("numberOfAnalysts") else None}
+        _row = est_rows.get("+1y") or {}
+        if _row.get("avg") == _row.get("avg") and _row.get("avg") is not None:
+            info["_fwd_eps_canonical"] = {"value": float(_row["avg"]), "source": "yfinance/earnings_estimate",
+                                          "analysts": _row.get("numberOfAnalysts") if _row.get("numberOfAnalysts") == _row.get("numberOfAnalysts") else None}
     except Exception:
         pass
     # leverage from the balance sheet, with and without leases
@@ -535,10 +547,11 @@ def market_snapshot(ticker: str) -> str:
         out.append(f"[income_stmt unavailable: {e}]")
 
     # Consensus EPS by fiscal year (non-GAAP), separately from trailing GAAP EPS.
+    if est_note:
+        out.append(est_note)
     try:
-        est = t.earnings_estimate
-        if est is not None and len(est.index) > 0:
-            rows = {str(k): {c: est.loc[k, c] for c in est.columns} for k in est.index}
+        if est_rows:
+            rows = est_rows
             current_fy = None
             try:
                 nfe = info.get("nextFiscalYearEnd")
@@ -554,13 +567,6 @@ def market_snapshot(ticker: str) -> str:
     # ---- VALUATION (deterministic; AUDIT FIX item 10) ----
     try:
         from markut.evidence.valuation import format_valuation_lines
-        est_rows = {}
-        try:
-            est = t.earnings_estimate
-            if est is not None and len(est.index) > 0:
-                est_rows = {str(k): {c: est.loc[k, c] for c in est.columns} for k in est.index}
-        except Exception:
-            est_rows = {}
         cur_fy = None
         try:
             if info.get("nextFiscalYearEnd"):

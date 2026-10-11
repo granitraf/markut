@@ -178,3 +178,22 @@ def test_foreign_release_columns_and_statement_noise(monkeypatch):
     check("subsidiary ownership percentages are not performance figures", "TSMC Japan" not in t)
     check("valuation assumptions of a compensation note are not performance figures", "Risk-free interest rate" not in t)
     check("a maturity table ('5-10 Years') is not a lease balance", "11,400,063" not in t and "as of 5-10 Years" not in t)
+
+
+# ---------------------------------------------------------------- analyst estimates (2026-10-11)
+def test_analyst_estimates_are_put_on_the_traded_unit():
+    from markut.evidence.currency import currency_context, normalize_estimates
+    cny = currency_context({"currency": "USD", "financialCurrency": "CNY"}, fx=0.14)
+    rows = {"0y": {"avg": 22.41, "low": 20.0, "high": 25.0, "numberOfAnalysts": 30, "growth": 0.12},
+            "+1y": {"avg": 28.11, "low": 25.0, "high": 31.0, "numberOfAnalysts": 28, "growth": 0.25}}
+    out, note = normalize_estimates(rows, {"trailingEps": 3.5}, cny)
+    assert abs(out["+1y"]["avg"] - 28.11 * 0.14) < 1e-9 and out["+1y"]["numberOfAnalysts"] == 28 and out["+1y"]["growth"] == 0.25, out
+    assert "in CNY" in note and "converted to USD" in note, note
+    twd = currency_context({"currency": "USD", "financialCurrency": "TWD"}, fx=0.03133)
+    same, note = normalize_estimates({"+1y": {"avg": 21.95}}, {"trailingEps": 13.76}, twd)
+    assert same["+1y"]["avg"] == 21.95 and note == "", "estimates already per ADR in USD are left alone"
+    usd = currency_context({"currency": "USD"})
+    gone, note = normalize_estimates({"+1y": {"avg": 40.0}}, {"trailingEps": 2.0}, usd)
+    assert gone == {} and "omitted" in note, "a 20x gap no exchange rate explains: the estimates are left out, said so"
+    loss, note = normalize_estimates({"+1y": {"avg": 0.5}}, {"trailingEps": -1.2}, usd)
+    assert loss["+1y"]["avg"] == 0.5 and note == "", "a loss-maker's estimates cannot be judged this way and are kept"

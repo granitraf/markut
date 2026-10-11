@@ -146,7 +146,8 @@ def fetch_filing_html(url: str) -> str:
 
 
 _ZERO_WIDTH = re.compile(r"[\u200b\u200c\u200d\ufeff]")
-_FIGURE_CELL = re.compile(r"^\(?[-+]?\$?\s?\d[\d,]*(?:\.\d+)?\)?\s?(?:%|x|bps)?\)?$|^[-+]\d")
+# "$(7,604)" — the sign before the bracket — is a figure too (2026-10-11)
+_FIGURE_CELL = re.compile(r"^(?:\$\s?)?\(?[-+]?\$?\s?\d[\d,]*(?:\.\d+)?\)?\s?(?:%|x|bps)?\)?$|^[-+]\d")
 
 
 def is_figure_cell(cell: str) -> bool:
@@ -672,15 +673,20 @@ def extract_highlights(press_text: str, char_limit: int = 1500) -> str:
 # only one filer uses.
 # run #28 (TSM): "(Unit: NT$ million, except for EPS)" — a 'unit:' lead-in, a
 # non-US dollar sign and a singular scale word all occur in foreign releases
-_UNITS_RE = re.compile(r"(?i)\b(?:in|\$ in|us\$ in|dollars in|amounts in|units?\s*:)\s*(?:(?:us|nt|c|ca|a|hk|s|nz)\s*\$\s*|\$\s*|"
+# "(in millions)", "Unit: NT$ million" — and "(millions of dollars, unless noted)" (2026-10-11)
+_UNITS_RE = re.compile(r"(?i)(?:\b(?:in|\$ in|us\$ in|dollars in|amounts in|units?\s*:|"
+                       r"dkk|sek|nok|chf|eur|gbp|usd|jpy|cny|rmb|twd|cad|aud|hkd|inr|krw)|\()\s*(?:(?:us|nt|c|ca|a|hk|s|nz)\s*\$\s*|\$\s*|"
                        r"u\.s\. dollars? |(?:rmb|cny|jpy|eur|gbp|chf|krw|inr|twd|cad|aud|hkd|usd)\s+|[€£¥]\s*)?(thousands?|millions?|billions?)\b")
 # the currency a table's caption names; a bare "$" names none (a domestic
 # filer's dollars, a foreign filer's are labelled by the packet's currency note)
-_CURRENCY_HINTS = [("TWD", r"NT\$|New Taiwan dollars?|\bTWD\b"), ("CAD", r"\bC\$|\bCA\$|Canadian dollars?|\bCAD\b"),
-                   ("AUD", r"\bA\$|Australian dollars?|\bAUD\b"), ("HKD", r"HK\$|Hong Kong dollars?|\bHKD\b"),
-                   ("CNY", r"\bRMB\b|Renminbi|\bCNY\b"), ("JPY", r"¥|\bJPY\b|\byen\b"), ("EUR", r"€|\bEUR\b|\beuros?\b"),
-                   ("GBP", r"£|\bGBP\b|pounds? sterling"), ("KRW", r"₩|\bKRW\b|Korean won"), ("INR", r"₹|\bINR\b|Indian rupees?"),
-                   ("USD", r"US\$|U\.S\. dollars?|\bUSD\b")]
+# currency names in any case ("In Thousands of New Taiwan Dollars", 2026-10-11)
+_CURRENCY_HINTS = [("TWD", r"NT\$|(?i:New Taiwan dollars?)|\bTWD\b"), ("CAD", r"\bC\$|\bCA\$|(?i:Canadian dollars?)|\bCAD\b"),
+                   ("AUD", r"\bA\$|(?i:Australian dollars?)|\bAUD\b"), ("HKD", r"HK\$|(?i:Hong Kong dollars?)|\bHKD\b"),
+                   ("CNY", r"\bRMB\b|(?i:Renminbi)|\bCNY\b"), ("JPY", r"¥|\bJPY\b|(?i:\byen\b)"), ("EUR", r"€|\bEUR\b|(?i:\beuros?\b)"),
+                   ("GBP", r"£|\bGBP\b|(?i:pounds? sterling)"), ("KRW", r"₩|\bKRW\b|(?i:Korean won)"), ("INR", r"₹|\bINR\b|(?i:Indian rupees?)"),
+                   ("DKK", r"\bDKK\b|(?i:Danish kron)"), ("SEK", r"\bSEK\b|(?i:Swedish kron)"), ("NOK", r"\bNOK\b|(?i:Norwegian kron)"),
+                   ("CHF", r"\bCHF\b|(?i:Swiss francs?)"),
+                   ("USD", r"US\$|(?i:U\.S\. dollars?)|\bUSD\b")]
 
 
 def caption_currency(text: str) -> str:
@@ -707,8 +713,11 @@ def _group_text(text: str) -> str:
     return _FOOTNOTE_MARK_RE.sub("", _LEAD_FOOTNOTE_RE.sub("", text or "")).rstrip(":").strip()
 
 
+_MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+                "November", "December")
 _PERIOD_WORDS_RE = re.compile(r"(?i)\b(?:weeks?|months?|quarter|year|fiscal|ended|ending|as of|q[1-4]\b|fy\s?\d|\d{4})")
-_DATE_RE = re.compile(r"(?i)\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b|\b\d{4}-\d{2}-\d{2}\b")
+# 2026-10-11: and day-month-year ("30 Jun 2026"), as European filers date their columns
+_DATE_RE = re.compile(r"(?i)\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b|\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?,?\s+\d{4}\b")
 
 
 def table_caption(table) -> tuple:
@@ -719,6 +728,12 @@ def table_caption(table) -> tuple:
     return caption, units
 
 
+def _text_only_table(table) -> bool:
+    """A small table with no figure cell: a title or heading block laid out as a table."""
+    cells = table.find_all(["td", "th"], limit=13)
+    return len(cells) <= 12 and not any(is_figure_cell(t) for t in (c.get_text(" ", strip=True) for c in cells) if t)
+
+
 def table_caption_ex(table) -> tuple:
     """(caption, units, currency) — table_caption plus the currency the
     caption names (run #28: 'Unit: NT$ million' -> millions, TWD)."""
@@ -727,8 +742,12 @@ def table_caption_ex(table) -> tuple:
         node = node.find_previous(string=re.compile(r"\S"))
         if node is None:
             break
-        if node.find_parent("table") is not None and node.find_parent("table") is not table:
+        outer = node.find_parent("table")
+        if outer is not None and outer is not table and not _text_only_table(outer):
             break   # the previous table's cells are not this table's caption
+        # a text-only table above is the statement's title block (2026-10-11:
+        # TSM prints "CONSOLIDATED BALANCE SHEETS" / "(In Thousands of New
+        # Taiwan Dollars)" in one) — read it like the paragraphs it stands for
         s = _ZERO_WIDTH.sub("", str(node)).replace("\xa0", " ").strip()
         s = re.sub(r"\s+", " ", s)
         if not s or _PAGE_FIELD_RE.match(s):
@@ -747,8 +766,9 @@ def table_caption_ex(table) -> tuple:
     currency = caption_currency(" ".join(p for p in prevs if _UNITS_RE.search(p)) or (prevs[0] if prevs else ""))
     caption = ""
     for s in prevs:                      # nearest first
-        if _UNITS_RE.search(s) and len(s.split()) <= 9:
-            continue                     # a units-only line ("(In US $ millions, except percentages)") is not the caption
+        if _UNITS_RE.search(s) and len(re.sub(r"\([^)]*\)", " ", s).split()) < 2:
+            continue                     # a units-only line ("(In US $ millions, except percentages)") is not the caption,
+                                         # but "Consolidated balance sheets (in millions)" is (2026-10-11)
         cleaned = _FOOTNOTE_MARK_RE.sub("", s).strip()
         if not cleaned or re.fullmatch(r"[\(\)\d\s,*•·\-–—]+", cleaned) or len(cleaned) < 8 or not re.search(r"[A-Za-z]{3,}\s+[A-Za-z]{2,}", cleaned):
             continue                     # a footnote marker, a bullet, or a stray word is not a caption
@@ -790,26 +810,49 @@ def _overlap(a, b) -> int:
 
 def _stack_headers(headers: list, cells: list) -> list:
     # a new header row under the current stack: every new cell inherits the
-    # text of the stacked cell above it (by column overlap); stacked cells no
-    # new cell covers are carried forward unchanged
+    # text of the stacked cell above it (by column overlap); a stacked cell
+    # keeps heading the columns no new cell sits under
     out = []
     for c0, c1, t in cells:
         above = [h for h in headers if _overlap(h, (c0, c1))]
+        covered = [h for h in above if c0 <= h[0] and h[1] <= c1]
+        if len(covered) > 1:
+            # a wide cell over several columns ("(in millions)" across RMB,
+            # RMB and US$) adds its text to each, never merges them into one
+            # (2026-10-11: every column of a balance sheet read "March 31")
+            out.extend([h[0], h[1], h[2] if t.lower() in h[2].lower() else (h[2] + " " + t).strip()] for h in covered)
+            continue
         if above:
-            top = max(above, key=lambda h: _overlap(h, (c0, c1)))
+            top = max(above, key=lambda h: (_overlap(h, (c0, c1)), -(h[1] - h[0])))
             text = t if top[2].lower() in t.lower() else (top[2] + " " + t).strip()
         else:
             text = t
         out.append([c0, c1, text])
     for h in headers:
-        if not any(_overlap(h, (c0, c1)) for c0, c1, _ in cells):
-            out.append(list(h))
+        # "QUARTERLY TRENDS" over seven columns still heads the five that
+        # "2Q26 Change" (over the last two) does not (2026-10-11) — kept as a
+        # fallback (the 4th field), used only where no newer heading sits
+        if sum(_overlap(h, (c0, c1)) for c0, c1, _ in cells) < h[1] - h[0]:
+            out.append(list(h[:3]) + [True])
     return sorted(out, key=lambda x: x[0])
 
 
 def _heading_for(headers: list, span) -> str:
-    best = max(headers, key=lambda h: _overlap(h, span), default=None)
-    return best[2] if best is not None and _overlap(best, span) else ""
+    # the most specific heading over the column: a heading of the latest
+    # header row before a carried-over fallback (a value printed one column
+    # right of "June 30, 2026" overlaps the wide "Three Months Ended" more —
+    # 2026-10-11), then the most overlap, then the narrowest
+    over = [h for h in headers if _overlap(h, span)]
+    if not over:
+        return ""
+    fresh = [h for h in over if not (len(h) > 3 and h[3])] or over
+    return max(fresh, key=lambda h: (_overlap(h, span), -(h[1] - h[0])))[2]
+
+
+_YEAR_CELL_RE = re.compile(r"^(?:19|20)\d\d$")
+# a column's period printed alone: "2026", "2Q26", "Q2 2026", "FY2026", "H1 2026"
+_PERIOD_CELL_RE = re.compile(r"(?i)^(?:(?:19|20)\d\d|[1-4]Q\s?'?\d{2,4}|Q[1-4]\s?'?\d{2,4}|FY\s?'?\d{2,4}|H[12]\s?'?\d{2,4})$")
+_NOTE_ROW_RE = re.compile(r"(?i)^\(\s*(?:un)?audited|^\(\s*reviewed|^\(\s*preliminary|^\(\s*continued|^\(\s*concluded")
 
 
 def parse_tables(html: str) -> list:
@@ -838,6 +881,27 @@ def parse_tables(html: str) -> list:
             if not cells:
                 continue
             numeric = [is_figure_cell(c[2]) for c in cells]
+            # a header row of period labels — bare years under "June 30," (a 10-Q
+            # that prints the year on its own row), quarter labels ("2Q26 | 1Q26"),
+            # beside a units cell, a section title or "Percentage Change Y/Y" — is
+            # part of the column headings, not a row of figures (2026-10-11: read
+            # as figures, two filers' quarters came out backwards).
+            # Attached only when every period cell sits under a column heading:
+            # a year row shifted off its columns would swap current and prior
+            # (only a row that would otherwise read as figures — one with bare
+            # years: a row of "2Q26 | 1Q26 | $ O/(U)" is a header row already)
+            periods = [c for c in cells if _PERIOD_CELL_RE.match(c[2])]
+            if periods and any(is_figure_cell(c[2]) for c in periods) and \
+                    all(_PERIOD_CELL_RE.match(c[2]) or not is_figure_cell(c[2]) for c in cells):
+                # under a heading over the figure columns, not the label column's
+                # "(millions of dollars)" (a year row shifted left sits there)
+                if headers and not all(any(_overlap(h, c) for h in headers if h[0] > 0) for c in periods):
+                    continue
+                numeric = [False] * len(cells)
+            # "(Preliminary)", "(Unaudited)" on a row of its own is a note on
+            # the statement — neither a section heading nor a column heading
+            if len(cells) == 1 and _NOTE_ROW_RE.match(cells[0][2]):
+                continue
             if not units and not seen_figure_row and not any(numeric):
                 m = _UNITS_RE.search(" ".join(c[2] for c in cells))
                 if m:                          # "(in millions)" printed in the table's own header row
@@ -846,9 +910,15 @@ def parse_tables(html: str) -> list:
             if len(cells) == 1 and not numeric[0]:
                 text = cells[0][2]
                 label_col = min([h[0] for h in headers] + [cells[0][0]]) if headers else 0
+                # 2026-10-11 (after run #29): a row that starts in the label
+                # column is a section heading even when it spans the whole
+                # table — Apple's full-width "ASSETS:" was stacked into the
+                # column headings and erased both balance-sheet dates
+                over_values = bool(headers) and cells[0][0] >= min(h[0] for h in headers)
                 if _DURATION_RE.search(text.lower()) and not text.rstrip().endswith(":") and len(text) < 80:
                     duration = text
-                elif cells[0][0] > label_col or (headers and any(_overlap(h, cells[0]) for h in headers)):
+                elif not text.rstrip().endswith(":") and (cells[0][0] > label_col or (
+                        over_values and any(_overlap(h, cells[0]) for h in headers))):
                     # a fragment of a stacked column heading (a brand name split over
                     # three rows above one column): it sits over a value column
                     headers = _stack_headers(headers, cells)
@@ -883,6 +953,11 @@ def parse_tables(html: str) -> list:
             # row ABOVE it; on its own the label names nothing
             if _re_pct_of.match(label) and out and out[-1]["table"] == ti and not _re_pct_of.match(out[-1]["label"]):
                 label = f"{out[-1]['label']} — {label}"
+            # "– diluted" under "Earnings per share (EPS) – basic" continues that
+            # label's stem (2026-10-11: on its own it read as millions)
+            stem = re.match(r"^(.+?)\s+[–—-]\s+\S", out[-1]["label"]) if out and out[-1]["table"] == ti else None
+            if stem and re.match(r"^[–—]\s*\w|^-\s+\w", label):
+                label = f"{stem.group(1)} {label}"
             # P0 (run #26): a result line (gross margin, operating income, net
             # income...) is never part of the cost or expense section above it
             # — "Operating income [Operating expenses]" was a label the row
@@ -920,6 +995,15 @@ def _strip_period_words(heading: str) -> str:
     t = re.sub(r"(?i)\b[1-4]Q\s?(?:FY\s?)?'?(?:\d{2}|\d{4})\b|\bQ[1-4]\s?(?:FY\s?)?'?(?:\d{2}|\d{4})\b", "", t)
     if re.search(r"(?i)\b(?:yoy|qoq|y/y|q/q)\b|inc\.?\s*\(dec\.?\)|\bincrease\s*\(decrease\)|%\s*change", t):
         t = ""
+    # an amount is never part of a column's name: a continuation table's
+    # headings can carry stray figures ("Six Months Ended June 30 $ (744,405)",
+    # TSM's interim cash flows), which split one column pair into two entities
+    t = re.sub(r"[$€£¥]?\s*\(?-?[\d][\d,]*(?:\.\d+)?\)?%?|(?<!\w)[$€£¥-](?!\w)", " ", t)
+    # an audit status ("June 30, 2026 (unaudited)") names no kind of column:
+    # a filer that marks only its latest column never paired it (2026-10-11)
+    t = re.sub(r"(?i)\(?\s*\b(?:un)?audited\b\s*\)?|\(?\s*\breviewed\b\s*\)?|\(?\s*\bpreliminary\b\s*\)?", " ", t)
+    # a month with no year ("Six Months Ended June 30") names the period too
+    t = re.sub(r"(?i)\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b", " ", t)
     # a trailing footnote marker ("2Q26 Amount a", "Amount (b)", "Amount*") is
     # not part of the column's name — "Amount a" and "Amount" are one kind
     t = re.sub(r"(?:\s+\(?[a-z]\)?|\s*\*+)$", "", re.sub(r"\s+", " ", t).strip(" ,"))
@@ -944,10 +1028,20 @@ def period_from_heading(heading: str, fallback: str = "") -> dict:
     low = h.lower()
     # run #28 (TSM): change columns ("YoY Inc. (Dec.) %", "QoQ", "% change")
     # are not periods — never a current or year-ago figure
-    if re.search(r"(?i)\b(?:yoy|qoq|y/y|q/q)\b|inc\.?\s*\(dec\.?\)|\bincrease\s*\(decrease\)|%\s*change|\bchange\b\s*%?$", h):
+    # "change" anywhere: "2Q26 Change 1Q26", "Percentage Change Y/Y"; and a
+    # growth column ("Growth in DKK", "Growth at CER") (2026-10-11)
+    if re.search(r"(?i)\b(?:yoy|qoq|y/y|q/q)\b|inc\.?\s*\(dec\.?\)|\bincrease\s*\(decrease\)|%\s*change|\bchange\b|\bgrowth\b|"
+                 r"\bo/\(u\)", h):     # "$ O/(U)": over/(under) the period named above it
         return {"period": "change", "label": h, "ended": ""}
     # compact quarter labels: "2Q26", "Q3 2026", "3Q FY26" -> a quarter with a
     # quarter-end date, so the newest column and its year-ago are known
+    # "1Q (2026/4-6)": a quarter printed with its calendar months (Japanese filers)
+    mq = re.search(r"\b[1-4]Q\s*\((\d{4})/(\d{1,2})-(\d{1,2})\)", h)
+    if mq:
+        y, m1, m2 = int(mq.group(1)), int(mq.group(2)), int(mq.group(3))
+        y += 1 if m2 < m1 else 0
+        last = (31, 29 if y % 4 == 0 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)[m2 - 1]
+        return {"period": "quarter", "label": h, "ended": f"{_MONTH_NAMES[m2 - 1]} {last}, {y}"}
     cq = re.search(r"(?i)\b([1-4])Q\s?(?:FY\s?)?'?(\d{2}|\d{4})\b|\bQ([1-4])\s?(?:FY\s?)?'?(\d{2}|\d{4})\b", h)
     if cq:
         qn = int(cq.group(1) or cq.group(3))
@@ -979,6 +1073,10 @@ def period_from_heading(heading: str, fallback: str = "") -> dict:
             period = "annual"; break
     if not period and fallback:
         period = period_from_heading(fallback)["period"] if not fallback.startswith(("quarter", "YTD", "annual", "ttm")) else fallback
+    when = ended.group(0) if ended else ""
+    dmy = re.match(r"(\d{1,2})\s+([A-Za-z]+)\.?,?\s+(\d{4})$", when)
+    if dmy:
+        when = f"{dmy.group(2)} {int(dmy.group(1))}, {dmy.group(3)}"      # one form downstream: "June 30, 2026"
     if not period and ended:
-        period = f"period ended {ended.group(0)}"
-    return {"period": period or "unstated", "label": h, "ended": ended.group(0) if ended else ""}
+        period = f"period ended {when}"
+    return {"period": period or "unstated", "label": h, "ended": when}

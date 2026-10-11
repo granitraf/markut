@@ -32,6 +32,7 @@ class DebateState(TypedDict):
     profile: dict            # business, archetype, segments, company_kpis, accounting_flags, sources
     profile_gaps: list       # COVERAGE GAP lines the profile check recorded
     profiled_text: str       # the section text the profiler read (research never retrieves it again)
+    profiled_sections: list  # [{name, filing_date, text}] — each section read, so a profile figure keeps its source (after run #29)
     filing_fingerprint: str  # accession numbers of the latest 10-K / 10-Q / earnings 8-K (cache key)
     profile_sources: list    # the sections the profile was read from (shown in the packet)
     profile_cached: bool     # True when the profile came from the cache (no extraction, no call)

@@ -149,7 +149,20 @@ window.Markut = (function () {
     }
     return svg + "</svg>";
   }
-  function leanHtml(lean, cons, comparison) {
+  // after run #29: what the analyst number means, and how the lean was reached
+  function consensusNote(cons) {
+    if (!cons || typeof cons.mean !== "number") return "";
+    const stops = { 1: "strong buy", 2: "buy", 3: "hold", 4: "sell", 5: "strong sell" }, m = cons.mean;
+    const clamp = (x) => Math.min(5, Math.max(1, x));
+    const where = Math.abs(m - Math.round(m)) < 0.05 ? `exactly ${stops[clamp(Math.round(m))]}` : `between ${stops[clamp(Math.floor(m))]} and ${stops[clamp(Math.ceil(m))]}`;
+    return `${m} is ${cons.n ? `the average of ${cons.n} analysts' ratings` : "the analysts' average rating"}, ${where}, on a scale where 1 = strong buy, 2 = buy, 3 = hold, 4 = sell, 5 = strong sell`;
+  }
+  function rulingsHtml(r) {
+    if (!r || !r.tally) return "";
+    const per = (r.questions || []).map((q) => `${esc(q.id)} ${esc(q.side || "")}${q.confidence === "low" ? " (low)" : ""}`).join(" · ");
+    return `<p class="rul">Question rulings: <b>bull ${r.tally.bull || 0} · bear ${r.tally.bear || 0} · neither ${r.tally.neither || 0}</b>${per ? ` <span class="rul-q">— ${per}</span>` : ""}</p>`;
+  }
+  function leanHtml(lean, cons, comparison, rulings, note) {
     if (!lean) return "";
     const withheld = !lean.lean && lean.withheld;
     if (!withheld && LEANS.indexOf(lean.lean) < 0) return "";
@@ -162,8 +175,11 @@ window.Markut = (function () {
          <p class="lean-r">The evidence could not support a lean: ${esc(lean.withheld)}.</p>`
       : `<div class="lean-head"><span class="lean-k">lean</span> <b class="lean-v ${side}">${esc(lean.lean.replace(/_/g, " "))}</b>${lean.confidence ? ` <span class="lean-c">${esc(lean.confidence)} confidence</span>` : ""}</div>
          ${lean.reason ? `<p class="lean-r">${esc(lean.reason)}</p>` : ""}`;
+    const cnote = note || consensusNote(cons);
     return `<div class="lean${withheld ? " withheld" : ""}">${head}
+      ${rulingsHtml(rulings)}
       <div class="scale">${scaleSvg(p, a, mean, (cons && cons.counts) || null)}</div>
+      ${cnote ? `<p class="cnote">Analyst rating: ${esc(cnote)}.</p>` : ""}
       ${comparison ? `<p class="cmp">${esc(comparison)}</p>` : ""}
       ${cons && cons.target_mean && cons.price ? `<p class="tgt">Analyst mean price target $${Number(cons.target_mean).toFixed(2)} vs price $${Number(cons.price).toFixed(2)}. Ratings and price targets were kept out of the debate${withheld ? "." : ", so the lean was formed without them."}</p>` : ""}
     </div>`;
@@ -185,7 +201,7 @@ window.Markut = (function () {
      long ones take the full row and wrap. Everything after the market lines (filings, news) stays
      collapsed as text. */
   const FLAG_LABELS = { upheld: "flag upheld", overturned: "flag overturned", unresolved: "unresolved" };
-  const WRAP_SECTIONS = /^(PROFILE|KEY QUESTIONS|WHAT WOULD MISLEAD|COVERAGE GAPS)$/;
+  const WRAP_SECTIONS = /^(PROFILE|KEY QUESTIONS|EVIDENCE QUALITY|WHAT WOULD MISLEAD|COVERAGE GAPS)$/;
   // A value longer than this is a sentence ("Total net sales: 109,417 million
   // (quarter, …) vs …"), not a figure: it takes the full row and wraps. Short
   // figures stay on one line. A section where a third of the values are long
@@ -370,7 +386,8 @@ window.Markut = (function () {
         clearPending();
         const s = d.stats || {}; const tagged = taggedNumbers(d.verdict);
         return card("review", `<h3><span class="who">governed verdict</span> <span class="pill">${esc(s.status || "")}</span>${d.budget_exceeded ? ' <span class="pill live">budget exceeded</span>' : ""}</h3>
-          ${leanHtml(d.lean, d.consensus, d.comparison)}
+          ${leanHtml(d.lean, d.consensus, d.comparison, d.rulings, d.consensus_note)}
+          ${d.quality ? `<p class="qual"><b>Evidence:</b> ${esc(d.quality)}</p>` : ""}
           <div class="verdict">${verdictHtml(d.verdict)}</div>
           ${sourcesHtml((d.report || {}).sources)}
           ${kvs([["claims", num(s.claims)], ["cited", num(s.cited)], ["flagged", num(s.flagged)], ["derived", num(s.derived)], ["labeled", num(s.labeled)], ["annotated", num(s.annotated)]])}

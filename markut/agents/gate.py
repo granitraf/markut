@@ -8,6 +8,8 @@ told before it writes, and its lean is overridden after, whatever it returns.
   no SEC filings read                 -> no lean (the reason is shown)
   fewer than 2 of 5 questions covered -> no lean
   exactly 2 covered                   -> a lean, confidence capped at low
+  a suspect or disputed figure        -> a lean, confidence capped at low
+                                         (after run #29: the [EVIDENCE QUALITY] block)
 """
 import re
 
@@ -38,9 +40,20 @@ def lean_gate(state: dict) -> dict:
         if covered < LEAN_MIN_COVERED:
             return {"allowed": False, "cap": None,
                     "reason": f"only {covered} of {total} key questions have current-period evidence in the filings"}
-        if covered == LEAN_LOW_CAP_AT:
-            return {"allowed": True, "cap": "low",
-                    "reason": f"only {covered} of {total} key questions have current-period evidence in the filings"}
+    reasons = []
+    if cov and sum(1 for v in cov.values() if v) == LEAN_LOW_CAP_AT:
+        reasons.append(f"only {LEAN_LOW_CAP_AT} of {len(cov)} key questions have current-period evidence in the filings")
+    # after run #29: a figure the code found out of range, or a filing and a
+    # provider figure that disagree, may sit under the lean — not at medium/high
+    from markut.evidence.quality import quality_flags
+    q = quality_flags((state or {}).get("evidence", ""))
+    if q["suspect"] or q["disputed"]:
+        found = " and ".join(p for p in (f"{q['suspect']} suspect" if q["suspect"] else "",
+                                         f"{q['disputed']} disputed" if q["disputed"] else "") if p)
+        reasons.append(f"the evidence check found {found} figure{'s' if q['suspect'] + q['disputed'] != 1 else ''}"
+                       + (f" ({'; '.join(q['items'][:3])})" if q["items"] else ""))
+    if reasons:
+        return {"allowed": True, "cap": "low", "reason": "; ".join(reasons)}
     return {"allowed": True, "cap": None, "reason": ""}
 
 

@@ -620,7 +620,8 @@ def strip_inline_anchors(text: str) -> tuple:
 
 # packet sections whose text is written by a model or describes the packet
 # itself: a figure there is not a source for anything
-_NOT_SOURCES = ("PROFILE", "KEY QUESTIONS", "WHAT WOULD MISLEAD", "COVERAGE GAPS", "DATA GAPS")
+_NOT_SOURCES = ("PROFILE", "KEY QUESTIONS", "WHAT WOULD MISLEAD", "COVERAGE GAPS", "DATA GAPS",
+                "EVIDENCE QUALITY")   # describes the packet (after run #29); its figures repeat or question the data
 _NOT_DATA_LINE = re.compile(r"could not find:|KPI value not found|^-?\s*COVERAGE GAP|\(limitation:", re.IGNORECASE)
 
 

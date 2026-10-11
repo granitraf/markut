@@ -68,7 +68,8 @@ def filing_set(ticker: str) -> dict:
         for doc in current:
             if floor and doc["filing_date"] < floor:
                 break
-            kind = filers.classify_current_report(" ".join(t for _, t, _ in _filing_docs(doc, text_only=True)))
+            texts = [t for _, t, _ in _filing_docs(doc, text_only=True)]
+            kind = filers.classify_current_report(" ".join(texts), docs=texts)
             doc["report_kind"] = kind
             if kind == "quarterly_results" and earnings is None:
                 earnings = doc
@@ -778,3 +779,31 @@ def guidance_sources(fs: dict, transcripts: list = None) -> list:
         sources.append({"label": q["form"], "text": doc_text(q, keep_tables=True), "form": q["form"],
                         "filing_date": q["filing_date"], "url": q["url"], "kind": "text"})
     return sources
+
+
+
+def current_docs(fs: dict) -> list:
+    """The CURRENT filings' text for the full-text search (run #29): the
+    interim report, the results release's text exhibits and the monthly
+    revenue reports — [{"form","name","filing_date","url","text"}]."""
+    out = []
+    q = fs.get("10-Q")
+    if q:
+        try:
+            out.append({"form": q["form"], "name": q.get("primary_doc", q["form"]), "filing_date": q["filing_date"],
+                        "url": q["url"], "text": doc_text(q)})
+        except Exception as e:
+            print(f"SECTIONS: interim text unavailable for the full-text search ({e})")
+    if fs.get("8-K"):
+        try:
+            for exh in exhibits_of(fs["8-K"]):
+                if not exh["image_only"]:
+                    out.append({"form": exh["form"], "name": exh["name"], "filing_date": exh["filing_date"], "url": exh["url"], "text": exh["text"]})
+        except Exception as e:
+            print(f"SECTIONS: release text unavailable for the full-text search ({e})")
+    for m in fs.get("monthly") or []:
+        try:
+            out.append({"form": m["form"], "name": m.get("primary_doc", m["form"]), "filing_date": m["filing_date"], "url": m["url"], "text": doc_text(m)})
+        except Exception:
+            pass
+    return out

@@ -111,11 +111,37 @@ def compare_lean(lean, consensus, withheld: bool = False) -> str:
     if not consensus or analyst_position(consensus.get("mean")) is None:
         return "No analyst consensus was available to compare with the debate's lean."
     a = analyst_position(consensus["mean"])
-    who = (f"the analyst consensus ({consensus['mean']:g}, {consensus.get('label') or analyst_label(consensus['mean'])}"
-           + (f", {consensus['n']} analysts" if consensus.get("n") else "") + ")")
+    # after run #29: the number says where it sits; the scale itself is
+    # defined once, in the caption under the graphic (explain_consensus)
+    who = (f"the analyst consensus ({consensus['mean']:g}, {_where(consensus['mean'])}"
+           + (f"; {consensus['n']} analysts" if consensus.get("n") else "") + ")")
     diff = p - a
     if abs(diff) <= 0.125:
         return f"The debate's lean is in line with {who}."
     side = "constructive" if diff > 0 else "cautious"
     much = "much " if abs(diff) >= 0.5 else ""
     return f"The debate leans {much}more {side} than {who}."
+
+
+
+def _where(mean) -> str:
+    """'between strong buy and buy' / 'exactly hold' on the 1-5 scale."""
+    import math
+    m = float(mean)
+    stops = {1: "strong buy", 2: "buy", 3: "hold", 4: "sell", 5: "strong sell"}
+    if abs(m - round(m)) < 0.05:
+        return f"exactly {stops[min(5, max(1, round(m)))]}"
+    return f"between {stops[min(5, max(1, math.floor(m)))]} and {stops[min(5, max(1, math.ceil(m)))]}"
+
+
+def explain_consensus(consensus) -> str:
+    """PURE. What the analyst number means (after run #29: '1.38' alone
+    read as nothing): where it sits on the provider's 1-5 scale, lower is
+    more bullish."""
+    if not consensus or consensus.get("mean") is None:
+        return ""
+    mean = float(consensus["mean"])
+    where = _where(mean)
+    n = consensus.get("n")
+    who = f"the average of {n} analysts' ratings" if n else "the analysts' average rating"
+    return f"{mean:g} is {who}, {where}, on a scale where 1 = strong buy, 2 = buy, 3 = hold, 4 = sell, 5 = strong sell"

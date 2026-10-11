@@ -66,16 +66,27 @@ def role_of(form: str) -> str:
 _MONTHS = r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
 _MONTHLY_RE = re.compile(r"(?i)\b(?:net )?revenues? for " + _MONTHS + r"\b|\brevenue report\b|\bmonthly (?:net )?revenues?\b|"
                          r"\b" + _MONTHS + r" \d{4} revenues?\b")
-_QUARTER_RE = re.compile(r"(?i)\b(?:first|second|third|fourth) quarter\b|\b[1-4]Q\s?\d{2}\b|\bQ[1-4]\b|\bthree months ended\b|\bquarter ended\b")
+_QUARTER_RE = re.compile(r"(?i)\b(?:first|second|third|fourth)[- ]quarter\b|\b[1-4]Q\s?\d{2}\b|\bQ[1-4]\b|\bthree months ended\b|\bquarter ended\b")
 _RESULTS_RE = re.compile(r"(?i)\b(?:net )?revenues?\b|\bnet (?:income|sales|profit|earnings)\b|\bearnings per (?:share|ADS|ADR)\b|\bgross margin\b|\bEPS\b")
+# a results release in any industry's words — a miner leads with margins, free
+# cash flow and adjusted earnings (2026-10-11) — counted only under a
+# "reports … results" headline, so an operational update is not the release
+_RESULTS_WIDE_RE = re.compile(r"(?i)\bmargins?\b|\bfree cash flow\b|\b(?:operating )?cash flows?\b|\badjusted (?:net )?(?:earnings|income)\b|"
+                              r"\bEBITDA\b|\boperating (?:income|profit|earnings)\b")
 _ANNOUNCE_RE = re.compile(r"(?i)\breports?\b|\bannounced\b|\bresults\b|\btoday\b")
 _INTERIM_FS_RE = re.compile(r"(?i)\b(?:condensed |interim )?consolidated (?:interim )?(?:financial statements|balance sheets?)\b|"
                             r"\bindependent auditors?['’]? review report\b|\breview report of independent\b|"
                             r"\bmanagement['’]s discussion and analysis\b|\binterim report\b")
+# an interim report names its statements as a heading with the period after
+# it, or names them again and again; a release mentions them once in passing
+# (2026-10-11: a rating note and a loan refinancing took the interim slot)
+_INTERIM_TITLE_RE = re.compile("(?:" + _INTERIM_FS_RE.pattern[4:] + ")" + r".{0,40}?(?:for the (?:three|six|nine|twelve|first|second|third|fourth)\b|"
+                               r"\b(?:three|six|nine) months\b|\bquarter ended\b|\bperiod ended\b|\bas (?:of|at)\b)", re.I)
+INTERIM_LONG_CHARS = 20000       # an interim report runs to tens of pages; the press releases that mention one do not
 _FIGURE_RE = re.compile(r"\d[\d,]*(?:\.\d+)?\s?(?:%|percent|billion|million|thousand)|[$€£¥]\s?\d|NT\$\s?\d|[A-Z]{2}\$\s?\d")
 
 
-def classify_current_report(text: str) -> str:
+def classify_current_report(text: str, docs: list = None) -> str:
     """PURE. What a 6-K (or an 8-K without item codes) carries:
     monthly_revenue | interim_report | quarterly_results | other.
     Monthly revenue is checked first (its text names a month and revenue);
@@ -95,8 +106,19 @@ def classify_current_report(text: str) -> str:
     if re.search(r"(?i)\bresolutions?\b|\bboard of directors meeting\b", head[:2500]) and results_terms < 10:
         return "other"
     headline = re.search(r"(?i)\breports?\b.{0,80}\bresults\b|\bannounced\b.{0,120}\bresults\b|\breports?\b.{0,60}\bquarter\b", head[:2500])
-    quarterly = bool(_QUARTER_RE.search(head) and (results_terms >= 4 or (results_terms >= 2 and headline)))
-    if _INTERIM_FS_RE.search(head) and not (quarterly and re.search(r"(?i)\btoday announced\b|\breports? (?:first|second|third|fourth|q[1-4])", head)):
+    wide = results_terms + (len(_RESULTS_WIDE_RE.findall(head)) if headline else 0)
+    quarterly = bool(_QUARTER_RE.search(head) and (results_terms >= 4 or (wide >= 2 and headline)))
+    # the title opens its own document (an exhibit) — a footnote naming "the
+    # condensed consolidated balance sheet as at June 30" deep in a release
+    # is not a title (2026-10-11); `docs` are the filing's documents
+    openings = [re.sub(r"\s+", " ", d or "")[:400] for d in (docs or [t])]
+    interim = len(_INTERIM_FS_RE.findall(t)) >= 3 or any(_INTERIM_TITLE_RE.search(o) for o in openings)
+    if interim and not (quarterly and re.search(r"(?i)\btoday announced\b|\breports? (?:first|second|third|fourth|q[1-4])", head)):
+        return "interim_report"
+    # a long document naming its statements once — a whole report in one file
+    # behind the SEC cover page — is the interim report unless it is headlined
+    # as a results release; the short notes that mention them are not
+    if len(t) >= INTERIM_LONG_CHARS and _INTERIM_FS_RE.search(t) and not (quarterly and headline):
         return "interim_report"
     if quarterly and _ANNOUNCE_RE.search(head):
         return "quarterly_results"

@@ -42,7 +42,7 @@ def initial_state(ticker: str, max_rounds: int) -> dict:
         "targeted_news_evidence": "", "news_checked": False,
         "claim_verification": {}, "judge_decision": {},
         "budget_exceeded": False, "review_report": {},
-        "profile": {}, "profile_gaps": [], "profiled_text": "", "filing_fingerprint": "",
+        "profile": {}, "profile_gaps": [], "profiled_text": "", "profiled_sections": [], "filing_fingerprint": "",
         "profile_sources": [], "profile_cached": False, "plan_cached": False,
         "plan": {}, "market_evidence": "", "research_pass": 0, "coverage": {}, "uncovered": [],
     }
@@ -177,8 +177,19 @@ def event_for(node: str, update: dict, before: dict, after: dict) -> dict:
         if not lean and decision.get("lean_withheld"):
             # run #28: no lean, said plainly — never a blank
             lean = {"lean": None, "confidence": None, "reason": "", "withheld": decision["lean_withheld"]}
+        # after run #29: the five question rulings, tallied, so a lean (or no
+        # lean) shows how it was reached
+        qs = [q for q in decision.get("questions") or [] if isinstance(q, dict) and q.get("id")]
+        rulings = ({"tally": {side: sum(1 for q in qs if q.get("stronger_side") == side) for side in ("bull", "bear", "neither")},
+                    "questions": [{"id": q["id"], "side": q.get("stronger_side", ""), "confidence": q.get("confidence", "")} for q in qs]}
+                   if qs else None)
+        # after run #29: how complete and consistent the packet under the
+        # verdict was, from its [EVIDENCE QUALITY] block ('' for older runs)
+        from markut.evidence.quality import quality_summary
         return {"event": "review", "data": {
             "lean": lean,
+            "rulings": rulings,
+            "quality": quality_summary((before or {}).get("evidence") or ""),
             "verdict": update.get("verdict", ""),
             "report": report,
             "stats": review_stats(before["verdict"], before["evidence"],
@@ -295,6 +306,8 @@ def stream_debate(ticker: str, max_rounds: int = None, app=None, check_sec: bool
                     lean = event["data"].get("lean") or {}
                     event["data"]["consensus"] = consensus
                     event["data"]["comparison"] = compare_lean(lean.get("lean"), consensus, withheld=bool(lean.get("withheld")))
+                    from markut.evidence.consensus import explain_consensus
+                    event["data"]["consensus_note"] = explain_consensus(consensus)
                 yield stamp(event, used)
                 if node == "research":
                     # mirror of coverage_route on the same state: the gate's ruling, reported

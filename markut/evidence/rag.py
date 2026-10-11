@@ -756,6 +756,7 @@ def get_filings_evidence(ticker: str, plan: dict = None, profile: dict = None, p
     except Exception as e:
         lines.append(f"[source header unavailable: {e}]")
 
+    core = {}
     # CORE FIGURES first: income, KPI table, segments, cash flow, KPI values,
     # derived metrics — by table structure, independent of the questions
     try:
@@ -768,7 +769,8 @@ def get_filings_evidence(ticker: str, plan: dict = None, profile: dict = None, p
         lines += ["", "[CORE FIGURES]", f"[core extraction unavailable: {e}]"]
     if plan and plan.get("key_questions"):
         try:
-            qlines = question_blocks(coll, plan, profile or {}, profiled_text or "", relaxed=relaxed_questions or [])
+            qlines = question_blocks(coll, plan, profile or {}, profiled_text or "", relaxed=relaxed_questions or [],
+                                     sweep_docs=secs.current_docs(fs), known_kpis=(core or {}).get("kpi_values") or {})
         except Exception as e:
             qlines = [f"[question evidence unavailable: {e}]"]
         lines.append("")
