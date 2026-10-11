@@ -156,7 +156,9 @@ window.Markut = (function () {
         const label = sec.name.toLowerCase() + (sec.intro ? " · " + sec.intro : "") + (n ? ` · ${n} line${n === 1 ? "" : "s"}` : "");
         return `<details class="pt pk-text"><summary>${esc(label)}</summary><pre class="evidence">${esc(body)}</pre></details>`;
       }
-      let h = `<div class="pk ${wrap ? "wrap" : ""}"><div class="pkh">${esc(sec.name.toLowerCase())}</div>`;
+      // "pk1" (one column), never "wrap": every page's outer container is .wrap,
+      // and the console's .wrap rule padded each such section by 40vh (run #27)
+      let h = `<div class="pk ${wrap ? "pk1" : ""}"><div class="pkh">${esc(sec.name.toLowerCase())}</div>`;
       if (kv.length) h += `<div class="pkg">` + kv.map((r) => `<div class="pkr${isLong(r) ? " long" : ""}"><span class="pkk">${esc(r.k)}</span><span class="pkv">${esc(r.v)}</span></div>`).join("") + `</div>`;
       if (sec.scenarios.length) {
         const cols = sec.scenarios[0].cells.map((c) => c.name);           // p25 / median / p75, or 0.8x fwd / fwd / 1.2x fwd

@@ -202,3 +202,58 @@ def test_report_endpoint_serves_pdf_attachment():
     assert r.headers["content-disposition"] == 'attachment; filename="markut-NVDA-2026-07-17.pdf"'
     assert r.content.startswith(b"%PDF-")
     assert client.get("/api/runs/999/report.pdf").status_code == 404
+
+
+# ---------------------------------------------------------------- shared renderer vs page layout classes
+def _class_tokens_from_js(src: str) -> set:
+    """Every class token the renderer can emit: the literal words inside
+    class="…" attributes, including string literals inside ${…} expressions
+    (class="pk ${wide ? "x" : ""}" emits both pk and x). An attribute never
+    spans lines; comment lines are skipped."""
+    import re
+    tokens = set()
+    for line in src.splitlines():
+        if line.strip().startswith(("//", "/*", "*")):
+            continue
+        i = 0
+        while True:
+            i = line.find('class="', i)
+            if i < 0:
+                break
+            j, depth, buf = i + len('class="'), 0, []
+            while j < len(line):
+                if line.startswith("${", j):
+                    depth += 1; buf.append("${"); j += 2; continue
+                ch = line[j]
+                if depth and ch == "}":
+                    depth -= 1
+                elif not depth and ch == '"':
+                    break
+                buf.append(ch); j += 1
+            body = "".join(buf)
+            literals = lambda m: " ".join(re.findall(r'"([^"]*)"', m.group(0)))
+            tokens |= set(re.findall(r"[A-Za-z][\w-]*", re.sub(r"\$\{[^}]*\}", literals, body)))
+            i = j + 1
+    return tokens
+
+
+def test_renderer_never_emits_a_page_layout_class():
+    # run #27: packet sections were tagged "wrap", which is also each page's
+    # outer container class — the console's unscoped .wrap rule (40vh bottom
+    # padding, min-height 100vh) put hundreds of pixels of empty space under
+    # every one-column packet section. A page that renders the timeline may
+    # style renderer classes only through a scoped selector ("article .md",
+    # ".out .card"); an unscoped rule on a renderer class leaks into the cards.
+    import os, re
+    static = os.path.join(os.path.dirname(__file__), "..", "markut", "web", "static")
+    emitted = _class_tokens_from_js(open(os.path.join(static, "debate.js")).read())
+    for page in ("console.html", "public.html", "library.html"):
+        html = open(os.path.join(static, page)).read()
+        if "debate.js" not in html:
+            continue                      # the page never renders cards
+        style = "\n".join(re.findall(r"(?s)<style>(.*?)</style>", html))
+        for rule in re.findall(r"([^{}]+)\{", style):
+            for sel in rule.split(","):
+                lead = re.match(r"\s*\.([A-Za-z][\w-]*)", sel)
+                assert not (lead and lead.group(1) in emitted), \
+                    f"{page} styles .{lead.group(1)} unscoped ({sel.strip()!r}), and debate.js emits that class inside cards"
