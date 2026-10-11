@@ -188,7 +188,7 @@ def stream_debate(ticker: str, max_rounds: int = None, app=None, check_sec: bool
     if max_rounds is None:
         max_rounds = config.DEFAULT_MAX_ROUNDS
     if max_rounds < config.MIN_ROUNDS:
-        print(f"ROUNDS: {max_rounds} requested — every debate runs at least {config.MIN_ROUNDS} (a rebuttal needs a second round)")
+        print(f"ROUNDS: {max_rounds} requested — every debate runs at least {config.MIN_ROUNDS}")
         max_rounds = config.MIN_ROUNDS
     try:
         ticker = validate_ticker(ticker)      # layer 1: shape

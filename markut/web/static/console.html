@@ -81,7 +81,7 @@
 
   const HINTS = {
     ticker: () => `input a ticker symbol`,
-    rounds: () => `debate rounds: 2 (default) or 3 — Enter for 2`,
+    rounds: () => `debate rounds: 1, 2 (default) or 3 — Enter for 2`,
     confirm: () => `to start stock analysis, confirm with <span class="green">run debate</span>`,
     running: () => `debate in progress — output below`,
   };
@@ -171,7 +171,8 @@
     }
     if (step === "rounds") {
       const n = text === "" ? 2 : Number(text);
-      if (!Number.isInteger(n) || n < 2 || n > 3) return println("rounds must be 2 or 3 — every debate has at least one rebuttal round", "err");
+      // 1, 2 or 3 (2026-10-10): one round is the opening cases and a ruling, no rebuttal
+      if (!Number.isInteger(n) || n < 1 || n > 3) return println("rounds must be 1, 2 or 3 — one round has no rebuttal", "err");
       rounds = n; println(`${n} round${n === 1 ? "" : "s"}`, "dim"); return setStep("confirm");
     }
     if (step === "confirm") {

@@ -33,7 +33,7 @@ token budget, deterministic output review). Research, not financial advice.
    source, date, period, basis, segment; each chunk used once), adds general
    evidence, the generic guidance scan, market data and news, then a
    count-only **coverage gate** loops back once for uncovered questions.
-4. **Bull ↔ Bear** argue Q1–Q5 (at least two rounds), the **Judge** rules per
+4. **Bull ↔ Bear** argue Q1–Q5 (1–3 rounds, default two), the **Judge** rules per
    question and overall, **claim review** re-audits flagged claims (flag
    upheld / overturned / unresolved), and the **governor** traces every number.
 

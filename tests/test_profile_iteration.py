@@ -320,18 +320,23 @@ def test_fcf_from_quarters_and_same_eps_field():
 
 
 # ---------------------------------------------------------------- rounds, turn ids, token log, cache, store text
-def test_two_rounds_minimum_and_turn_ids():
+def test_rounds_floor_at_one_and_turn_ids():
+    # 2026-10-10: the user chose 1, 2 or 3 rounds (one round = opening cases
+    # and a ruling, no rebuttal). One round passes through; zero floors to one.
     from markut.web import events as ev
+    seen = []
     class App:
         def stream(self, state, stream_mode):
-            assert state["max_rounds"] == 2
+            seen.append(state["max_rounds"])
             yield {"research": {"evidence": "e", "coverage": {}, "research_pass": 1}}
     saved = dict(llm.TOKENS)
     try:
         events = list(ev.stream_debate("abc", max_rounds=1, app=App(), check_sec=False))
+        zero = list(ev.stream_debate("abc", max_rounds=0, app=App(), check_sec=False))
     finally:
         llm.TOKENS.update(saved)
-    assert events[0]["data"]["max_rounds"] == 2 and config.MIN_ROUNDS == 2
+    assert events[0]["data"]["max_rounds"] == 1 and config.MIN_ROUNDS == 1 and seen[0] == 1
+    assert zero[0]["data"]["max_rounds"] == 1 and seen[1] == 1
     ids = [e["data"]["turn_id"] for e in events]
     assert len(set(ids)) == len(ids) and events[-1]["data"]["by_node"] == {"research": {"calls": 0, "input": 0, "output": 0, "cache_write": 0, "cache_read": 0}}
     assert [e["event"] for e in events] == ["start", "research", "coverage", "done"]

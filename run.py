@@ -14,7 +14,7 @@ def main():
     parser = argparse.ArgumentParser(description="Markut bull-vs-bear research debate")
     parser.add_argument("ticker", help="stock ticker symbol")
     parser.add_argument("--max-rounds", type=int, default=config.DEFAULT_MAX_ROUNDS,
-                        help=f"debate rounds (minimum {config.MIN_ROUNDS}: a rebuttal needs a second round)")
+                        help=f"debate rounds, 1-3 (default {config.DEFAULT_MAX_ROUNDS}; one round has no rebuttal)")
     parser.add_argument("--budget", type=int, default=config.TOKEN_BUDGET,
                         help="token budget (execution guardrail)")
     parser.add_argument("--no-log", action="store_true", help="do not store this run in the run log")

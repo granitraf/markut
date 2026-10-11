@@ -17,7 +17,7 @@ API
   GET /api/runs/{id}/report.pdf  the run as an equity-style PDF report (built from the store, <1s)
   GET /api/replay?run=ID[&speed] SSE replay of a stored run (free)
   GET /api/debate?ticker=XYZ&max_rounds=2
-                                 OPERATOR: SSE live debate (paid: 10-14 model calls; at least 2 rounds); stored when done
+                                 OPERATOR: SSE live debate (paid: about 6-14 model calls; 1-3 rounds); stored when done
 
 WHY Server-Sent Events: one plain HTTP response the browser keeps open, one
 "event: NAME / data: JSON" block per graph node. No websockets, no polling,

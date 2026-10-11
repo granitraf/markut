@@ -115,6 +115,28 @@ def test_live_stream_logs_a_fake_debate(monkeypatch):
 
 def test_live_stream_caps_rounds():
     assert client.get("/api/debate", params={"ticker": "NVDA", "max_rounds": 40}).status_code == 422
+    assert client.get("/api/debate", params={"ticker": "NVDA", "max_rounds": 0}).status_code == 422
+
+
+def test_live_stream_accepts_one_round(monkeypatch):
+    # 2026-10-10: 1, 2 or 3 rounds — one round is a valid request end to end
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "test-key")
+    asked = []
+    def fake_stream(ticker, max_rounds):
+        asked.append(max_rounds)
+        yield {"event": "start", "data": {"ticker": ticker, "max_rounds": max_rounds, "model": "m"}}
+        yield {"event": "done", "data": {"rounds": 1, "converged": False, "budget_exceeded": False, "usage": {"calls": 1, "input": 2, "output": 3}}}
+    monkeypatch.setattr(app_mod.ev, "stream_debate", fake_stream)
+    r = client.get("/api/debate", params={"ticker": "aapl", "max_rounds": 1})
+    assert r.status_code == 200 and asked == [1]
+
+
+def test_console_offers_one_two_or_three_rounds():
+    import os, re
+    html = open(os.path.join(os.path.dirname(__file__), "..", "markut", "web", "static", "console.html")).read()
+    check = re.search(r"n < (\d) \|\| n > (\d)", html)
+    assert check and check.groups() == ("1", "3"), "the console's rounds step must accept 1, 2 or 3"
+    assert "1, 2 (default) or 3" in html
 
 
 # ---------------------------------------------------------------- operator gate

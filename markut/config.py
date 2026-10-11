@@ -63,9 +63,11 @@ RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 TOKEN_BUDGET = 300_000
 
 DEFAULT_MAX_ROUNDS = 2
-# every ticker gets at least two rounds: a one-round debate has no rebuttal,
-# so the judge never sees either side answer the other
-MIN_ROUNDS = 2
+# 1, 2 or 3 rounds (the user's choice, 2026-10-10; the floor was 2 from the
+# runs #10/#11 bug pass). One round = both opening cases and one ruling, no
+# rebuttal: cheaper, but the judge never sees either side answer the other —
+# which is why the default stays at two.
+MIN_ROUNDS = 1
 
 # ---- profiler / planner / research (the understand-the-company-first pass) ----
 # token caps for the four filing sections the profiler reads (4 chars/token)
