@@ -223,48 +223,52 @@ def parse_packet(evidence: str) -> tuple:
 
 # ---------------------------------------------------------------- lean scale (2026-10-11)
 def lean_scale_drawing(lean: dict, consensus: dict, width: float):
-    """The debate's lean and the analyst consensus on one five-point line:
-    bearish / strong sell on the left, bullish / strong buy on the right.
-    Our marker sits on the line; the analysts' marker below it, with their
-    rating spread as a bar. Either half may be missing."""
-    from reportlab.graphics.shapes import Circle, Drawing, Line, Polygon, Rect, String
+    """The debate's lean and the analyst consensus on one five-point scale:
+    a red-to-green track from strongly bearish / strong sell to strongly
+    bullish / strong buy, the debate's marker on it, the analysts' marker
+    below it, and their rating spread as a bar. A withheld lean draws no
+    debate marker and says so (run #28). Either half may be missing."""
+    from reportlab.graphics.shapes import Circle, Drawing, Polygon, Rect, String
     from markut.evidence.consensus import ANALYST_STOPS, LEAN_LABELS, LEANS, analyst_position, lean_position
-    pad, h = 34.0, 96.0
+    shades = ["#c0392b", "#e08a7e", "#9a978f", "#6fbf8f", "#1f8a4c"]
+    counts = (consensus or {}).get("counts") or {}
+    total = sum(counts.values()) if counts else 0
+    pad, h = 40.0, 124.0 if total else 98.0
     d = Drawing(width, h)
     x = lambda pos: pad + pos * (width - 2 * pad)
-    y_track = 62
-    d.add(Line(pad, y_track, width - pad, y_track, strokeColor=LINE, strokeWidth=1.2))
+    y_bar = h - 34                                   # the track
+    seg = (width - 2 * pad) / 5
+    for i, shade in enumerate(shades):
+        d.add(Rect(pad - (5 if i == 0 else 0) + i * seg, y_bar - 4, seg + (5 if i in (0, 4) else 0), 8,
+                   fillColor=colors.HexColor(shade), strokeColor=None))
     for i, key in enumerate(LEANS):
-        xi = x(i / 4)
-        d.add(Line(xi, y_track - 3, xi, y_track + 3, strokeColor=LINE, strokeWidth=1))
-        d.add(String(xi, y_track + 9, LEAN_LABELS[key], fontName="Mono", fontSize=6.6, fillColor=MUTED, textAnchor="middle"))
-        d.add(String(xi, y_track - 16, ANALYST_STOPS[i], fontName="Mono", fontSize=6.6, fillColor=MUTED, textAnchor="middle"))
+        d.add(String(x(i / 4), y_bar + 13, LEAN_LABELS[key], fontName="Mono", fontSize=6.8, fillColor=MUTED, textAnchor="middle"))
+        d.add(String(x(i / 4), y_bar - 40, ANALYST_STOPS[i], fontName="Mono", fontSize=6.8, fillColor=MUTED, textAnchor="middle"))
     p = lean_position((lean or {}).get("lean"))
     if p is not None:
-        color = BEAR if p < 0.5 else (BULL if p > 0.5 else INK)
-        d.add(Circle(x(p), y_track, 5.5, fillColor=color, strokeColor=colors.white, strokeWidth=1))
-        d.add(String(x(p), y_track + 19, "debate", fontName="Mono-Bold", fontSize=7, fillColor=color, textAnchor="middle"))
+        color = colors.HexColor(shades[round(p * 4)])
+        d.add(Circle(x(p), y_bar, 7.5, fillColor=color, strokeColor=colors.white, strokeWidth=2))
+        d.add(String(x(p), y_bar + 23, "debate", fontName="Mono-Bold", fontSize=7.4, fillColor=color, textAnchor="middle"))
+    elif (lean or {}).get("withheld"):
+        d.add(String(width / 2, y_bar + 23, "no lean issued", fontName="Mono-Bold", fontSize=7.4, fillColor=INK, textAnchor="middle"))
     a = analyst_position((consensus or {}).get("mean"))
     if a is not None:
         xa = x(a)
-        d.add(Polygon([xa, y_track - 3, xa - 5, y_track - 11, xa + 5, y_track - 11], fillColor=JUDGE, strokeColor=JUDGE))
-        d.add(String(xa, y_track - 27, f"analysts {consensus['mean']:g}", fontName="Mono-Bold", fontSize=7, fillColor=JUDGE, textAnchor="middle"))
-        counts = consensus.get("counts") or {}
-        total = sum(counts.values()) if counts else 0
-        if total:
-            # spread bar, ordered like the line: strong sell -> strong buy
-            shades = ["#c0392b", "#e08a7e", "#b9b6ad", "#7fc29b", "#1f8a4c"]
-            cx, bar_w = pad, width - 2 * pad
-            for key, shade in zip(["strong_sell", "sell", "hold", "buy", "strong_buy"], shades):
-                w = bar_w * counts.get(key, 0) / total
-                if w > 0:
-                    d.add(Rect(cx, 14, w, 7, fillColor=colors.HexColor(shade), strokeColor=colors.white, strokeWidth=0.5))
-                cx += w
-            legend = " · ".join(f"{name} {counts.get(key, 0)}" for name, key in
-                                zip(ANALYST_STOPS, ["strong_sell", "sell", "hold", "buy", "strong_buy"]))
-            # no total here: the provider's monthly spread and its mean rating count
-            # analysts differently (AAPL: 44 vs 39) — one count is shown, in the comparison
-            d.add(String(pad, 3, "ratings this month: " + legend, fontName="Mono", fontSize=6.4, fillColor=MUTED))
+        d.add(Polygon([xa, y_bar - 6, xa - 6, y_bar - 15, xa + 6, y_bar - 15], fillColor=colors.HexColor("#8e7cc3"), strokeColor=None))
+        d.add(String(xa, y_bar - 26, f"analysts {consensus['mean']:g}", fontName="Mono-Bold", fontSize=7.2,
+                     fillColor=colors.HexColor("#8e7cc3"), textAnchor="middle"))
+    if total:
+        cx, bar_w = pad, width - 2 * pad
+        for key, shade in zip(["strong_sell", "sell", "hold", "buy", "strong_buy"], shades):
+            w = bar_w * counts.get(key, 0) / total
+            if w > 0:
+                d.add(Rect(cx, 14, w, 7, fillColor=colors.HexColor(shade), strokeColor=colors.white, strokeWidth=0.5))
+            cx += w
+        legend = " · ".join(f"{name} {counts.get(key, 0)}" for name, key in
+                            zip(ANALYST_STOPS, ["strong_sell", "sell", "hold", "buy", "strong_buy"]))
+        # no total here: the provider's monthly spread and its mean rating count
+        # analysts differently (AAPL: 44 vs 39) — one count is shown, in the comparison
+        d.add(String(pad, 3, "ratings this month: " + legend, fontName="Mono", fontSize=6.4, fillColor=MUTED))
     return d
 
 
@@ -414,6 +418,15 @@ def build_report(run: dict) -> bytes:
     # 2026-10-11: the stance first — the debate's lean on the evidence, placed
     # on a scale next to the analyst consensus the agents never saw
     lean, consensus = review.get("lean") or None, review.get("consensus") or None
+    if lean and not lean.get("lean") and lean.get("withheld"):
+        # run #28: no lean, said plainly — the analysts' marker stays for reference
+        story.append(Paragraph("<b>No lean</b> · withheld by the evidence gate", st["h2"]))
+        story.append(Paragraph("The evidence could not support a lean: " + escape(lean["withheld"]) + ".", st["verdict"]))
+        story.append(lean_scale_drawing(lean, consensus, width))
+        if review.get("comparison"):
+            story.append(Paragraph(escape(review["comparison"]), st["small"]))
+        story.append(Spacer(1, 6))
+        lean = None
     if lean:
         story.append(Paragraph(f"<b>Lean: {escape(str(lean.get('lean', '')).replace('_', ' '))}</b>"
                                + (f" · {escape(str(lean.get('confidence')))} confidence" if lean.get("confidence") else ""), st["h2"]))

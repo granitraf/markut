@@ -91,7 +91,10 @@ def review_stats(pre_verdict: str, evidence: str, final_verdict: str, report: di
     from markut.guardrails.review import _TAG_RE
     final_clean = _TAG_RE.sub("", final_verdict or "")
     claims = extract_numeric_claims(final_clean)
-    flagged = [c for c in claims if trace_claim(c, evidence or "") == "FLAGGED"]
+    # run #28: traced against DATA only — never the planner's own question text
+    from markut.guardrails.tracer import tracing_evidence
+    data = tracing_evidence(evidence or "")
+    flagged = [c for c in claims if trace_claim(c, data) == "FLAGGED"]
     pre = extract_numeric_claims(pre_verdict or "")
     resolutions = report.get("resolutions", []) or []
     return {
@@ -165,6 +168,9 @@ def event_for(node: str, update: dict, before: dict, after: dict) -> dict:
         decision = (before or {}).get("judge_decision") or {}
         lean = ({"lean": decision["lean"], "confidence": decision.get("lean_confidence"), "reason": decision.get("lean_reason", "")}
                 if decision.get("lean") else None)
+        if not lean and decision.get("lean_withheld"):
+            # run #28: no lean, said plainly — never a blank
+            lean = {"lean": None, "confidence": None, "reason": "", "withheld": decision["lean_withheld"]}
         return {"event": "review", "data": {
             "lean": lean,
             "verdict": update.get("verdict", ""),
@@ -186,6 +192,31 @@ def _usage_delta(before: dict, after: dict) -> dict:
     return {k: after.get(k, 0) - before.get(k, 0) for k in after}
 
 
+def filing_history_forms(cik: str) -> list:
+    """The forms in the company's recent SEC filing history (one free request)."""
+    from markut.evidence.edgar import get_filing_index
+    return list(get_filing_index(cik).get("form") or [])
+
+
+def sec_filer_refusal(ticker: str) -> str:
+    """'' when Markut can read this company's filings; otherwise the plain
+    reason it will not run (no model is called either way)."""
+    from markut.evidence import filers
+    try:
+        cik = ticker_to_cik(ticker)
+    except ValueError:
+        return (f"{ticker} is not an SEC filer: it is not in the SEC's company list, so there are no filings to read. "
+                "Markut needs a 10-K, 20-F or 40-F filer. Nothing was run and no model was called.")
+    try:
+        forms = filing_history_forms(cik)
+    except Exception as e:
+        return f"{ticker}: the SEC filing history could not be read ({type(e).__name__}). Nothing was run and no model was called."
+    if filers.filer_type(forms) == "no_periodic_reports":
+        return (f"{ticker} {filers.slot_reason('annual', 'no_periodic_reports', forms)[4:]}. Markut needs a 10-K, 20-F or 40-F "
+                "filer. Nothing was run and no model was called.")
+    return ""
+
+
 def stream_debate(ticker: str, max_rounds: int = None, app=None, check_sec: bool = True, consensus: dict = None):
     """Generator: validate (input guardrail layers 1-2) -> build graph ->
     stream -> yield one event per node. app= is the test seam (anything
@@ -201,11 +232,16 @@ def stream_debate(ticker: str, max_rounds: int = None, app=None, check_sec: bool
         max_rounds = config.MIN_ROUNDS
     try:
         ticker = validate_ticker(ticker)      # layer 1: shape
-        if check_sec:
-            ticker_to_cik(ticker)             # layer 2: SEC existence (free, cached)
     except ValueError as e:
         yield {"event": "error", "data": {"stage": "validation", "message": str(e)}}
         return
+    if check_sec:
+        # layer 2: an SEC filer with periodic reports (run #28 — refuse, before
+        # any paid call, a company Markut has no filings to read for)
+        refusal = sec_filer_refusal(ticker)
+        if refusal:
+            yield {"event": "error", "data": {"stage": "validation", "message": refusal}}
+            return
 
     llm.reset()  # USAGE reflects only this run, exactly like run.py
     if app is None:
@@ -247,7 +283,7 @@ def stream_debate(ticker: str, max_rounds: int = None, app=None, check_sec: bool
                     from markut.evidence.consensus import compare_lean
                     lean = event["data"].get("lean") or {}
                     event["data"]["consensus"] = consensus
-                    event["data"]["comparison"] = compare_lean(lean.get("lean"), consensus)
+                    event["data"]["comparison"] = compare_lean(lean.get("lean"), consensus, withheld=bool(lean.get("withheld")))
                 yield stamp(event, used)
                 if node == "research":
                     # mirror of coverage_route on the same state: the gate's ruling, reported

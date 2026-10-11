@@ -95,10 +95,16 @@ def fetch_analyst_consensus(ticker: str):
         return None
 
 
-def compare_lean(lean, consensus) -> str:
+def compare_lean(lean, consensus, withheld: bool = False) -> str:
     """PURE. One plain sentence: where the debate's lean sits against the
     analysts. Half a step either way is 'in line'; two steps or more is
-    'much more'. No lean -> '' (nothing to compare)."""
+    'much more'. A withheld lean says so (run #28); no lean at all -> ''."""
+    if withheld:
+        if consensus and analyst_position(consensus.get("mean")) is not None:
+            return (f"No lean was issued, so there is nothing to compare; the analyst consensus ({consensus['mean']:g}, "
+                    f"{consensus.get('label') or analyst_label(consensus['mean'])}"
+                    + (f", {consensus['n']} analysts" if consensus.get("n") else "") + ") is shown for reference only.")
+        return "No lean was issued, and no analyst consensus was available."
     p = lean_position(lean)
     if p is None:
         return ""

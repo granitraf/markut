@@ -192,3 +192,5 @@ pre.evidence.small { font-size: 12px; margin-top: 8px; }
 details.srcs summary { font-size: 13px; color: var(--muted); }
 .srclist { margin: 0; padding: 2px 0 10px 1.4em; font-size: 12.5px; line-height: 1.5; color: var(--muted); }
 .srclist li { margin: 0 0 5px; } .srclist .sk { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--review); }
+.scale-svg { display: block; width: 100%; height: auto; max-width: 640px; color: var(--ink); overflow: visible; }
+.lean.withheld { border-style: dashed; }

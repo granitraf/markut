@@ -11,28 +11,78 @@ import json
 import re
 
 from markut import config
+from markut.evidence import edgar as _edgar
+from markut.evidence import filers
 from markut.evidence.edgar import (EDGAR_CACHE, EXHIBIT_PATTERNS, edgar_get, extract_10k_business,
-    extract_10k_sections, extract_10q_sections, fetch_filing_html, find_latest_filings,
-    get_filing_index, html_to_text, is_figure_cell, normalize_dollars, strip_exhibit_label,
+    extract_10k_sections, extract_10q_sections, extract_20f_sections, extract_40f_sections, fetch_filing_html,
+    find_latest_filings, get_filing_index, html_to_text, is_figure_cell, normalize_dollars, strip_exhibit_label,
     strip_sgml_header, ticker_to_cik, dollar_sentences, _find_section)
 
 CHARS_PER_TOKEN = 4
 
 
 # ---------------------------------------------------------------- filing set
+def _merge_older(recent: dict, cik: str) -> dict:
+    """The recent table plus older pages, as one newest-first table."""
+    merged = {k: list(v) for k, v in recent.items()}
+    for page in _edgar.get_older_filings(cik):
+        for k in merged:
+            merged[k] += list(page.get(k) or [""] * len(page.get("form", [])))
+    return merged
+
+
 def filing_set(ticker: str) -> dict:
-    """Latest 10-K, 10-Q and earnings (Item 2.02) 8-K plus the accession
-    fingerprint that keys every cache (profile, plan, transcripts)."""
+    """The filings that play each ROLE for this company, plus the accession
+    fingerprint that keys every cache (profile, plan, transcripts).
+
+    Run #28 (TSM): only 10-K / 10-Q / Item 2.02 8-K were looked for, so a
+    foreign private issuer (20-F + 6-K) or a Canadian MJDS filer (40-F + 6-K)
+    got nothing — with no reason. Roles now (evidence/filers.py):
+      "10-K" slot = annual report (10-K | 20-F | 40-F)
+      "10-Q" slot = interim report (10-Q | 6-K with interim statements / MD&A)
+      "8-K"  slot = results release (Item 2.02 8-K | 6-K with the quarterly release)
+    The slot keys stay for every caller; each document keeps its REAL form,
+    which is what every label prints. An empty slot has a reason in
+    fs["reasons"]; monthly revenue 6-Ks newer than the release are kept."""
     symbol = ticker.upper().strip()
     cik = ticker_to_cik(symbol)
     recent = get_filing_index(cik)
-    latest = find_latest_filings(recent, cik, ["10-K", "10-Q", "8-K"], max_per_form=12)
-    tenk = latest["10-K"][0] if latest["10-K"] else None
-    tenq = latest["10-Q"][0] if latest["10-Q"] else None
-    earnings = next((e for e in latest["8-K"] if "2.02" in (e.get("items") or "")), None)
-    fingerprint = "|".join(d["accession"] if d else "-" for d in (tenk, tenq, earnings))
-    return {"ticker": symbol, "cik": cik, "10-K": tenk, "10-Q": tenq, "8-K": earnings,
-            "fingerprint": fingerprint, "all_8k": latest["8-K"]}
+    ftype = filers.filer_type(recent["form"])
+    annual_forms = {"domestic": ("10-K",), "foreign_private": ("20-F",), "canadian_mjds": ("40-F",)}.get(ftype, ())
+    latest = find_latest_filings(recent, cik, list(annual_forms) + ["10-Q", "8-K", "6-K"], max_per_form=30)
+    if annual_forms and not latest[annual_forms[0]]:
+        older = find_latest_filings(_merge_older(recent, cik), cik, list(annual_forms), max_per_form=1)
+        latest[annual_forms[0]] = older[annual_forms[0]]
+    annual = latest[annual_forms[0]][0] if annual_forms and latest[annual_forms[0]] else None
+    interim = earnings = None
+    monthly = []
+    if ftype == "domestic":
+        interim = latest["10-Q"][0] if latest["10-Q"] else None
+        earnings = next((e for e in latest["8-K"] if "2.02" in (e.get("items") or "")), None)
+        current = latest["8-K"]
+    else:
+        # 6-Ks carry no item codes: read each (newest first, back to the annual
+        # report) and sort it by what it carries
+        current = latest["6-K"]
+        floor = annual["filing_date"] if annual else ""
+        for doc in current:
+            if floor and doc["filing_date"] < floor:
+                break
+            kind = filers.classify_current_report(" ".join(t for _, t, _ in _filing_docs(doc, text_only=True)))
+            doc["report_kind"] = kind
+            if kind == "quarterly_results" and earnings is None:
+                earnings = doc
+            elif kind == "interim_report" and interim is None:
+                interim = doc
+            elif kind == "monthly_revenue" and earnings is None and len(monthly) < 3:
+                monthly.append(doc)        # newer than the latest release: this quarter so far
+            if earnings is not None and interim is not None:
+                break
+    reasons = {role: filers.slot_reason(role, ftype, recent["form"])
+               for role, doc in (("annual", annual), ("interim", interim), ("earnings", earnings)) if doc is None}
+    fingerprint = "|".join(d["accession"] if d else "-" for d in (annual, interim, earnings))
+    return {"ticker": symbol, "cik": cik, "filer_type": ftype, "10-K": annual, "10-Q": interim, "8-K": earnings,
+            "monthly": monthly, "reasons": reasons, "fingerprint": fingerprint, "all_8k": current}
 
 
 def trim_tokens(text: str, tokens: int) -> str:
@@ -62,17 +112,65 @@ def _exhibit_rank(name: str) -> int:
     return len(EXHIBIT_PATTERNS)
 
 
-def exhibits_of(doc: dict) -> list:
-    """Every 99.x exhibit of one 8-K: text (tables kept as rows), image URLs,
-    and whether the exhibit is image-only (a slide deck filed as pictures)."""
+def _listing(doc: dict) -> list:
     try:
         listing = json.loads(fetch_filing_html(doc["base_url"] + "/index.json"))
     except Exception as e:
         print(f"SECTIONS: exhibit listing failed for {doc.get('accession')} ({e})")
         return []
-    names = [it.get("name", "") for it in listing.get("directory", {}).get("item", [])]
-    html_names = [n for n in names if n.lower().endswith((".htm", ".html"))
-                  and "index" not in n.lower() and re.search(r"99", n)]
+    return [it.get("name", "") for it in listing.get("directory", {}).get("item", [])]
+
+
+def _exhibit_names(doc: dict, names: list) -> list:
+    """The exhibit documents of one filing. An 8-K's exhibits are its 99.x
+    files. A 6-K or 40-F names them freely (TSM: 'a2q26e_withguidance…htm'),
+    so every HTML document except the index pages and the cover counts — and
+    the cover itself when it is the only document (a monthly revenue 6-K)."""
+    # XBRL viewer pages (R1.htm … R300.htm) and the filing summary are
+    # generated by EDGAR, not filed by the company: never documents to read
+    html = [n for n in names if n.lower().endswith((".htm", ".html")) and "index" not in n.lower()
+            and not re.match(r"(?i)^R\d+\.html?$", n) and "filingsummary" not in n.lower()]
+    if filers.base_form(doc.get("form", "")) == "8-K":
+        return [n for n in html if re.search(r"99", n)]
+    if filers.base_form(doc.get("form", "")) == "40-F":
+        # some 40-F filers put the AIF, MD&A and statements in the main
+        # document itself (Canadian Natural): read it with the exhibits
+        return [n for n in html if n == doc.get("primary_doc")] + [n for n in html if n != doc.get("primary_doc")]
+    others = [n for n in html if n != doc.get("primary_doc")]
+    return others or [n for n in html if n == doc.get("primary_doc")]
+
+
+def _filing_docs(doc: dict, text_only: bool = False) -> list:
+    """[(name, text, raw html)] for every exhibit document of a filing."""
+    out = []
+    for n in sorted(_exhibit_names(doc, _listing(doc)), key=_exhibit_rank):
+        try:
+            raw = fetch_filing_html(doc["base_url"] + "/" + n)
+        except Exception as e:
+            print(f"SECTIONS: document {n} failed ({e})")
+            continue
+        out.append((n, strip_exhibit_label(strip_sgml_header(html_to_text(raw, keep_tables=not text_only))), raw))
+    return out
+
+
+def doc_text(doc: dict, keep_tables: bool = False) -> str:
+    """The readable text of a filing role: the primary document of a 10-K,
+    10-Q or 20-F; the exhibits of a 6-K or 40-F (where their content lives)."""
+    if not doc:
+        return ""
+    if filers.base_form(doc["form"]) in ("6-K", "40-F"):
+        return "\n\n".join(t for _, t, _ in _filing_docs(doc, text_only=not keep_tables))
+    return html_to_text(fetch_filing_html(doc["url"]), keep_tables=keep_tables)
+
+
+def exhibits_of(doc: dict) -> list:
+    """Every exhibit of one 8-K (99.x) or 6-K / 40-F (any document but the
+    cover): text (tables kept as rows), image URLs, and whether the exhibit
+    is image-only (a slide deck filed as pictures)."""
+    names = _listing(doc)
+    if not names:
+        return []
+    html_names = _exhibit_names(doc, names)
     from bs4 import BeautifulSoup
     out = []
     for n in sorted(html_names, key=_exhibit_rank):
@@ -97,8 +195,33 @@ def exhibits_of(doc: dict) -> list:
         compact = re.sub(r"\s+", " ", text)
         out.append({"name": n, "url": url, "text": text, "images": image_urls,
                     "image_only": len(compact) < 400 and len(image_urls) >= 3,
-                    "form": "8-K", "filing_date": doc["filing_date"], "accession": doc["accession"]})
+                    "form": doc.get("form", "8-K"), "filing_date": doc["filing_date"], "accession": doc["accession"]})
     return out
+
+
+def annual_sections(doc: dict) -> dict:
+    """{"business"|"risk"|"mdna": (label, text)} from the annual report, by
+    form (run #28): 10-K Items 1 / 1A / 7, 20-F Items 4 / 3.D / 5, 40-F
+    Annual Information Form + annual MD&A exhibits. Text '' when absent."""
+    if not doc:
+        return {}
+    form = filers.base_form(doc["form"])
+    ok = lambda t: t if t and not t.startswith("[section unavailable") else ""
+    if form == "10-K":
+        html = fetch_filing_html(doc["url"])
+        k = extract_10k_sections(html)
+        return {"business": ("10-K Item 1 (Business)", ok(extract_10k_business(html))),
+                "risk": ("10-K Item 1A (Risk Factors)", ok(k["Item 1A"])), "mdna": ("10-K Item 7 (MD&A)", ok(k["Item 7"]))}
+    if form == "20-F":
+        f = extract_20f_sections(fetch_filing_html(doc["url"]))
+        return {"business": ("20-F Item 4 (Information on the Company)", ok(f["Item 4 (Information on the Company)"])),
+                "risk": ("20-F Item 3.D (Risk Factors)", ok(f["Item 3.D (Risk Factors)"])),
+                "mdna": ("20-F Item 5 (Operating and Financial Review)", ok(f["Item 5 (Operating and Financial Review)"]))}
+    if form == "40-F":
+        f = extract_40f_sections([t for _, t, _ in _filing_docs(doc, text_only=True)])
+        return {"business": ("40-F Annual Information Form (business)", f["business"]),
+                "risk": ("40-F Annual Information Form (risk factors)", f["risk"]), "mdna": ("40-F annual MD&A", f["mdna"])}
+    return {}
 
 
 TRANSCRIBE_SYSTEM = (
@@ -175,7 +298,7 @@ def transcribe_exhibit(exh: dict) -> dict:
 
 
 def transcripts_for(fs: dict, allow_model: bool = False) -> list:
-    """Transcripts of the earnings 8-K's image-only exhibits. With
+    """Transcripts of the results release's (8-K / 6-K) image-only exhibits. With
     allow_model=False only the cache is consulted (research never spends
     tokens); the profiler passes True."""
     if not fs.get("8-K"):
@@ -247,46 +370,57 @@ def _from_overview(text: str) -> str:
 def profile_sections(fs: dict) -> list:
     """The sections the profiler reads, each trimmed to its cap and carrying a
     section id (accession + name). Missing sections are simply absent — the
-    profile check reports what the model never saw."""
+    profile check reports what the model never saw. Read by ROLE (run #28):
+    the annual report's business section (10-K Item 1 | 20-F Item 4 | 40-F
+    AIF), the newest MD&A (10-Q | 6-K interim report | the annual one), a
+    segment note, and the results release (8-K | 6-K exhibit)."""
     caps = config.PROFILE_SECTION_TOKENS
     secs = []
-    html10k = fetch_filing_html(fs["10-K"]["url"]) if fs.get("10-K") else ""
-    if html10k:
-        item1 = extract_10k_business(html10k)
-        if not item1.startswith("[section unavailable"):
-            secs.append(_section("item1", f"{fs['10-K']['accession']}:Item 1", "10-K Item 1 (Business)",
-                                 trim_tokens(item1, caps["item1"]), fs["10-K"]))
+    annual, interim, earnings = fs.get("10-K"), fs.get("10-Q"), fs.get("8-K")
+    ann = annual_sections(annual) if annual else {}
+    label, business = ann.get("business", ("", ""))
+    if business:
+        secs.append(_section("item1", f"{annual['accession']}:{label}", label, trim_tokens(business, caps["item1"]), annual))
     # MD&A: the newest filing's narrative
-    mdna_text, mdna_doc = "", None
-    if fs.get("10-Q") and (not fs.get("10-K") or fs["10-Q"]["filing_date"] >= fs["10-K"]["filing_date"]):
-        mdna_text = extract_10q_sections(fetch_filing_html(fs["10-Q"]["url"]))["Item 2 (10-Q MD&A)"]
-        mdna_doc = fs["10-Q"]
-    if (not mdna_text or mdna_text.startswith("[section unavailable")) and html10k:
-        mdna_text, mdna_doc = extract_10k_sections(html10k)["Item 7"], fs["10-K"]
+    mdna_text, mdna_doc, mdna_name = "", None, ""
+    if interim and (not annual or interim["filing_date"] >= annual["filing_date"]):
+        if filers.base_form(interim["form"]) == "10-Q":
+            mdna_text = extract_10q_sections(fetch_filing_html(interim["url"]))["Item 2 (10-Q MD&A)"]
+            mdna_name = "10-Q MD&A (overview and results)"
+        else:
+            mdna_text = doc_text(interim)
+            mdna_name = f"{interim['form']} interim report (overview and results)"
+        mdna_doc = interim
+    if (not mdna_text or mdna_text.startswith("[section unavailable")) and ann.get("mdna", ("", ""))[1]:
+        mdna_text, mdna_doc = ann["mdna"][1], annual
+        mdna_name = f"{ann['mdna'][0]} (overview and results)"
     if mdna_text and not mdna_text.startswith("[section unavailable"):
-        secs.append(_section("mdna", f"{mdna_doc['accession']}:MD&A", f"{mdna_doc['form']} MD&A (overview and results)",
+        secs.append(_section("mdna", f"{mdna_doc['accession']}:MD&A", mdna_name,
                              trim_tokens(_from_overview(mdna_text), caps["mdna"]), mdna_doc))
     # segment note: newest filing that has one, tables kept
-    for doc in [d for d in (fs.get("10-Q"), fs.get("10-K")) if d]:
-        note = extract_segment_note(fetch_filing_html(doc["url"]))
+    for doc in [d for d in (interim, annual) if d]:
+        if filers.base_form(doc["form"]) in ("6-K", "40-F"):
+            note = next((extract_segment_note(raw) for _, _, raw in _filing_docs(doc) if extract_segment_note(raw)), "")
+        else:
+            note = extract_segment_note(fetch_filing_html(doc["url"]))
         if note:
             secs.append(_section("segment", f"{doc['accession']}:Segment note", f"{doc['form']} segment reporting note",
                                  trim_tokens(note, caps["segment"]), doc))
             break
-    # earnings 8-K: the release text, plus any image-only deck transcribed
-    if fs.get("8-K"):
-        exhs = exhibits_of(fs["8-K"])
+    # results release: the release text, plus any image-only deck transcribed
+    if earnings:
+        exhs = exhibits_of(earnings)
         release = next((e for e in exhs if not e["image_only"] and len(e["text"]) > 200), None)
         if release:
             secs.append(_section("exhibit", f"{release['accession']}:{release['name']}",
-                                 f"8-K {release['name']} (earnings release)",
+                                 f"{release['form']} {release['name']} (results release)",
                                  trim_tokens(release["text"], caps["exhibit"]), release))
         for e in exhs:
             if e["image_only"]:
                 t = transcribe_exhibit(e)
                 if t.get("text"):
                     secs.append(_section("slides", f"{e['accession']}:{e['name']} (transcribed)",
-                                         f"8-K {e['name']} (slides, transcribed)",
+                                         f"{e['form']} {e['name']} (slides, transcribed)",
                                          trim_tokens(t["text"], caps["slides"]), e))
     return secs
 
@@ -324,6 +458,10 @@ _EXCLUDE_RE = re.compile(
     r"lease payments?|lease liabilit|minimum lease|lease obligations?|\bmatur(?:e|es|ity|ities)\b|principal (?:payments|amounts)|"
     r"unrecognized compensation|expected amortization|amortization expense|expected to be paid|interest payments|"
     r"purchase obligations?|future (?:minimum )?payments|"
+    # run #28 (TSM interim statements): hedge tables and option-pricing
+    # inputs are accounting model assumptions, not business targets
+    r"hedg(?:e|es|ed|ing)|forecast(?:ed)? transactions?|risk-free (?:interest )?rate|expected (?:price )?volatility|"
+    r"expected (?:dividend yield|term|life)|residual life|option[- ]pricing|black-scholes|monte carlo|"
     r"\bVaR\b|confidence level|holding period|(?:adverse|central|baseline) scenario|unemployment rate|"
     r"allowance for credit losses|expected credit loss|risk-weighted assets|stress test|deferred tax")
 _SLIDE_TITLE_RE = re.compile(r"(?i)outlook|guidance|assumptions|targets?|20\d\d (?:key|underlying|financial|guidance|outlook)|"
@@ -594,7 +732,7 @@ def note_dollar_blocks(fs: dict, max_items: int = 8) -> list:
     dollar figure (dollar_sentences)."""
     blocks, seen_lines, found = [], set(), set()
     for doc in [d for d in (fs.get("10-Q"), fs.get("10-K")) if d]:
-        text = html_to_text(fetch_filing_html(doc["url"]))
+        text = doc_text(doc)
         for title, pat, topics in NOTE_HEADINGS:
             if title in found:
                 continue
@@ -621,21 +759,22 @@ def guidance_sources(fs: dict, transcripts: list = None) -> list:
     """Texts the guidance scan reads: every 99.x exhibit of the earnings 8-K
     (tables kept), its transcribed decks, and the newest 10-Q MD&A."""
     sources = []
+    rel_form = (fs.get("8-K") or {}).get("form", "8-K")
     if fs.get("8-K"):
         for exh in exhibits_of(fs["8-K"]):
             if exh["image_only"]:
                 continue
-            sources.append({"label": f"8-K {exh['name']}", "text": exh["text"], "form": "8-K",
+            sources.append({"label": f"{exh['form']} {exh['name']}", "text": exh["text"], "form": exh["form"],
                             "filing_date": exh["filing_date"], "url": exh["url"], "kind": "text"})
     for t in transcripts or []:
-        sources.append({"label": f"8-K {t.get('name', 'exhibit')} (slides)", "text": t.get("text", ""), "form": "8-K",
+        sources.append({"label": f"{rel_form} {t.get('name', 'exhibit')} (slides)", "text": t.get("text", ""), "form": rel_form,
                         "filing_date": t.get("filing_date", ""), "url": t.get("url", ""), "kind": "slides",
                         "status": t.get("status"), "slides": t.get("slides")})
     if fs.get("10-Q"):
-        # the WHOLE 10-Q narrative, tables kept: an outlook paragraph can sit
+        # the WHOLE interim narrative, tables kept: an outlook paragraph can sit
         # anywhere (banks put it under an executive overview ahead of the
         # MD&A heading), so the scan is not limited to the extracted MD&A
-        full = html_to_text(fetch_filing_html(fs["10-Q"]["url"]), keep_tables=True)
-        sources.append({"label": "10-Q", "text": full, "form": "10-Q",
-                        "filing_date": fs["10-Q"]["filing_date"], "url": fs["10-Q"]["url"], "kind": "text"})
+        q = fs["10-Q"]
+        sources.append({"label": q["form"], "text": doc_text(q, keep_tables=True), "form": q["form"],
+                        "filing_date": q["filing_date"], "url": q["url"], "kind": "text"})
     return sources

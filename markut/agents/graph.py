@@ -53,7 +53,10 @@ def coverage_decision(state: dict) -> dict:
     covered = sum(1 for n in coverage.values() if n)
     uncovered = [q for q, n in coverage.items() if not n]
     passes = state.get("research_pass") or 1
-    again = bool(total) and covered < config.COVERAGE_MIN_QUESTIONS and passes < 2 and bool(uncovered)
+    # run #28: with no filings read a second pass has nothing new to search
+    from markut.agents.gate import filings_unavailable
+    no_filings = bool(filings_unavailable(state.get("evidence", "")))
+    again = bool(total) and covered < config.COVERAGE_MIN_QUESTIONS and passes < 2 and bool(uncovered) and not no_filings
     return {"decision": "research" if again else "debate", "covered": covered, "total": total,
             "uncovered": uncovered, "pass": passes}
 

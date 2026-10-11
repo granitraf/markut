@@ -184,15 +184,18 @@ def mark_disclosure(profile: dict, records: list, profiled_text: str) -> dict:
     undisclosed ones so the planner can avoid them."""
     out = dict(profile or {})
     segs = [x.get("name", "") for x in out.get("segments") or [] if isinstance(x, dict) and x.get("name")]
+    # run #28: with no filing records and no filing text nothing was read —
+    # disclosure is UNKNOWN (None), never "not disclosed"
+    read_nothing = not records and not (profiled_text or "").strip()
     kpis = []
     for k in out.get("company_kpis") or []:
         if not isinstance(k, dict) or not k.get("name"):
             continue
         k = dict(k)
-        k["disclosed"] = metric_disclosed(k["name"], records, segs, profiled_text)
+        k["disclosed"] = None if read_nothing else metric_disclosed(k["name"], records, segs, profiled_text)
         kpis.append(k)
     out["company_kpis"] = kpis
-    out["undisclosed_metrics"] = [k["name"] for k in kpis if not k["disclosed"]]
+    out["undisclosed_metrics"] = [k["name"] for k in kpis if k["disclosed"] is False]
     return out
 
 
@@ -259,6 +262,8 @@ def enforce_disclosure(plan: dict, profile: dict, text: str = "") -> dict:
     index = (profile or {}).get("table_index") or []
     if not kmap and not index:
         return plan
+    if not index and not (text or "").strip() and all(v is None for v in kmap.values()):
+        return plan          # run #28: nothing was read — no metric may be called "not disclosed"
     records = records_from_index(index)
     segs = [x.get("name", "") for x in (profile or {}).get("segments") or [] if isinstance(x, dict) and x.get("name")]
     undisclosed = list((profile or {}).get("undisclosed_metrics") or [])
@@ -411,6 +416,13 @@ def profiler_node(state: DebateState) -> dict:
                 "profile_cached": True, "profile_sources": cached.get("sources", [])}
     sections = secs.profile_sections(fs)
     print("PROFILER: sections — " + (", ".join(f"{s['name']} ({len(s['text']) // 4} tok)" for s in sections) or "none"))
+    if not sections:
+        # run #28: with nothing to read the model can only say so (and invented
+        # three metrics named "not disclosed") — no call, the reason recorded
+        why = (fs.get("reasons") or {}).get("annual") or "no filing sections could be located"
+        print(f"PROFILER: no filing sections ({why}) — profile skipped, no model call")
+        return {"profile": {}, "profile_gaps": [f"no filing sections could be read: {why}"], "profiled_text": "",
+                "filing_fingerprint": fs.get("fingerprint", ""), "profile_sources": []}
     user = (f"Ticker: {ticker}\n\nFILING SECTIONS:\n\n{sections_prompt(sections)}\n\n"
             "Profile this company from the sections above only.")
     profile, gaps = {}, []

@@ -12,7 +12,7 @@ from markut.evidence.gaps import count_gaps
 from markut.guardrails.parsing import parse_review_json
 from markut.guardrails.tracer import (DISCLAIMER_TEXT, _as_float, check_scenarios,
     extract_numeric_claims, find_absence_claims, find_advice_language, find_mislabeled, has_disclaimer,
-    figure_sources, normalize_number, recompute_derived, strip_inline_anchors, trace_claim)
+    figure_sources, normalize_number, recompute_derived, strip_inline_anchors, trace_claim, tracing_evidence)
 
 
 def _close(a, b, pct: bool) -> bool:
@@ -94,14 +94,19 @@ def review_node(state: DebateState) -> dict:
     budget_exceeded = (llm.TOKENS["input"] + llm.TOKENS["output"] + llm.TOKENS.get("cache_write", 0)
                        + llm.TOKENS.get("cache_read", 0)) >= config.TOKEN_BUDGET
 
+    # run #28 (TSM): numbers trace against DATA lines only — the profile, the
+    # planner's questions and their 'could not find' echoes are model-written
+    # (run #28's "64%" traced to the planner's own question). The absence check
+    # below still reads the full packet: it needs the not-found lines.
+    data = tracing_evidence(evidence)
     claims = extract_numeric_claims(verdict)
-    flagged = [c for c in claims if trace_claim(c, evidence) == "FLAGGED"]
+    flagged = [c for c in claims if trace_claim(c, data) == "FLAGGED"]
     advice = find_advice_language(verdict)
     # AUDIT FIX (run #2): presence is not truth — numbers that trace under the
     # WRONG period/basis, and multiple×EPS scenarios whose direction the
     # arithmetic contradicts, are findings too (deterministic, offline).
-    mislabeled = find_mislabeled(verdict, evidence)
-    scenarios = check_scenarios(verdict, evidence)
+    mislabeled = find_mislabeled(verdict, data)
+    scenarios = check_scenarios(verdict, data)
     absences = find_absence_claims(verdict, evidence)
     for f in mislabeled:
         # keep the sentence so the stamper can place the tag inside it
@@ -230,7 +235,7 @@ def review_node(state: DebateState) -> dict:
                 return True
             if res.get("resolution") == "DERIVED":
                 anchors = res.get("anchors") or []
-                if not anchors or not all(trace_claim(str(a), evidence) == "CITED" for a in anchors):
+                if not anchors or not all(trace_claim(str(a), data) == "CITED" for a in anchors):
                     return False
                 check = recompute_derived(res.get("claim", ""), anchors)
                 res["recomputed"] = check
@@ -314,10 +319,10 @@ def review_node(state: DebateState) -> dict:
         # the inline annotation — visible, not deleted.
         # 1. deterministic re-checks on the CLEAN revised text (before any stamp
         #    exists, so sentence lookups and number extraction see no tag text)
-        still_mis = find_mislabeled(revised, evidence)
+        still_mis = find_mislabeled(revised, data)
         for f in still_mis:
             f["sentence"] = next((c["sentence"] for c in _claim_sentences(revised) if c["claim"] == f["claim"]), "")
-        still_sc = check_scenarios(revised, evidence)
+        still_sc = check_scenarios(revised, data)
         still_abs = find_absence_claims(revised, evidence)
         report["mislabeled_after"] = [dict(f) for f in still_mis]
         report["scenario_flags_after"] = [dict(f) for f in still_sc]
@@ -325,7 +330,7 @@ def review_node(state: DebateState) -> dict:
         # 2. which numbers still need an UNGROUNDED tag — decided on clean text,
         #    excluding numbers a MISCOMPUTED resolution already explains
         to_tag = [claim for claim in extract_numeric_claims(revised)
-                  if trace_claim(claim, evidence) == "FLAGGED" and not _covered(claim)
+                  if trace_claim(claim, data) == "FLAGGED" and not _covered(claim)
                   and not any(_close(_as_float(claim), _as_float(c), str(claim).strip().endswith("%"))
                               for r in miscomputed for c in _claim_numbers(r))]
         # 3. stamps, each pass blind to the tags the previous one wrote
@@ -377,7 +382,7 @@ def review_node(state: DebateState) -> dict:
     mis_n = len(report.get("mislabeled_after", report["mislabeled"]))
     sc_n = len(report.get("scenario_flags_after", report["scenario_flags"]))
     _final = extract_numeric_claims(_TAG_RE.sub("", revised))
-    _final_flagged = sum(1 for c in _final if trace_claim(c, evidence) == "FLAGGED")
+    _final_flagged = sum(1 for c in _final if trace_claim(c, data) == "FLAGGED")
     print(f"REVIEW STATS (final verdict): claims={len(_final)} cited={len(_final) - _final_flagged} | draft: "
           f"claims={len(claims)} cited={cited_count} "
           f"flagged={len(flagged)} | derived={derived_n} labeled={labeled_n} "

@@ -53,17 +53,28 @@ _TIMES_RE = re.compile(
     r"(?:earnings|sales|revenue|book(?:\s+value)?|EBITDA|EBIT|free cash flow|cash flow|EPS)\b")
 
 
+# run #28 (TSM): a bare decimal is a figure ("against the 22.05 consensus");
+# a year, a quarter label or an identifier is not (no decimal point), and a
+# decimal already captured with its unit ($2.02, 10.5 billion, 1.5x) is not
+# counted twice (the span check below)
+_BARE_DECIMAL_RE = re.compile(r"(?<![\w$€£¥.,/:\-])(\d{1,4}\.\d{1,4})(?![\w%.]|\s?(?:x\b|times\b|percent|billion|million|thousand|trillion|bn\b|[BMKT]\b))")
+
+
 def extract_numeric_claims(text: str) -> list:
     # PURE. Every dollar amount, percent (ranges kept whole), multiple,
-    # finance-noun-attached number, and bare figure after a valuation metric
-    # the verdict asserts, in order of appearance, deduped.
-    found = []
+    # finance-noun-attached number, bare figure after a valuation metric and
+    # bare decimal the verdict asserts, in order of appearance, deduped.
+    found, spans = [], []
     for match in _CLAIM_RE.finditer(text or ""):
         found.append((match.start(), re.sub(r"\s+", " ", match.group(0)).strip()))
-    for match in _METRIC_BARE_RE.finditer(text or ""):
-        found.append((match.start(1), match.group(1)))
-    for match in _TIMES_RE.finditer(text or ""):
-        found.append((match.start(1), match.group(1)))
+        spans.append((match.start(), match.end()))
+    for pattern in (_METRIC_BARE_RE, _TIMES_RE, _BARE_DECIMAL_RE):
+        for match in pattern.finditer(text or ""):
+            s, e = match.start(1), match.end(1)
+            if any(a < e and s < b for a, b in spans):
+                continue                      # already a figure (with its unit)
+            found.append((s, match.group(1)))
+            spans.append((s, e))
     seen, claims = set(), []
     for _, claim in sorted(found):
         key = claim.lower()
@@ -610,6 +621,27 @@ def strip_inline_anchors(text: str) -> tuple:
 # packet sections whose text is written by a model or describes the packet
 # itself: a figure there is not a source for anything
 _NOT_SOURCES = ("PROFILE", "KEY QUESTIONS", "WHAT WOULD MISLEAD", "COVERAGE GAPS", "DATA GAPS")
+_NOT_DATA_LINE = re.compile(r"could not find:|KPI value not found|^-?\s*COVERAGE GAP|\(limitation:", re.IGNORECASE)
+
+
+def tracing_evidence(packet: str) -> str:
+    """PURE. The packet as the governor may trace against it — DATA only
+    (run #28, TSM): the profile, the planner's questions, 'could not find'
+    lines that repeat them, the section headers that carry a question's text,
+    the coverage / data-gap notes and the 'what would mislead' list are
+    written by a model or describe the packet; a figure there is not evidence."""
+    out, section = [], ""
+    for raw in (packet or "").splitlines():
+        line = raw.strip()
+        m = re.match(r"^\[([A-Z][A-Z0-9 &/]+?)(?:\s+Q\d)?\](.*)$", line)
+        if m:
+            section = m.group(1)
+            out.append(line[:m.start(2)])          # keep the header, drop a question's text after it
+            continue
+        if section in _NOT_SOURCES or _NOT_DATA_LINE.search(line):
+            continue
+        out.append(raw)
+    return "\n".join(out)
 
 
 def _source_lines(evidence: str) -> list:
@@ -622,7 +654,7 @@ def _source_lines(evidence: str) -> list:
         if m:
             section = m.group(1)
             continue
-        if not line or section in _NOT_SOURCES:
+        if not line or section in _NOT_SOURCES or _NOT_DATA_LINE.search(line):
             continue
         # question tags ("[Q2]") and source tags ("[source: T4]") are labels,
         # not figures: a bare anchor like "2" must not match them

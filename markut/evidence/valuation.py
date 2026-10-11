@@ -7,6 +7,7 @@ governor's scenario check polices the rest.
 No peer comparison, on purpose: peers need a curated list per ticker, and a
 list only covers the symbols someone thought of (any other ticker would get
 nothing). Everything here comes from the company's own data and is PURE."""
+from markut.evidence.currency import currency_context, money, per_unit, share_basis_ok, to_quote
 from markut.evidence.market import fmt_price, fmt_ratio, fmt_pct
 
 SCENARIO_MULTIPLE_SPREAD = 0.20   # bear/bull multiples sit ±20% around today's forward P/E
@@ -66,13 +67,28 @@ def format_valuation_lines(info: dict, estimates: dict, current_fy=None, band_in
         if value is not None:
             lines.append(f"- {label}: {value}  [source: {source}]")
 
-    add("EV/EBITDA (TTM)", fmt_ratio(_num(info.get("enterpriseToEbitda"))))
+    # run #28 (TSM): a ratio may mix the trading currency (price, market cap)
+    # with the reporting currency (cash flow, EPS) only after converting at a
+    # stated rate; the provider's own mixed ratios are left out, and said so
+    ccx = info.get("_ccy") or currency_context(info)
+    omitted = []
+    if ccx["mixed"]:
+        if _num(info.get("enterpriseToEbitda")) is not None:
+            omitted.append(f"EV/EBITDA (the provider's enterprise value mixes {ccx['report']} debt and cash with the {ccx['quote']} market value)")
+    else:
+        add("EV/EBITDA (TTM)", fmt_ratio(_num(info.get("enterpriseToEbitda"))))
     mc = _num(info.get("marketCap"))
     fcf = _num(((info.get("_fcf_quarters") or {}).get("fcf")))
     if fcf is None:
         fcf = _num(info.get("freeCashflow"))
     if mc and fcf is not None:
-        add("FCF yield (TTM FCF / market cap)", fmt_pct(fcf / mc), "computed")
+        if not ccx["mixed"]:
+            add("FCF yield (TTM FCF / market cap)", fmt_pct(fcf / mc), "computed")
+        elif ccx.get("fx"):
+            add(f"FCF yield (TTM FCF {money(fcf, ccx['report'])} converted to {ccx['quote']} at {ccx['fx']:.5f} = "
+                f"{money(to_quote(fcf, ccx), ccx['quote'])}, / market cap {money(mc, ccx['quote'])})", fmt_pct(to_quote(fcf, ccx) / mc), "computed")
+        else:
+            omitted.append(f"FCF yield (no exchange rate from {ccx['report']} to {ccx['quote']})")
     add("PEG (trailing, yfinance; growth basis not disclosed by the source)", fmt_ratio(_num(info.get("trailingPegRatio") or info.get("pegRatio"))))
 
     eps0 = _num(((estimates or {}).get("0y") or {}).get("avg"))
@@ -87,11 +103,28 @@ def format_valuation_lines(info: dict, estimates: dict, current_fy=None, band_in
     if price and eps1:
         add(f"P/E on next-FY{fy1} consensus EPS ({fmt_price(eps1)}, non-GAAP)", f"{price / eps1:.2f}x", "computed")
 
-    band = pe_band((band_inputs or {}).get("closes") or [], (band_inputs or {}).get("annual_eps") or [])
+    annual_eps = (band_inputs or {}).get("annual_eps") or []
+    band_basis = ""
+    if annual_eps and ccx["mixed"]:
+        # closes are in the trading currency per traded unit; the statement EPS
+        # is in the reporting currency — convert it, and check it is per the
+        # same unit (an ADS holding 5 ordinary shares would be 5x off)
+        latest = sorted(annual_eps)[-1][1]
+        ok, why = share_basis_ok(_num(info.get("trailingEps")), latest, ccx)
+        if not ccx.get("fx"):
+            omitted.append(f"the trailing P/E band (no exchange rate from {ccx['report']} to {ccx['quote']})")
+            annual_eps = []
+        elif not ok:
+            lines.append(f"- Band note: no trailing P/E band — {why}  [source: computed]")
+            annual_eps = []
+        else:
+            annual_eps = [(d, e * ccx["fx"]) for d, e in annual_eps]
+            band_basis = f"; EPS converted from {ccx['report']} to {ccx['quote']} at today's {ccx['fx']:.5f}"
+    band = pe_band((band_inputs or {}).get("closes") or [], annual_eps)
     # today's forward multiple on the SAME EPS field the grid rows use
     own_fwd = (price / eps1) if (price and eps1) else _num(info.get("forwardPE"))
     if band:
-        lines.append(f"- Trailing P/E band (company's own history: ~4y of daily closes / annual diluted GAAP EPS, {band['sessions']} sessions): "
+        lines.append(f"- Trailing P/E band (company's own history: ~4y of daily closes / annual diluted GAAP EPS{band_basis}, {band['sessions']} sessions): "
                      f"p25 {band['p25']}x | median {band['median']}x | p75 {band['p75']}x  [source: computed]")
     # DISPERSION GUARD (the audit's peer-dispersion rule, applied to the company's
     # own history): a band whose p75 is more than 2x its p25 is not a usable
@@ -127,4 +160,6 @@ def format_valuation_lines(info: dict, estimates: dict, current_fy=None, band_in
         for case_label, eps in cases:
             cells = " | ".join(f"{name} {m}x = {fmt_price(eps * m)} ({(eps * m / price - 1) * 100:+.1f}%)" for name, m in mults)
             lines.append(f"- Implied price, EPS {case_label} {fmt_price(eps)}: {cells}  [source: computed]")
+    if omitted:
+        lines.append(f"- CURRENCY NOTE: omitted — {'; '.join(omitted)}  [source: computed]")
     return lines if len(lines) > 1 else []

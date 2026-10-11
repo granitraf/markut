@@ -145,6 +145,9 @@ def _entity_key(cell: dict) -> str:
     return re.sub(r"\s+", " ", e).strip()
 
 
+_MONTHS = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+
+
 def _pair_cells(cells: list, prefer_percent: bool = False, entity: str = None):
     """(current, year_ago) cells: the shortest period class present, the same
     column entity (a brand or segment column never pairs with its neighbour),
@@ -169,13 +172,26 @@ def _pair_cells(cells: list, prefer_percent: bool = False, entity: str = None):
     elif len(keys) > 1:
         tot = [c for c in use if re.search(r"(?i)^total|consolidated|^company", _entity_key(c))]
         use = tot or [c for c in use if _entity_key(c) == sorted(keys, key=len)[0]]
-    def key(c):
+    def when(c):
+        # (year, month, day) of the column's end date; (year, 0, 0) when only a
+        # year is printed; None when no date at all
         d = period_from_heading(c.get("heading", "")).get("ended") or ""
-        m = re.search(r"(\d{4})", d)
-        return -int(m.group(1)) if m else 0
+        m = re.search(r"([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})", d)
+        if m and m.group(1)[:3].lower() in _MONTHS:
+            return (int(m.group(3)), _MONTHS[m.group(1)[:3].lower()], int(m.group(2)))
+        y = re.search(r"(\d{4})", d)
+        return (int(y.group(1)), 0, 0) if y else None
+    def key(c):
+        w = when(c)
+        return (-w[0], -w[1], -w[2]) if w else (0, 0, 0)
     use = sorted(use, key=key)
     cur = use[0] if use else None
-    prev = next((c for c in use[1:] if _entity_key(c) == _entity_key(cur)), None) if cur else None
+    same = [c for c in use[1:] if cur and _entity_key(c) == _entity_key(cur)]
+    # the comparison is the YEAR-AGO column: run #28 (TSM "2Q26 | 2Q25 | 1Q26")
+    # — the next column over can be the previous quarter
+    wc = when(cur) if cur else None
+    year_ago = [c for c in same if wc and when(c) and when(c)[0] == wc[0] - 1 and (not wc[1] or abs(when(c)[1] - wc[1]) <= 1)]
+    prev = (year_ago or [c for c in same if not (wc and when(c) and when(c)[0] == wc[0])] or same or [None])[0]
     return cur, prev
 
 
@@ -219,6 +235,8 @@ def figure_line(label: str, rec: dict, cur: dict, prev, src: dict, segment: str,
     # P0 (run #26): units come from the row type ("$2.02 million" was a
     # per-share figure that inherited the table's "in millions")
     units, scale = row_units(label, rec.get("group", ""), cur.get("value", ""), rec.get("units", ""))
+    if rec.get("currency") and rec["currency"] != "USD" and units and units not in ("percent", "count", "as printed"):
+        units = f"{rec['currency']} {units}"      # run #28: 'TWD millions', 'TWD per share' — never an unlabelled foreign amount
     cur_v = _scaled(cur["value"], scale)
     if prev is not None:
         prev_v = _scaled(prev["value"], scale)
@@ -281,20 +299,28 @@ def headline_period(text: str) -> str:
 
 def core_sources(fs: dict) -> list:
     """[{form, name, filing_date, url, html, text, headline_period}] for the
-    earnings 8-K's text exhibits and the latest 10-Q."""
-    from markut.evidence.sections import exhibits_of
+    results release's text exhibits (8-K or 6-K) and the interim report
+    (10-Q, or the documents of a 6-K interim report) — each under its REAL
+    form (run #28: a 6-K is never labelled 8-K or 10-Q)."""
+    from markut.evidence.filers import base_form
+    from markut.evidence.sections import _filing_docs, exhibits_of
     out = []
     if fs.get("8-K"):
         for exh in exhibits_of(fs["8-K"]):
             if exh["image_only"]:
                 continue
             raw = fetch_filing_html(exh["url"])
-            out.append({"form": "8-K", "name": exh["name"], "filing_date": exh["filing_date"], "url": exh["url"],
+            out.append({"form": exh["form"], "name": exh["name"], "filing_date": exh["filing_date"], "url": exh["url"],
                         "html": raw, "text": exh["text"], "headline_period": headline_period(exh["text"])})
-    if fs.get("10-Q"):
-        raw = fetch_filing_html(fs["10-Q"]["url"])
-        out.append({"form": "10-Q", "name": fs["10-Q"].get("primary_doc", "10-Q"), "filing_date": fs["10-Q"]["filing_date"],
-                    "url": fs["10-Q"]["url"], "html": raw, "text": "", "headline_period": "quarter"})
+    q = fs.get("10-Q")
+    if q and base_form(q["form"]) == "6-K":
+        for name, text, raw in _filing_docs(q):
+            out.append({"form": q["form"], "name": name, "filing_date": q["filing_date"], "url": q["base_url"] + "/" + name,
+                        "html": raw, "text": text, "headline_period": headline_period(text) or "quarter"})
+    elif q:
+        raw = fetch_filing_html(q["url"])
+        out.append({"form": q["form"], "name": q.get("primary_doc", q["form"]), "filing_date": q["filing_date"],
+                    "url": q["url"], "html": raw, "text": "", "headline_period": "quarter"})
     return out
 
 
@@ -310,7 +336,14 @@ def classify_tables(records: list) -> dict:
         k = set()
         income_hits = sum(1 for lab in labels if any(re.search(p, lab.strip().lower()) for _, p in INCOME_ROWS))
         cash_hits = sum(1 for lab in labels if any(re.search(p, lab.strip().lower()) for _, p in CASH_ROWS))
-        if income_hits >= 2:
+        # an equity statement repeats "Net income" under its equity columns
+        # (TSM's interim 6-K): it is not an income statement
+        # equity components as its columns mark one even when the caption does not
+        equity_cols = {e for r in rows for c in r["cells"] for e in [c.get("entity", "")]
+                       if re.search(r"(?i)capital stock|capital surplus|share premium|retained earnings|unappropriated|treasury (?:stock|shares)|"
+                                    r"other equity|non-?controlling interests?|accumulated other comprehensive", e)}
+        is_equity = bool(re.search(r"(?i)changes in (?:\w+['’]?\s+)?equity|statements? of (?:\w+['’]?\s+)?equity", caption)) or len(equity_cols) >= 2
+        if income_hits >= 2 and not is_equity:
             k.add("income")
         if cash_hits >= 2 or (cash_hits >= 1 and re.search(r"(?i)cash flow", caption)):
             k.add("cash")
@@ -329,6 +362,8 @@ def extract_core(fs: dict, profile: dict, plan: dict = None) -> dict:
     "lines": [...], "checks": [...]}."""
     profile = profile or {}
     _LEGEND.clear()
+    from markut.evidence.filers import source_phrase
+    _SRC = source_phrase(fs)   # run #28: name the forms this company files
     segments = [s.get("name", "") for s in profile.get("segments", []) if isinstance(s, dict) and s.get("name")]
     kpi_names = [k.get("name", "") for k in profile.get("company_kpis", []) if isinstance(k, dict) and k.get("name")]
     for q in (plan or {}).get("key_questions", []):
@@ -354,6 +389,11 @@ def extract_core(fs: dict, profile: dict, plan: dict = None) -> dict:
             low = label.strip().lower()
             cur, prev = _pair_cells(rec["cells"])
             if cur is None or num_of(cur["value"]) is None:
+                continue
+            # a balance needs a dated column: a maturity table's "Less Than 1
+            # Year" / "5-10 Years" columns are a schedule (run #28, TSM)
+            if LEASE_ROW_RE.search(label) and not _LEASE_SKIP_RE.search(label) and \
+                    not period_from_heading(cur.get("heading", "")).get("ended"):
                 continue
             if LEASE_ROW_RE.search(label) and not _LEASE_SKIP_RE.search(label):
                 key = ("lease", low, rec.get("group", ""), cur["period"])
@@ -410,7 +450,18 @@ def extract_core(fs: dict, profile: dict, plan: dict = None) -> dict:
                 placed = True
             # run #26 (P1): every percentage row (margin by segment or line,
             # current vs year-ago) — not just the total line
-            if not placed and "%" in (cur.get("value") or "") and len(blocks["pct"]) < MAX_LINES["pct"]:
+            # ownership tables (a subsidiary's "Percentage of Ownership") are
+            # not performance figures (run #28, TSM's interim statements)
+            if re.search(r"(?i)ownership|voting|subsidiar|interest held|shareholding",
+                         " ".join([rec.get("caption", "")] + [c.get("heading", "") for c in rec["cells"]])):
+                continue
+            # percentages from performance tables only (income / segment / KPI /
+            # percent-of-revenue) or rows that name a margin or a growth rate:
+            # a compensation note's "Risk-free interest rate 1.40%" is a model
+            # assumption, not a result (run #28, TSM's interim statements)
+            performance = bool(k & {"income", "segment", "kpi", "percent"}) or re.search(
+                r"(?i)margin|growth|percentage of (?:total |net )?(?:sales|revenues?)|% of (?:sales|revenues?)", label + " " + rec.get("group", ""))
+            if not placed and performance and "%" in (cur.get("value") or "") and len(blocks["pct"]) < MAX_LINES["pct"]:
                 key = ("pct", low, rec.get("group", ""), cur["period"])
                 if key not in seen:
                     seen.add(key)
@@ -433,7 +484,7 @@ def extract_core(fs: dict, profile: dict, plan: dict = None) -> dict:
                                  + (f", … {len(uniq) - 12} more" if len(uniq) > 12 else "") + ")")
                 kpi_values[name] = True
             else:
-                kpi_lines.append(f"- KPI value not found: {name} (no segment or revenue-line table in the latest 8-K exhibits or 10-Q)")
+                kpi_lines.append(f"- KPI value not found: {name} (no segment or revenue-line table in {_SRC})")
                 kpi_values[name] = False
             continue
         found = resolve_kpi(name, all_records, segments)
@@ -444,7 +495,7 @@ def extract_core(fs: dict, profile: dict, plan: dict = None) -> dict:
             kpi_lines.append(line.replace("  [source:", f"  ({note})  [source:", 1) if note else line)
             kpi_values[name] = True
         else:
-            kpi_lines.append(f"- KPI value not found: {name} (no table row in the latest 8-K exhibits or 10-Q names this metric)")
+            kpi_lines.append(f"- KPI value not found: {name} (no table row in {_SRC} names this metric)")
             kpi_values[name] = False
     derived, seen_d = [], set()
     for ln in derived_lines(all_records, segments):
@@ -456,16 +507,16 @@ def extract_core(fs: dict, profile: dict, plan: dict = None) -> dict:
         if key not in seen_d:
             seen_d.add(key); derived.append(ln)
     blocks["derived"] = derived
-    lines = ["[CORE FIGURES] (extracted by code from the tables of the latest earnings exhibits and 10-Q before any question was asked; "
+    lines = [f"[CORE FIGURES] (extracted by code from the tables of {_SRC} before any question was asked; "
              "each line: figure (period) vs year-ago; change — then (units; basis; segment) and its source table; "
              "'KPI value not found' means the metric was not in a table, not that it does not exist)"]
     for title, key in (("Income statement summary", "income"), ("KPI / operating metrics table", "kpi"),
                        ("Segment and revenue lines", "segment"), ("Percentage tables (each line with its comparison column)", "pct"),
                        ("Cash flow summary", "cash")):
         lines.append(f"-- {title} --")
-        lines.extend(blocks[key] or [f"- none found by table structure in the latest 8-K exhibits or 10-Q"])
+        lines.extend(blocks[key] or [f"- none found by table structure in {_SRC}"])
     lines.append("-- Lease liabilities (balance sheet or lease note) --")
-    lines.extend(blocks["lease"] or ["- no lease-liability row in the latest 8-K exhibits or 10-Q tables"])
+    lines.extend(blocks["lease"] or [f"- no lease-liability row in {_SRC} tables"])
     lines.append("-- KPI values for the profiled metrics --")
     lines.extend(kpi_lines or ["- the profile listed no KPIs"])
     lines.append("-- Derived metrics and sanity checks (computed in code) --")

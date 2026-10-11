@@ -25,6 +25,8 @@ def fmp_get_json(endpoint: str, symbol: str, **extra_params):
 import yfinance as yf
 from datetime import datetime
 
+from markut.evidence.currency import (currency_context, currency_note, fetch_fx, money, per_unit, quarter_end)
+
 # ---------- pure formatting helpers (no network) ----------
 # WHY: the debate agents read this packet as plain text. Raw values like
 # 4785585180000 or 0.7414 are easy for a model to mis-scale (billions vs
@@ -75,12 +77,18 @@ def format_market_lines(info: dict) -> list:
     # questions (what happened vs what the market expects). Labeling each value's
     # period stops the bull/bear from quoting a forward estimate as if it were a
     # historical fact — a subtle hallucination the old packet couldn't prevent.
+    # run #28 (TSM): market data in the TRADING currency, statement figures in
+    # the REPORTING currency, each labelled; a USD company prints as before
+    ccx = info.get("_ccy") or currency_context(info)
+    q, r = ccx["quote"], ccx["report"]
     lines.append("[QUOTE & VALUATION]")
-    add("Price (current)", fmt_price(info.get("currentPrice")))
-    add("Market cap", fmt_big(info.get("marketCap")))
+    if currency_note(ccx):
+        lines.append(currency_note(ccx))
+    add("Price (current)", per_unit(info.get("currentPrice"), q))
+    add("Market cap", money(info.get("marketCap"), q))
     lo, hi = info.get("fiftyTwoWeekLow"), info.get("fiftyTwoWeekHigh")
     if lo is not None and hi is not None:
-        add("52-week range", f"{fmt_price(lo)} / {fmt_price(hi)}")
+        add("52-week range", f"{per_unit(lo, q)} / {per_unit(hi, q)}")
     # AUDIT FIX (run #2): every EPS and P/E line now names its PERIOD and its
     # ACCOUNTING BASIS. yfinance's trailingEps is GAAP TTM; forwardEps is the
     # analyst consensus for a FUTURE fiscal year and is non-GAAP for most
@@ -91,8 +99,11 @@ def format_market_lines(info: dict) -> list:
     # valuation grid uses (forwardEps), never a second provider field
     fwd_pe = forward_pe(info)
     add("P/E (forward, price / next-FY consensus non-GAAP EPS)", fmt_ratio(fwd_pe), "computed" if fwd_pe else "yfinance/info")
-    add("Price/Book (mrq)", fmt_ratio(info.get("priceToBook")))
-    add("EPS (trailing TTM, GAAP)", fmt_price(info.get("trailingEps")))
+    if not ccx["mixed"]:
+        # the provider divides the price of the traded unit by book value per
+        # share in the reporting currency — wrong for an ADR (TSM: 93x)
+        add("Price/Book (mrq)", fmt_ratio(info.get("priceToBook")))
+    add("EPS (trailing TTM, GAAP)", per_unit(info.get("trailingEps"), q))
     # run #26 (P2, item 12): ONE forward EPS. The analysts' estimate table
     # (+1y average, with its analyst count) is the canonical source; the
     # provider's single forwardEps field is used only when there is no table,
@@ -101,10 +112,10 @@ def format_market_lines(info: dict) -> list:
     canon = info.get("_fwd_eps_canonical") or {}
     if canon.get("value") is not None:
         n = f", {int(canon['analysts'])} analysts" if canon.get("analysts") else ""
-        add(f"EPS (forward, next-FY consensus non-GAAP{n}; canonical source)", fmt_price(canon["value"]),
+        add(f"EPS (forward, next-FY consensus non-GAAP{n}; canonical source)", per_unit(canon["value"], q),
             f"{canon.get('source', 'yfinance/earnings_estimate')} (canonical)")
     else:
-        add("EPS (forward, next-FY consensus non-GAAP; data-provider field)", fmt_price(info.get("forwardEps")),
+        add("EPS (forward, next-FY consensus non-GAAP; data-provider field)", per_unit(info.get("forwardEps"), q),
             "yfinance/info (no estimate table)")
 
     lines.append("\n[FUNDAMENTALS]")
@@ -118,16 +129,20 @@ def format_market_lines(info: dict) -> list:
     lines.extend(info.get("_leverage_lines") or [])
     fcf = info.get("_fcf_quarters") or {}
     if fcf.get("fcf") is not None:
-        add(f"Free cash flow (TTM: last 4 quarters of operating cash flow {fmt_big(fcf['ocf'])} less capex {fmt_big(-fcf['capex'])}, "
-            f"quarters to {fcf['quarters'][0]})", fmt_big(fcf["fcf"]), "yfinance/quarterly_cashflow, computed")
+        add(f"Free cash flow (TTM: last 4 quarters of operating cash flow {money(fcf['ocf'], r)} less capex {money(-fcf['capex'], r)}, "
+            f"quarters to {fcf['quarters'][0]})", money(fcf["fcf"], r), "yfinance/quarterly_cashflow, computed")
     elif info.get("freeCashflow") is not None:
-        add("Free cash flow (TTM, data-provider field; quarterly cash flow unavailable)", fmt_big(info.get("freeCashflow")))
+        add("Free cash flow (TTM, data-provider field; quarterly cash flow unavailable)", money(info.get("freeCashflow"), r))
     # AUDIT FIX (run #2): yfinance revenueGrowth is the MOST RECENT QUARTER vs
     # the same quarter a year earlier — NOT annual growth. Labeled "(yoy)" it
     # was quoted as "revenue grew 85.5% in FY2025". The annual figure is
     # computed separately from the income statement (fy_growth_lines).
-    add("Revenue growth (MRQ YoY, most recent quarter vs year-ago quarter)", fmt_pct(info.get("revenueGrowth")))
-    add("Earnings growth (MRQ YoY)", fmt_pct(info.get("earningsGrowth")))
+    # run #28: the quarter is named — TSM's 36% (quarter ended June 30) was
+    # argued against a news report's 51% for the NEXT quarter as a conflict
+    qe = quarter_end(info)
+    add(f"Revenue growth (MRQ YoY, quarter ended {qe} vs the year-ago quarter)" if qe
+        else "Revenue growth (MRQ YoY, most recent quarter vs year-ago quarter)", fmt_pct(info.get("revenueGrowth")))
+    add(f"Earnings growth (MRQ YoY, quarter ended {qe})" if qe else "Earnings growth (MRQ YoY)", fmt_pct(info.get("earningsGrowth")))
     return lines
 
 
@@ -165,11 +180,12 @@ def fcf_from_quarterly(cf) -> dict:
         return {}
 
 
-def leverage_lines(bs, info: dict) -> list:
+def leverage_lines(bs, info: dict, ccy: str = "USD") -> list:
     """PURE over a yfinance quarterly_balance_sheet frame (latest column):
     debt/equity WITH and WITHOUT lease obligations, every component in
     dollars, and which of the two matches the provider's Debt/Equity figure —
     so nobody has to guess what that field includes."""
+    money_c = lambda n: money(n, ccy)      # run #28: amounts in the balance sheet's currency
     try:
         if bs is None or len(bs.columns) == 0:
             return []
@@ -200,13 +216,13 @@ def leverage_lines(bs, info: dict) -> list:
             # obligations, yet the line said "including lease obligations" —
             # a label the computation did not earn. Say what it is.
             return [f"- Debt/Equity on the data provider's total debt (computed, balance sheet {asof}): {with_l:.1f}% = total debt "
-                    f"{fmt_big(total_debt)} / stockholders' equity {fmt_big(equity)}; lease obligations are not included (the provider's "
+                    f"{money_c(total_debt)} / stockholders' equity {money_c(equity)}; lease obligations are not included (the provider's "
                     f"debt figure holds {'$0 of them' if leases == 0 else 'no lease line'})  [source: yfinance/quarterly_balance_sheet, computed]{tag(with_l)}"]
         ex_l = (total_debt - leases) / equity * 100
-        return [f"- Debt/Equity including lease obligations (computed, balance sheet {asof}): {with_l:.1f}% = total debt {fmt_big(total_debt)} "
-                f"(of which lease obligations {fmt_big(leases)}) / stockholders' equity {fmt_big(equity)}  [source: yfinance/quarterly_balance_sheet, computed]{tag(with_l)}",
-                f"- Debt/Equity excluding lease obligations (computed, balance sheet {asof}): {ex_l:.1f}% = debt ex-leases {fmt_big(total_debt - leases)} "
-                f"/ stockholders' equity {fmt_big(equity)}  [source: yfinance/quarterly_balance_sheet, computed]{tag(ex_l)}"]
+        return [f"- Debt/Equity including lease obligations (computed, balance sheet {asof}): {with_l:.1f}% = total debt {money_c(total_debt)} "
+                f"(of which lease obligations {money_c(leases)}) / stockholders' equity {money_c(equity)}  [source: yfinance/quarterly_balance_sheet, computed]{tag(with_l)}",
+                f"- Debt/Equity excluding lease obligations (computed, balance sheet {asof}): {ex_l:.1f}% = debt ex-leases {money_c(total_debt - leases)} "
+                f"/ stockholders' equity {money_c(equity)}  [source: yfinance/quarterly_balance_sheet, computed]{tag(ex_l)}"]
     except Exception:
         return []
 
@@ -253,6 +269,84 @@ def format_estimate_lines(estimates: dict, current_fy=None) -> list:
         n_txt = f", {int(n)} analysts" if n is not None and n == n else ""
         lines.append(f"- EPS consensus ({fy}{label}, non-GAAP{n_txt}): {fmt_price(avg)}  [source: yfinance/earnings_estimate]")
     return lines
+
+
+def statement_lines(inc, ccy: str = "USD") -> list:
+    """PURE over yfinance income_stmt: latest FY revenue and net income in the
+    REPORTING currency, plus the FY-vs-FY growth lines (run #28: TSM's TWD
+    revenue printed as '$3.81T')."""
+    out = []
+    if inc is None or len(inc.columns) == 0:
+        return out
+    col = inc.columns[0]  # yfinance orders columns newest-first
+    fy = getattr(col, "year", col)  # label the fiscal year explicitly
+    for row, nice in (("Total Revenue", "Revenue"), ("Net Income", "Net income")):
+        if row in inc.index:
+            val = inc.loc[row, col]
+            if val == val:  # NaN check without importing pandas (NaN != NaN)
+                out.append(f"- {nice} (FY{fy} annual): {money(val, ccy)}  [source: yfinance/income_stmt]")
+    annuals = []
+    for c in list(inc.columns)[:2]:
+        annuals.append((getattr(c, "year", c),
+                        inc.loc["Total Revenue", c] if "Total Revenue" in inc.index else None,
+                        inc.loc["Net Income", c] if "Net Income" in inc.index else None))
+    out.extend(fy_growth_lines(annuals))
+    return out
+
+
+def fmp_income_lines(d: dict, ccx: dict) -> list:
+    """PURE. The second provider's latest-FY EPS, labelled with the currency
+    it reports in (TSM: 'TWD 333.05', not '$333.05')."""
+    ccy = (d.get("reportedCurrency") or (ccx or {}).get("report") or "USD").upper()
+    fiscal_year = d.get("fiscalYear") or d.get("date")
+    suffix = f" ({fiscal_year})" if fiscal_year is not None else ""
+    out = []
+    for label, key in ((f"EPS (latest fiscal year{suffix})", "eps"), (f"EPS diluted (latest fiscal year{suffix})", "epsDiluted")):
+        if d.get(key) is not None:
+            out.append(f"- {label}: {per_unit(d.get(key), ccy)}  [source: FMP/income-statement]")
+    return out
+
+
+def fmp_ratio_lines(d: dict, ccx: dict) -> list:
+    """PURE. The second provider's price ratios — only when trading and
+    reporting currency agree; otherwise one line says why they are omitted."""
+    if (ccx or {}).get("mixed"):
+        return [f"- FMP ratios omitted: Price/Sales, Price/FCF and FCF yield from the second provider divide the {ccx['quote']} "
+                f"price by {ccx['report']} statement figures on an unstated basis  [source: computed]"]
+    out = []
+    for label, key, f in (("Price/Sales (TTM)", "priceToSalesRatioTTM", fmt_ratio), ("Price/FCF (TTM)", "priceToFreeCashFlowRatioTTM", fmt_ratio),
+                          ("Free cash flow yield (TTM)", "freeCashFlowYieldTTM", fmt_pct)):
+        if d.get(key) is not None:
+            out.append(f"- {label}: {f(d.get(key))}  [source: FMP/ratios]")
+    return out
+
+
+def dcf_lines(d: dict, price, ccx: dict) -> list:
+    """PURE. The third-party DCF, labelled unverified when far from the
+    price; left out when the currencies differ (its currency and per-share
+    basis are not stated)."""
+    dcf_val = d.get("dcf")
+    if dcf_val is None:
+        return []
+    if (ccx or {}).get("mixed"):
+        return [f"- DCF fair value omitted: the third-party model does not state whether its value is in {ccx['quote']} per "
+                f"traded share or {ccx['report']} per ordinary share  [source: FMP/dcf]"]
+    out = []
+    far = price and abs(float(dcf_val) / float(price) - 1) > 0.5
+    if far:
+        out.append(f"- DCF fair value (unverified third-party model, assumptions not disclosed; excluded from the verdict): "
+                   f"{fmt_price(dcf_val)}  [source: FMP/dcf]")
+    else:
+        out.append(f"- DCF fair value: {fmt_price(dcf_val)}  [source: FMP/dcf]")
+    if price is not None and not far:
+        # WHY spell out the direction: leaving "247.17 vs 197.58" as raw
+        # numbers forces each agent to do the comparison itself; stating
+        # ABOVE/BELOW with the % gap removes an arithmetic step a model
+        # could botch mid-argument.
+        gap = (float(dcf_val) / float(price) - 1) * 100
+        direction = "ABOVE" if float(dcf_val) > float(price) else "BELOW"
+        out.append(f"- DCF vs price: fair value is {direction} current price ({gap:+.1f}%)  [source: FMP/dcf]")
+    return out
 
 
 def basis_notes(info: dict) -> list:
@@ -373,6 +467,13 @@ def market_snapshot(ticker: str) -> str:
     except Exception as e:
         info = {}
         out.append(f"[info unavailable: {e}]")
+    # run #28: which currency is which, and the rate between them (one free
+    # FX lookup, only when the trading and reporting currencies differ)
+    ccx = currency_context(info)
+    if ccx["mixed"]:
+        rate, rate_date, rate_src = fetch_fx(ccx["report"], ccx["quote"])
+        ccx = currency_context(info, fx=rate, fx_date=rate_date, fx_source=rate_src)
+    info["_ccy"] = ccx
 
     # one daily price series for the run (all-time high, returns, P/E band)
     try:
@@ -402,7 +503,7 @@ def market_snapshot(ticker: str) -> str:
         pass
     # leverage from the balance sheet, with and without leases
     try:
-        info["_leverage_lines"] = leverage_lines(t.quarterly_balance_sheet, info)
+        info["_leverage_lines"] = leverage_lines(t.quarterly_balance_sheet, info, ccy=ccx["report"])
     except Exception as e:
         info["_leverage_lines"] = []
         out.append(f"[quarterly balance sheet unavailable: {e}]")
@@ -418,23 +519,7 @@ def market_snapshot(ticker: str) -> str:
     # lose two lines, not the whole fundamentals section — one broken yfinance
     # property must cost one section, never the whole packet.
     try:
-        inc = t.income_stmt
-        if inc is not None and len(inc.columns) > 0:
-            col = inc.columns[0]  # yfinance orders columns newest-first
-            fy = getattr(col, "year", col)  # label the fiscal year explicitly
-            for row, nice in (("Total Revenue", "Revenue"), ("Net Income", "Net income")):
-                if row in inc.index:
-                    val = inc.loc[row, col]
-                    if val == val:  # NaN check without importing pandas (NaN != NaN)
-                        add_line(f"{nice} (FY{fy} annual)", fmt_big(val), "yfinance/income_stmt")
-            # annual growth, both years named (AUDIT FIX: the MRQ figure above
-            # must never be the only growth number in the packet)
-            annuals = []
-            for c in list(inc.columns)[:2]:
-                annuals.append((getattr(c, "year", c),
-                                inc.loc["Total Revenue", c] if "Total Revenue" in inc.index else None,
-                                inc.loc["Net Income", c] if "Net Income" in inc.index else None))
-            out.extend(fy_growth_lines(annuals))
+        out.extend(statement_lines(t.income_stmt, ccx["report"]))
     except Exception as e:
         out.append(f"[income_stmt unavailable: {e}]")
 
@@ -500,11 +585,7 @@ def market_snapshot(ticker: str) -> str:
     try:
         income = fmp_get_json("income-statement", symbol, limit=1)
         if isinstance(income, list) and income:
-            d = income[0]
-            fiscal_year = d.get("fiscalYear") or d.get("date")
-            suffix = f" ({fiscal_year})" if fiscal_year is not None else ""
-            add_line(f"EPS (latest fiscal year{suffix})", fmt_price(d.get("eps")), "FMP/income-statement")
-            add_line(f"EPS diluted (latest fiscal year{suffix})", fmt_price(d.get("epsDiluted")), "FMP/income-statement")
+            out.extend(fmp_income_lines(income[0], ccx))
         elif isinstance(income, dict):
             out.append(f"[FMP income statement section unavailable: {income}]")
     except Exception as e:
@@ -514,10 +595,7 @@ def market_snapshot(ticker: str) -> str:
     try:
         ratios = fmp_get_json("ratios-ttm", symbol)
         if isinstance(ratios, list) and ratios:
-            d = ratios[0]
-            add_line("Price/Sales (TTM)", fmt_ratio(d.get("priceToSalesRatioTTM")), "FMP/ratios")
-            add_line("Price/FCF (TTM)", fmt_ratio(d.get("priceToFreeCashFlowRatioTTM")), "FMP/ratios")
-            add_line("Free cash flow yield (TTM)", fmt_pct(d.get("freeCashFlowYieldTTM")), "FMP/ratios")
+            out.extend(fmp_ratio_lines(ratios[0], ccx))
         elif isinstance(ratios, dict):
             out.append(f"[FMP ratios section unavailable: {ratios}]")
     except Exception as e:
@@ -566,25 +644,7 @@ def market_snapshot(ticker: str) -> str:
         out.append("\n[DCF]")
         dcf = fmp_get_json("discounted-cash-flow", symbol)
         if isinstance(dcf, list) and dcf:
-            d = dcf[0]
-            dcf_val = d.get("dcf")
-            price = info.get("currentPrice")
-            far = dcf_val is not None and price and abs(float(dcf_val) / float(price) - 1) > 0.5
-            if far:
-                add_line("DCF fair value (unverified third-party model, assumptions not disclosed; excluded from the verdict)",
-                         fmt_price(dcf_val), "FMP/dcf")
-            else:
-                add_line("DCF fair value", fmt_price(dcf_val), "FMP/dcf")
-            if dcf_val is not None and price is not None and not far:
-                # WHY spell out the direction: leaving "247.17 vs 197.58" as raw
-                # numbers forces each agent to do the comparison itself; stating
-                # ABOVE/BELOW with the % gap removes an arithmetic step a model
-                # could botch mid-argument.
-                gap = (float(dcf_val) / float(price) - 1) * 100
-                direction = "ABOVE" if float(dcf_val) > float(price) else "BELOW"
-                add_line("DCF vs price",
-                         f"fair value is {direction} current price ({gap:+.1f}%)",
-                         "FMP/dcf")
+            out.extend(dcf_lines(dcf[0], info.get("currentPrice"), ccx))
         elif isinstance(dcf, dict):
             out.append(f"[FMP DCF section unavailable: {dcf}]")
     except Exception as e:

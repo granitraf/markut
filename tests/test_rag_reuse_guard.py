@@ -31,20 +31,15 @@ def test_second_build_reuses_session_collection(monkeypatch):
             counts["create"] += 1
             return _PlColl()
 
-    monkeypatch.setattr(rag, "ticker_to_cik", lambda s: "0000000000")
-    monkeypatch.setattr(rag, "get_filing_index", lambda cik: {})
-    monkeypatch.setattr(rag, "find_latest_filings",
-                        lambda recent, cik, forms, max_per_form=10: {
-                            "10-K": [{"url": "https://sec.test/000-fake-accession-1/f10k.htm",
-                                      "filing_date": "2026-01-01"}],
-                            "10-Q": [], "8-K": []})
-    monkeypatch.setattr(rag, "fetch_filing_html", lambda url: "<html></html>")
-    monkeypatch.setattr(rag, "extract_10k_sections", lambda html: {
-        "Item 1A": "Export risk hurts. Supply risk hurts. Demand risk hurts.",
-        "Item 7": "Revenue grew strongly. Margins expanded again this year."})
-    monkeypatch.setattr(rag, "extract_risk_titles", lambda html, sec: [])
-    monkeypatch.setattr(rag, "extract_8k_press_release", lambda docs: {
-        "text": "[press release unavailable: none]", "filing_date": "", "url": ""})
+    # run #28: the builder reads the filer-aware filing set and gathers its
+    # chunks by role; the seams moved, the guarded behaviour did not
+    from markut.evidence import sections
+    monkeypatch.setattr(sections, "filing_set", lambda t: {
+        "10-K": {"form": "10-K", "url": "https://sec.test/000-fake-accession-1/f10k.htm", "filing_date": "2026-01-01"},
+        "10-Q": None, "8-K": None, "monthly": [], "reasons": {}})
+    monkeypatch.setattr(rag, "filing_chunks", lambda fs, extra=None: [
+        {"text": "Export risk hurts. Supply risk hurts.", "metadata": {"form": "10-K", "section": "Item 1A"}},
+        {"text": "Revenue grew strongly. Margins expanded again this year.", "metadata": {"form": "10-K", "section": "Item 7"}}])
     monkeypatch.setattr(rag, "get_embedder", lambda: _PlEmbedder())
     monkeypatch.setattr(rag, "CHROMA", _PlChroma())
     rag._FILING_INDEX_CACHE.pop("FAKETK", None)

@@ -236,6 +236,7 @@ def judge_node(state: DebateState) -> dict:
         f"Latest Bear case:\n{state['bear_case']}\n\n"
         f"Rounds completed so far (including this one): {new_round}"
         + coverage_gap_note(state["evidence"])
+        + gate_note(lean_gate(state))
     )
     prefix = evidence_prefix(state["evidence"])
 
@@ -288,6 +289,9 @@ def judge_node(state: DebateState) -> dict:
     decision.setdefault("planner_coverage", "")
     if decision.get("lean") not in LEANS:
         decision["lean"] = None           # never a default stance
+    # run #28: the evidence gate is code — a withheld lean is None whatever the
+    # judge returned; at the coverage floor the confidence is capped at low
+    decision = apply_gate(decision, lean_gate(state))
     print(f"JUDGE LEAN: {decision.get('lean') or 'not recorded'} ({decision.get('lean_confidence') or '—'}) — {decision.get('lean_reason', '')}")
     return {
         "verdict": decision["verdict"],
@@ -297,6 +301,7 @@ def judge_node(state: DebateState) -> dict:
     }
 
 
+from markut.agents.gate import apply_gate, gate_note, lean_gate
 from markut.evidence.consensus import LEANS
 import re as _re
 

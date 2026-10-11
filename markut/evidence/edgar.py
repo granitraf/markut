@@ -74,6 +74,22 @@ def get_filing_index(cik: str) -> dict:
     return data["filings"]["recent"]
 
 
+def get_older_filings(cik: str, pages: int = 2) -> list:
+    """Older pages of the filing history (run #28, 2026-10-11). The 'recent'
+    table holds the latest 1,000 filings; a company with heavy Form 4 / 6-K
+    traffic can push its annual report out of it. Each page has the same
+    parallel arrays. Never raises: no pages -> []."""
+    try:
+        data = edgar_get(f"https://data.sec.gov/submissions/CIK{cik}.json").json()
+        out = []
+        for f in (data.get("filings", {}).get("files") or [])[:pages]:
+            out.append(edgar_get(f"https://data.sec.gov/submissions/{f['name']}").json())
+        return out
+    except Exception as e:
+        print(f"EDGAR: older filing pages unavailable ({e})")
+        return []
+
+
 def find_latest_filings(index: dict, cik: str, form_types=("10-K", "8-K"), max_per_form=1) -> dict:
     # WHY form_types is a list: adding "10-Q" later must be a one-element change
     # here, not a rewrite.
@@ -299,6 +315,74 @@ def extract_10k_sections(html: str) -> dict:
         "Item 7": item_7 if len(item_7) >= MIN_CHARS
         else "[section unavailable: Item 7 (MD&A) not located in this 10-K]",
     }
+
+
+def extract_20f_sections(html: str) -> dict:
+    """A 20-F's narrative items (run #28, foreign private issuers): Item 3.D
+    risk factors (inside Item 3 'Key Information'), Item 4 'Information on
+    the Company' (the business), Item 5 'Operating and Financial Review and
+    Prospects' (the annual MD&A). Same honest-marker convention as the 10-K
+    reader. Headings often use a non-breaking space ('ITEM\u00a04.')."""
+    text = html_to_text(html)
+    item3 = _find_section(text, r"(?m)^\s*item\s+3\b", [r"(?m)^\s*item\s+4\b"])
+    m = re.search(r"(?im)^\s*(?:d\.\s*)?risk factors\b", item3) or re.search(r"(?i)\brisk factors\b", item3)
+    risks = item3[m.start():] if m else ""
+    item4 = _find_section(text, r"(?m)^\s*item\s+4\b(?!\s*a)", [r"(?m)^\s*item\s+4\s*a\b", r"(?m)^\s*item\s+5\b"])
+    item5 = _find_section(text, r"(?m)^\s*item\s+5\b", [r"(?m)^\s*item\s+6\b"])
+    return {
+        "Item 3.D (Risk Factors)": risks if len(risks) >= 500
+        else "[section unavailable: Item 3.D (Risk Factors) not located in this 20-F]",
+        "Item 4 (Information on the Company)": item4 if len(item4) >= 500
+        else "[section unavailable: Item 4 (Information on the Company) not located in this 20-F]",
+        "Item 5 (Operating and Financial Review)": item5 if len(item5) >= 500
+        else "[section unavailable: Item 5 (Operating and Financial Review) not located in this 20-F]",
+    }
+
+
+def extract_40f_sections(exhibit_texts: list) -> dict:
+    """A 40-F's narrative lives in its exhibits (run #28, Canadian MJDS
+    filers): the Annual Information Form (business and risk factors) and
+    the annual MD&A. exhibit_texts: [text, ...]. Missing parts -> ''."""
+    # an exhibit is what its TITLE says it is: the MD&A mentions the AIF in its
+    # first paragraph (Suncor), so the test is the opening ~300 characters
+    title = lambda t: re.sub(r"[\s\u200b]+", " ", t)[:300].lower()
+    aif = next((t for t in exhibit_texts if "annual information form" in title(t)), "")
+    mda = next((t for t in exhibit_texts if re.search(r"management['’]s discussion and analysis", title(t))
+                and "annual information form" not in title(t)[:80]), "")
+
+    def longest(text, start, ends):
+        # AIF headings are usually CAPITALIZED, while the table of contents and
+        # cross-references use title case ("Risk Factors 40") — prefer
+        # capitalized occurrences, fall back to any case. Among them keep the
+        # longest span (a contents entry ends at the next heading one line
+        # later). The text converter can fold a short heading into the line
+        # before it, so occurrences are not anchored to line starts.
+        best = ""
+        caps = [m for m in re.finditer(start.upper(), text)]
+        for m in caps or list(re.finditer(start, text, re.IGNORECASE)):
+            tail = text[m.start() + 20:]
+            hits = [x.start() for ep in ends for x in [re.search(ep, tail) if caps else re.search(ep, tail, re.IGNORECASE)] if x]
+            if caps and not hits:
+                hits = [x.start() for ep in ends for x in [re.search(ep, tail, re.IGNORECASE)] if x]
+            e = m.start() + 20 + min(hits) if hits else len(text)
+            if e - m.start() > len(best):
+                best = text[m.start():e].strip()
+        return best
+    pool = aif or "\n\n".join(exhibit_texts)
+    business = longest(pool, r"DESCRIPTION OF THE BUSINESS|GENERAL DEVELOPMENT OF THE BUSINESS|OUR BUSINESS", [r"RISK FACTORS"])
+    # an AIF's sections follow a standard order; any of the ones after Risk
+    # Factors ends it (Canadian Natural's ran 250k characters to "dividends")
+    risks = longest(pool, r"RISK FACTORS", [r"DIVIDENDS|DESCRIPTION OF (?:SHARE )?CAPITAL(?: STRUCTURE)?|MARKET FOR (?:THE )?SECURITIES|"
+                                           r"DIRECTORS AND (?:EXECUTIVE )?OFFICERS|LEGAL PROCEEDINGS|INTERESTS? OF EXPERTS|AUDIT COMMITTEE|"
+                                           r"TRANSFER AGENTS?|MATERIAL CONTRACTS|INDUSTRY CONDITIONS|ENVIRONMENTAL (?:AND SOCIAL )?(?:MATTERS|REGULATION)"])
+    if not mda:
+        # the MD&A inside the main document (no titled exhibit): it runs to the
+        # statements that follow it
+        rest = "\n\n".join(exhibit_texts)
+        mda = longest(rest, r"MANAGEMENT['’]S DISCUSSION AND ANALYSIS",
+                      [r"MANAGEMENT['’]S REPORT|REPORT OF INDEPENDENT REGISTERED|INDEPENDENT AUDITOR['’]?S['’]? REPORT|CONSOLIDATED BALANCE SHEETS?\b"])
+    return {"business": business if len(business) >= 300 else "", "risk": risks if len(risks) >= 300 else "",
+            "mdna": mda if len(mda) >= 500 else ""}
 
 
 def extract_10q_sections(html: str) -> dict:
@@ -586,7 +670,30 @@ def extract_highlights(press_text: str, char_limit: int = 1500) -> str:
 # information:"), the row label, and the period heading of every column
 # ("13 Weeks Ended June 30, 2026"). Nothing here knows a company or a heading
 # only one filer uses.
-_UNITS_RE = re.compile(r"(?i)\b(?:in|\$ in|us\$ in|dollars in|amounts in)\s+(?:us\s*\$\s*|\$\s*|u\.s\. dollars? )?(thousands|millions|billions)\b")
+# run #28 (TSM): "(Unit: NT$ million, except for EPS)" — a 'unit:' lead-in, a
+# non-US dollar sign and a singular scale word all occur in foreign releases
+_UNITS_RE = re.compile(r"(?i)\b(?:in|\$ in|us\$ in|dollars in|amounts in|units?\s*:)\s*(?:(?:us|nt|c|ca|a|hk|s|nz)\s*\$\s*|\$\s*|"
+                       r"u\.s\. dollars? |(?:rmb|cny|jpy|eur|gbp|chf|krw|inr|twd|cad|aud|hkd|usd)\s+|[€£¥]\s*)?(thousands?|millions?|billions?)\b")
+# the currency a table's caption names; a bare "$" names none (a domestic
+# filer's dollars, a foreign filer's are labelled by the packet's currency note)
+_CURRENCY_HINTS = [("TWD", r"NT\$|New Taiwan dollars?|\bTWD\b"), ("CAD", r"\bC\$|\bCA\$|Canadian dollars?|\bCAD\b"),
+                   ("AUD", r"\bA\$|Australian dollars?|\bAUD\b"), ("HKD", r"HK\$|Hong Kong dollars?|\bHKD\b"),
+                   ("CNY", r"\bRMB\b|Renminbi|\bCNY\b"), ("JPY", r"¥|\bJPY\b|\byen\b"), ("EUR", r"€|\bEUR\b|\beuros?\b"),
+                   ("GBP", r"£|\bGBP\b|pounds? sterling"), ("KRW", r"₩|\bKRW\b|Korean won"), ("INR", r"₹|\bINR\b|Indian rupees?"),
+                   ("USD", r"US\$|U\.S\. dollars?|\bUSD\b")]
+
+
+def caption_currency(text: str) -> str:
+    """PURE. The ISO currency a table caption or header names ('' if none)."""
+    for code, pat in _CURRENCY_HINTS:
+        if re.search(pat, text or ""):
+            return code
+    return ""
+
+
+def _units_word(m) -> str:
+    w = (m.group(1) or "").lower() if m else ""
+    return w if not w or w.endswith("s") else w + "s"        # "million" -> "millions"
 _PAGE_FIELD_RE = re.compile(r"^\s*Field:\s*/", re.IGNORECASE)
 _FOOTNOTE_MARK_RE = re.compile(r"\s*\(\d{1,2}\)\s*$|\s*\(\d{1,2}\)(?=\s*:)|\*+$")
 _re_pct_of = re.compile(r"(?i)^(?:as a )?(?:percent(?:age)?|%) of (?:total |net |total net )?(?:revenues?|sales|net sales)\b")
@@ -608,6 +715,13 @@ def table_caption(table) -> tuple:
     """(caption, units) from the text that precedes a table: up to three
     non-empty strings back (skipping page fields), the last heading-like one
     as caption, units from any of them or from the table's own first cells."""
+    caption, units, _ccy = table_caption_ex(table)
+    return caption, units
+
+
+def table_caption_ex(table) -> tuple:
+    """(caption, units, currency) — table_caption plus the currency the
+    caption names (run #28: 'Unit: NT$ million' -> millions, TWD)."""
     prevs, node = [], table
     for _ in range(20):
         node = node.find_previous(string=re.compile(r"\S"))
@@ -629,7 +743,8 @@ def table_caption(table) -> tuple:
     units = ""
     m = _UNITS_RE.search(head_text)
     if m:
-        units = (m.group(1) or m.group(2) or "").lower()
+        units = _units_word(m)
+    currency = caption_currency(" ".join(p for p in prevs if _UNITS_RE.search(p)) or (prevs[0] if prevs else ""))
     caption = ""
     for s in prevs:                      # nearest first
         if _UNITS_RE.search(s) and len(s.split()) <= 9:
@@ -640,7 +755,7 @@ def table_caption(table) -> tuple:
         if len(s) <= 120 and not s.endswith("."):
             caption = cleaned
             break
-    return caption, units
+    return caption, units, currency
 
 
 def _cells_positional(tr) -> list:
@@ -714,7 +829,7 @@ def parse_tables(html: str) -> list:
     for ti, table in enumerate(soup.find_all("table")):
         if table.find_parent("table") is not None:
             continue
-        caption, units = table_caption(table)
+        caption, units, currency = table_caption_ex(table)
         headers, group, duration = [], "", ""
         seen_figure_row = False
         inherited = False
@@ -726,7 +841,8 @@ def parse_tables(html: str) -> list:
             if not units and not seen_figure_row and not any(numeric):
                 m = _UNITS_RE.search(" ".join(c[2] for c in cells))
                 if m:                          # "(in millions)" printed in the table's own header row
-                    units = (m.group(1) or "").lower()
+                    units = _units_word(m)
+                    currency = currency or caption_currency(" ".join(c[2] for c in cells))
             if len(cells) == 1 and not numeric[0]:
                 text = cells[0][2]
                 label_col = min([h[0] for h in headers] + [cells[0][0]]) if headers else 0
@@ -757,6 +873,7 @@ def parse_tables(html: str) -> list:
                 # current and year-ago periods instead of "unstated"
                 headers, duration = [list(h) for h in prev[0]], prev[1]
                 caption, units = (prev[2] + " (continued)") if prev[2] else "", units or prev[3]
+                currency = currency or (prev[4] if len(prev) > 4 else "")
                 inherited = True
             seen_figure_row = True
             label = "" if numeric[0] else cells[0][2]
@@ -781,14 +898,14 @@ def parse_tables(html: str) -> list:
                 row_cells.append({"heading": full, "period": pf["period"] if full else "", "entity": entity, "value": v})
             periods = [h[2] for h in headers]
             has_periods = bool(duration) or any(_PERIOD_WORDS_RE.search(h) or _DATE_RE.search(h) for h in periods)
-            out.append({"table": ti, "caption": caption, "units": units, "group": group, "label": label,
+            out.append({"table": ti, "caption": caption, "units": units, "currency": currency, "group": group, "label": label,
                         "cells": row_cells, "periods": periods, "duration": duration, "has_period_headings": has_periods})
             # a section ends at its Total row: the rows after it belong to no
             # group until the next heading
             if group and re.match(r"(?i)^total\b", label):
                 group = ""
         if headers and not inherited:
-            prev = (headers, duration, caption, units)
+            prev = (headers, duration, caption, units, currency)
     return out
 
 
@@ -798,6 +915,14 @@ def _strip_period_words(heading: str) -> str:
     t = _DATE_RE.sub("", heading or "")
     t = re.sub(r"(?i)\b(?:for the\s+)?(?:\d{1,2}|three|six|nine|twelve|thirteen|twenty-six|thirty-nine)\s*[- ]?(?:weeks?|months?)\s+(?:ended|ending)\b", "", t)
     t = re.sub(r"(?i)\b(?:year|years|quarter)\s+(?:ended|ending)\b|\bas of\b|\bended\b|\bending\b", "", t)
+    # run #28 (TSM): compact quarter labels ("2Q26", "Q3 2026", "3Q FY26") and
+    # change columns ("YoY Inc. (Dec.) %") name a period, not a segment
+    t = re.sub(r"(?i)\b[1-4]Q\s?(?:FY\s?)?'?(?:\d{2}|\d{4})\b|\bQ[1-4]\s?(?:FY\s?)?'?(?:\d{2}|\d{4})\b", "", t)
+    if re.search(r"(?i)\b(?:yoy|qoq|y/y|q/q)\b|inc\.?\s*\(dec\.?\)|\bincrease\s*\(decrease\)|%\s*change", t):
+        t = ""
+    # a trailing footnote marker ("2Q26 Amount a", "Amount (b)", "Amount*") is
+    # not part of the column's name — "Amount a" and "Amount" are one kind
+    t = re.sub(r"(?:\s+\(?[a-z]\)?|\s*\*+)$", "", re.sub(r"\s+", " ", t).strip(" ,"))
     return re.sub(r"\s+", " ", t).strip(" ,")
 
 
@@ -817,6 +942,19 @@ def period_from_heading(heading: str, fallback: str = "") -> dict:
     'unstated' when the table has period headings."""
     h = (heading or "").strip()
     low = h.lower()
+    # run #28 (TSM): change columns ("YoY Inc. (Dec.) %", "QoQ", "% change")
+    # are not periods — never a current or year-ago figure
+    if re.search(r"(?i)\b(?:yoy|qoq|y/y|q/q)\b|inc\.?\s*\(dec\.?\)|\bincrease\s*\(decrease\)|%\s*change|\bchange\b\s*%?$", h):
+        return {"period": "change", "label": h, "ended": ""}
+    # compact quarter labels: "2Q26", "Q3 2026", "3Q FY26" -> a quarter with a
+    # quarter-end date, so the newest column and its year-ago are known
+    cq = re.search(r"(?i)\b([1-4])Q\s?(?:FY\s?)?'?(\d{2}|\d{4})\b|\bQ([1-4])\s?(?:FY\s?)?'?(\d{2}|\d{4})\b", h)
+    if cq:
+        qn = int(cq.group(1) or cq.group(3))
+        yr = cq.group(2) or cq.group(4)
+        yr = int(yr) + 2000 if len(yr) == 2 else int(yr)
+        end = ("March 31", "June 30", "September 30", "December 31")[qn - 1]
+        return {"period": "quarter", "label": h, "ended": f"{end}, {yr}"}
     ended = _DATE_RE.search(h)
     period = ""
     if re.search(r"(?i)\b(ttm|trailing|last twelve months)\b", low):

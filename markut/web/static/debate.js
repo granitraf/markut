@@ -115,31 +115,57 @@ window.Markut = (function () {
      one plain sentence comparing the two. */
   const LEANS = ["strongly_bearish", "bearish", "neutral", "bullish", "strongly_bullish"];
   const STOPS = ["strong sell", "sell", "hold", "buy", "strong buy"];
+  // run #28: the scale is an inline SVG with its own colours — it draws even if
+  // a stylesheet is stale or blocked, and it reads as a graphic at a glance:
+  // a red-to-green track from strongly bearish / strong sell to strongly
+  // bullish / strong buy, the debate's marker on it, the analysts' below it
+  const SCALE_COLORS = ["#c0392b", "#e08a7e", "#9a978f", "#6fbf8f", "#1f8a4c"];
+  function scaleSvg(p, a, mean, counts) {
+    const W = 600, x0 = 60, x1 = 540, X = (pos) => x0 + pos * (x1 - x0), seg = (x1 - x0) / 5;
+    const keys = ["strong_sell", "sell", "hold", "buy", "strong_buy"];
+    const total = counts ? keys.reduce((t, k) => t + (counts[k] || 0), 0) : 0;
+    let svg = `<svg class="scale-svg" viewBox="0 0 ${W} ${total ? 150 : 112}" width="100%" role="img" aria-label="${esc(
+      (p === null ? "No lean issued" : "Debate lean at " + LEANS[Math.round(p * 4)].replace(/_/g, " ")) +
+      (a === null ? "" : `; analyst mean ${mean} (${STOPS[Math.round(a * 4)]})`))}" xmlns="http://www.w3.org/2000/svg">`;
+    LEANS.forEach((l, i) => { svg += `<text x="${X(i / 4)}" y="16" text-anchor="middle" font-size="14" fill="currentColor" fill-opacity="0.7">${esc(l.replace(/_/g, " "))}</text>`; });
+    SCALE_COLORS.forEach((c, i) => { svg += `<rect x="${x0 + i * seg - (i ? 0 : 6)}" y="34" width="${seg + (i === 0 || i === 4 ? 6 : 0)}" height="10" fill="${c}"${i === 0 ? ' rx="5"' : i === 4 ? ' rx="5"' : ""}/>`; });
+    if (p !== null) {
+      const fill = SCALE_COLORS[Math.round(p * 4)];
+      svg += `<circle cx="${X(p)}" cy="39" r="11" fill="${fill}" stroke="#ffffff" stroke-width="3"/>`;
+      svg += `<text x="${X(p)}" y="${p === null ? 0 : 66}" text-anchor="middle" font-size="14" font-weight="700" fill="${fill}">debate</text>`;
+    } else {
+      svg += `<text x="${W / 2}" y="66" text-anchor="middle" font-size="14" font-weight="700" fill="currentColor">no lean issued</text>`;
+    }
+    if (a !== null) {
+      const xa = X(a);
+      svg += `<polygon points="${xa},50 ${xa - 8},${p !== null && Math.abs(xa - X(p)) < 40 ? 62 : 62} ${xa + 8},62" fill="#8e7cc3"/>`;
+      svg += `<text x="${xa}" y="${p !== null && Math.abs(xa - X(p)) < 46 ? 80 : 78}" text-anchor="middle" font-size="14" font-weight="700" fill="#8e7cc3">analysts ${mean}</text>`;
+    }
+    STOPS.forEach((st, i) => { svg += `<text x="${X(i / 4)}" y="100" text-anchor="middle" font-size="14" fill="currentColor" fill-opacity="0.7">${st}</text>`; });
+    if (total) {
+      let cx = x0;
+      keys.forEach((k, i) => { const w = (x1 - x0) * (counts[k] || 0) / total; if (w > 0) svg += `<rect x="${cx}" y="112" width="${w}" height="9" fill="${SCALE_COLORS[i]}"/>`; cx += w; });
+      svg += `<text x="${W / 2}" y="140" text-anchor="middle" font-size="13" fill="currentColor" fill-opacity="0.7">ratings this month: ${keys.map((k, i) => `${STOPS[i]} ${counts[k] || 0}`).join(" · ")}</text>`;
+    }
+    return svg + "</svg>";
+  }
   function leanHtml(lean, cons, comparison) {
-    if (!lean || LEANS.indexOf(lean.lean) < 0) return "";
-    const at = (pos) => `${10 + pos * 80}%`;                 // label columns centre on 10/30/50/70/90%
-    const p = LEANS.indexOf(lean.lean) / 4;
-    const side = p < 0.5 ? "bear" : p > 0.5 ? "bull" : "flat";
+    if (!lean) return "";
+    const withheld = !lean.lean && lean.withheld;
+    if (!withheld && LEANS.indexOf(lean.lean) < 0) return "";
+    const p = withheld ? null : LEANS.indexOf(lean.lean) / 4;
+    const side = p === null ? "flat" : p < 0.5 ? "bear" : p > 0.5 ? "bull" : "flat";
     const mean = cons && typeof cons.mean === "number" ? cons.mean : null;
     const a = mean === null ? null : Math.min(1, Math.max(0, (5 - mean) / 4));
-    const counts = (cons && cons.counts) || null;
-    const total = counts ? Object.values(counts).reduce((x, y) => x + y, 0) : 0;
-    const keys = ["strong_sell", "sell", "hold", "buy", "strong_buy"];
-    return `<div class="lean">
-      <div class="lean-head"><span class="lean-k">lean</span> <b class="lean-v ${side}">${esc(lean.lean.replace(/_/g, " "))}</b>${lean.confidence ? ` <span class="lean-c">${esc(lean.confidence)} confidence</span>` : ""}</div>
-      ${lean.reason ? `<p class="lean-r">${esc(lean.reason)}</p>` : ""}
-      <div class="scale">
-        <div class="scale-lab">${LEANS.map((l) => `<span>${esc(l.replace(/_/g, " "))}</span>`).join("")}</div>
-        <div class="scale-track">${[0, 1, 2, 3, 4].map((i) => `<i class="tick" style="left:${at(i / 4)}"></i>`).join("")}
-          <span class="mk ours ${side}" style="left:${at(p)}" title="the debate's lean"></span>
-          ${a === null ? "" : `<span class="mk theirs" style="left:${at(a)}" title="analyst mean ${mean}"></span>`}</div>
-        <div class="scale-lab low">${STOPS.map((s) => `<span>${s}</span>`).join("")}</div>
-        ${total ? `<div class="spread">${keys.map((k, i) => counts[k] ? `<span class="s${i}" style="width:${(100 * counts[k] / total).toFixed(2)}%" title="${STOPS[i]} ${counts[k]}"></span>` : "").join("")}</div>
-          <div class="spread-legend">ratings this month: ${keys.map((k, i) => `${STOPS[i]} ${counts[k] || 0}`).join(" · ")}</div>` : ""}
-        <div class="scale-key"><span class="mk-key ours ${side}"></span> debate lean${a === null ? "" : ` <span class="mk-key theirs"></span> analyst mean ${mean}`}</div>
-      </div>
+    const head = withheld
+      ? `<div class="lean-head"><span class="lean-k">lean</span> <b class="lean-v flat">No lean</b> <span class="lean-c">withheld by the evidence gate</span></div>
+         <p class="lean-r">The evidence could not support a lean: ${esc(lean.withheld)}.</p>`
+      : `<div class="lean-head"><span class="lean-k">lean</span> <b class="lean-v ${side}">${esc(lean.lean.replace(/_/g, " "))}</b>${lean.confidence ? ` <span class="lean-c">${esc(lean.confidence)} confidence</span>` : ""}</div>
+         ${lean.reason ? `<p class="lean-r">${esc(lean.reason)}</p>` : ""}`;
+    return `<div class="lean${withheld ? " withheld" : ""}">${head}
+      <div class="scale">${scaleSvg(p, a, mean, (cons && cons.counts) || null)}</div>
       ${comparison ? `<p class="cmp">${esc(comparison)}</p>` : ""}
-      ${cons && cons.target_mean && cons.price ? `<p class="tgt">Analyst mean price target $${Number(cons.target_mean).toFixed(2)} vs price $${Number(cons.price).toFixed(2)}. Ratings and price targets were kept out of the debate, so the lean was formed without them.</p>` : ""}
+      ${cons && cons.target_mean && cons.price ? `<p class="tgt">Analyst mean price target $${Number(cons.target_mean).toFixed(2)} vs price $${Number(cons.price).toFixed(2)}. Ratings and price targets were kept out of the debate${withheld ? "." : ", so the lean was formed without them."}</p>` : ""}
     </div>`;
   }
   function sourcesHtml(sources) {

@@ -169,121 +169,115 @@ CHROMA = chromadb.Client()
 _FILING_INDEX_CACHE = {}
 
 
-def build_filing_index(ticker: str, extra_sections: list = None):
-    # Full pipeline for one ticker: filings -> sections -> chunks -> vectors ->
-    # a per-ticker Chroma collection. Returns the collection.
-    # Besides the semantic chunks, TWO DETERMINISTIC blocks are stored under
-    # their own section names ("Item 1A titles", "Item 1 overview"). They live
-    # in the same collection for provenance, but are fetched by metadata
-    # EQUALITY (coll.get), never by similarity search.
-    # extra_sections = [{"section","text","form","filing_date","url"}]: text
-    # that is not a filing document — a transcribed slide deck — indexed one
-    # slide per chunk so question retrieval can reach it.
-    symbol = ticker.upper().strip()
-    cik = ticker_to_cik(symbol)
-    recent = get_filing_index(cik)
-    latest = find_latest_filings(recent, cik, ["10-K", "10-Q", "8-K"], max_per_form=10)
-
-    # REUSE GUARD: same ticker + same filing vintage already indexed in this
-    # kernel -> return it instead of re-fetching and re-embedding everything
-    # (a live harness run built one ticker's identical index twice). WHY the
-    # fingerprint is the candidate filing URLs: each URL carries its
-    # accession number, so a newly published filing — or a changed pick —
-    # changes the fingerprint and forces a genuine rebuild.
-    fingerprint = tuple(doc["url"] for form in ("10-K", "10-Q", "8-K")
-                        for doc in latest[form]) + tuple(
-                            (x.get("url", ""), x.get("section", ""), len(x.get("text", ""))) for x in (extra_sections or []))
-    _cached = _FILING_INDEX_CACHE.get(symbol)
-    if _cached and _cached[0] == fingerprint:
-        print(f"RAG: reusing existing collection for {symbol} — same filings, skipping re-embed")
-        return _cached[1]
-
+def filing_chunks(fs: dict, extra_sections: list = None) -> list:
+    """Chunks for the index, gathered by ROLE from filing_set (run #28): the
+    annual report (10-K Items 1A / 7 + the Item 1 overview; 20-F Items 3.D /
+    5 + the Item 4 overview; 40-F AIF risk factors / annual MD&A + the AIF
+    business overview), the interim report (10-Q MD&A, risk updates and
+    obligations notes; a 6-K interim report's text), the results release
+    (8-K or 6-K exhibit) and monthly revenue 6-Ks. Every chunk keeps its
+    document's REAL form. Two DETERMINISTIC blocks go under their own section
+    names ("Item 1A titles", "Item 1 overview") — fetched by metadata
+    equality, never by similarity — whatever the annual form."""
+    from markut.evidence import filers
+    from markut.evidence.sections import NOTE_HEADINGS, _NOTE_END, _best_section, annual_sections, doc_text, exhibits_of
     all_chunks = []
-    # ---- 10-K: Item 1A gets per-risk-factor treatment when its structure is
-    # recoverable; Item 7 (and Item 1A as a fallback) chunk normally.
-    if latest["10-K"]:
-        doc = latest["10-K"][0]
-        html = fetch_filing_html(doc["url"])
-        sections = extract_10k_sections(html)
-        titles = extract_risk_titles(html, sections["Item 1A"])
-        # WHY the >=5 gate: a real Risk Factors section lists DOZENS of risks.
-        # A handful of matches means caption detection only partly worked on
-        # this filer's formatting — splitting on partial structure could
-        # silently drop real risks, so we fall back to plain chunking instead.
-        if len(titles) >= 5:
-            print(f"RAG: Item 1A split into {len(titles)} titled risk factors")
-            for block in split_risk_factors(sections.pop("Item 1A"), titles):
-                # A recovered block begins with its management-written caption.
-                # Carry that caption into every sentence window so a middle-body
-                # match never loses the name of the risk it belongs to.
-                risk_title = next((t for t in titles if block.startswith(t)), "")
-                all_chunks += chunk_sections(
-                    {"Item 1A": block}, "10-K", doc["filing_date"], doc["url"],
-                    risk_title=risk_title,
-                )
-            # The caption list IS management's own one-line-per-risk summary of
-            # everything that scares them — stored whole as one deterministic
-            # block (~300 packet tokens buys COMPLETE risk coverage).
-            all_chunks.append({
-                "text": " • ".join(titles),
-                "metadata": {"form": "10-K", "section": "Item 1A titles",
-                             "filing_date": doc["filing_date"], "url": doc["url"]},
-            })
-        all_chunks += chunk_sections(sections, "10-K", doc["filing_date"], doc["url"])
-        # AUDIT FIX (run #2): what the company SELLS — the head of Item 1,
-        # stored as a deterministic block so every debate opens with it
-        overview = business_overview(extract_10k_business(html))
+    annual = fs.get("10-K")
+    if annual:
+        form, date, url = annual["form"], annual["filing_date"], annual["url"]
+        secs = annual_sections(annual)
+        risk_label, risk_text = secs.get("risk", ("", ""))
+        mdna_label, mdna_text = secs.get("mdna", ("", ""))
+        # section names in the index are the item names, without the form
+        # prefix (the source tag adds the form): "Item 1A", "Item 3.D (Risk Factors)"
+        short = lambda label: label.split(" ", 1)[1] if label.startswith(form + " ") else label
+        risk_name = "Item 1A" if filers.base_form(form) == "10-K" else short(risk_label)
+        mdna_name = "Item 7" if filers.base_form(form) == "10-K" else short(mdna_label)
+        if risk_text:
+            html = fetch_filing_html(url) if filers.base_form(form) in ("10-K", "20-F") else ""
+            titles = extract_risk_titles(html, risk_text) if html else []
+            if len(titles) >= 5:
+                print(f"RAG: {form} risk factors split into {len(titles)} titled risk factors")
+                for block in split_risk_factors(risk_text, titles):
+                    risk_title = next((t for t in titles if block.startswith(t)), "")
+                    all_chunks += chunk_sections({risk_name: block}, form, date, url, risk_title=risk_title)
+                all_chunks.append({"text": " • ".join(titles),
+                                   "metadata": {"form": form, "section": "Item 1A titles", "filing_date": date, "url": url}})
+            else:
+                all_chunks += chunk_sections({risk_name: risk_text}, form, date, url)
+        if mdna_text:
+            all_chunks += chunk_sections({mdna_name: mdna_text}, form, date, url)
+        overview = business_overview(secs.get("business", ("", ""))[1])
         if overview:
-            all_chunks.append({
-                "text": overview,
-                "metadata": {"form": "10-K", "section": "Item 1 overview",
-                             "filing_date": doc["filing_date"], "url": doc["url"]},
-            })
+            all_chunks.append({"text": overview,
+                               "metadata": {"form": form, "section": "Item 1 overview", "filing_date": date, "url": url}})
         else:
-            print("RAG: Item 1 (Business) not located — business overview block will be absent")
+            print(f"RAG: {form} business section not located — business overview block will be absent")
     else:
-        print(f"RAG: no recent 10-K for {symbol} — skipping")
+        print(f"RAG: no annual report — {fs.get('reasons', {}).get('annual', 'not found')}")
 
-    # ---- 10-Q: quarterly MD&A + risk updates, plain chunking.
-    if latest["10-Q"]:
-        doc = latest["10-Q"][0]
-        q_html = fetch_filing_html(doc["url"])
+    interim = fs.get("10-Q")
+    if interim and filers.base_form(interim["form"]) == "10-Q":
+        q_html = fetch_filing_html(interim["url"])
         sections = extract_10q_sections(q_html)
-        # the notes that carry obligations and financing — commitments,
-        # guarantees, leases, debt — indexed under the heading actually found,
-        # so a question about guarantees or leverage can retrieve into them
-        from markut.evidence.sections import NOTE_HEADINGS, _NOTE_END, _best_section
         plain = html_to_text(q_html)
         for title, pat, _topics in NOTE_HEADINGS:
             note = _best_section(plain, r"(?m)^\s*(?:note\s+)?(?:\d{1,2}\s*[.\-—:]?\s*)?" + pat + r"\b",
                                  _NOTE_END, min_chars=300, max_chars=40000)
             if note:
                 sections[f"{title} (10-Q note)"] = note
-        all_chunks += chunk_sections(sections, "10-Q", doc["filing_date"], doc["url"])
+        all_chunks += chunk_sections(sections, "10-Q", interim["filing_date"], interim["url"])
+    elif interim:
+        all_chunks += chunk_sections({"interim report": doc_text(interim)}, interim["form"], interim["filing_date"], interim["url"])
     else:
-        print(f"RAG: no recent 10-Q for {symbol} — skipping")
+        print(f"RAG: no interim report — {fs.get('reasons', {}).get('interim', 'not found')}")
 
-    # ---- 8-K press release: semantic chunks (guidance, segment figures and
-    # executive quotes are extracted deterministically by evidence.sections)
-    pr = extract_8k_press_release(latest["8-K"])
-    if not pr["text"].startswith("[press release unavailable"):
-        all_chunks += chunk_sections({"press release": pr["text"]}, "8-K",
-                                     pr["filing_date"], pr["url"])
+    earnings = fs.get("8-K")
+    if earnings and filers.base_form(earnings["form"]) == "8-K":
+        pr = extract_8k_press_release(fs.get("all_8k") or [earnings])
+        if not pr["text"].startswith("[press release unavailable"):
+            all_chunks += chunk_sections({"press release": pr["text"]}, "8-K", pr["filing_date"], pr["url"])
+        else:
+            print(f"RAG: {pr['text']}")
+    elif earnings:
+        release = next((e for e in exhibits_of(earnings) if not e["image_only"] and len(e["text"]) > 200), None)
+        if release:
+            all_chunks += chunk_sections({"press release": release["text"]}, release["form"], release["filing_date"], release["url"])
     else:
-        print(f"RAG: {pr['text']}")
+        print(f"RAG: no results release — {fs.get('reasons', {}).get('earnings', 'not found')}")
+    for m in fs.get("monthly") or []:
+        text = doc_text(m)
+        if text.strip():
+            all_chunks += chunk_sections({"monthly revenue report": text}, m["form"], m["filing_date"], m["url"])
 
-    # ---- transcribed decks and any other non-document text: one slide per chunk
     for extra in extra_sections or []:
         text = extra.get("text") or ""
         blocks = [b.strip() for b in re.split(r"(?=^Slide\s+\d+\s*[:\-—])", text, flags=re.MULTILINE | re.IGNORECASE) if b.strip()]
         for b in blocks or ([text] if text.strip() else []):
             all_chunks.append({"text": b[:1500], "embed_text": b[:1200],
-                               "metadata": {"form": extra.get("form", "8-K"), "section": extra.get("section", "8-K slides"),
+                               "metadata": {"form": extra.get("form", "8-K"), "section": extra.get("section", "slides"),
                                             "filing_date": extra.get("filing_date", ""), "url": extra.get("url", "")}})
+    return all_chunks
 
-    # WHY delete-then-create: "rebuild" must mean REPLACE — appending to an old
-    # collection would mix chunks from different filing vintages of the same
-    # ticker, and retrieval would quote superseded documents.
+
+def build_filing_index(ticker: str, extra_sections: list = None):
+    # Full pipeline for one ticker: filings -> sections -> chunks -> vectors ->
+    # a per-ticker Chroma collection. Returns the collection. The chunks come
+    # from filing_chunks(filing_set) — the same filer-aware roles every other
+    # reader uses (run #28: this builder used to look for 10-K / 10-Q / 8-K on
+    # its own and found nothing for a 20-F / 6-K filer).
+    from markut.evidence.sections import filing_set
+    symbol = ticker.upper().strip()
+    fs = filing_set(symbol)
+    fingerprint = tuple(d["url"] for d in (fs.get("10-K"), fs.get("10-Q"), fs.get("8-K")) if d) + tuple(
+        m["url"] for m in fs.get("monthly") or []) + tuple(
+        (x.get("url", ""), x.get("section", ""), len(x.get("text", ""))) for x in (extra_sections or []))
+    _cached = _FILING_INDEX_CACHE.get(symbol)
+    if _cached and _cached[0] == fingerprint:
+        print(f"RAG: reusing existing collection for {symbol} — same filings, skipping re-embed")
+        return _cached[1]
+    all_chunks = filing_chunks(fs, extra_sections)
+
     name = f"filings_{symbol.replace('.', '_')}"  # Chroma names disallow "."
     try:
         CHROMA.delete_collection(name)
@@ -724,13 +718,19 @@ def get_filings_evidence(ticker: str, plan: dict = None, profile: dict = None, p
         fs = secs.filing_set(ticker)
     except Exception as e:
         return f"\n\n[FILINGS]\n[filings unavailable: {e}]"
+    if not (fs.get("10-K") or fs.get("10-Q") or fs.get("8-K")):
+        # run #28: an empty filing set used to surface as "unavailable —
+        # unavailable"; the reason is now always stated
+        why = fs.get("reasons", {}).get("annual") or "no filings found"
+        return f"\n\n[FILINGS]\n[filings unavailable: {why}]"
     transcripts = []
     try:
         transcripts = secs.transcripts_for(fs)
     except Exception as e:
         print(f"RAG: transcripts lookup skipped ({e})")
-    extra = [{"section": f"8-K {t.get('name', 'exhibit')} (slides, transcribed)", "text": t.get("text", ""),
-              "form": "8-K", "filing_date": t.get("filing_date", ""), "url": t.get("url", "")}
+    rel_form = (fs.get("8-K") or {}).get("form", "8-K")
+    extra = [{"section": f"{rel_form} {t.get('name', 'exhibit')} (slides, transcribed)", "text": t.get("text", ""),
+              "form": rel_form, "filing_date": t.get("filing_date", ""), "url": t.get("url", "")}
              for t in transcripts if t.get("text")]
     try:
         coll = build_filing_index(ticker, extra_sections=extra)
@@ -744,8 +744,9 @@ def get_filings_evidence(ticker: str, plan: dict = None, profile: dict = None, p
         metas = coll.get(include=["metadatas"])["metadatas"] or []
         seen = {}
         for m in metas:
-            label = "8-K press release" if m["form"] == "8-K" and "slides" not in str(m.get("section", "")) else (
-                "8-K slides" if m["form"] == "8-K" else m["form"])
+            sec = str(m.get("section", ""))
+            label = (f"{m['form']} slides" if "slides" in sec else f"{m['form']} results release" if sec == "press release"
+                     else f"{m['form']} monthly revenue report" if sec == "monthly revenue report" else m["form"])
             seen[(label, m["filing_date"])] = m.get("url", "")
         if seen:
             lines.append("Sources: " + " | ".join(

@@ -173,7 +173,8 @@ def excerpt_relevant(q: dict, text: str, segments: list) -> bool:
 
 
 def filing_dates(coll) -> dict:
-    """{"10-K": newest 10-K date, "10-Q": newest 10-Q date, "8-K": newest 8-K date} from the index."""
+    """{form: newest filing date of that form} from the index — 10-K / 10-Q /
+    8-K for a domestic filer, 20-F or 40-F / 6-K for a foreign one."""
     out = {}
     try:
         for m in coll.get(include=["metadatas"])["metadatas"] or []:
@@ -186,23 +187,30 @@ def filing_dates(coll) -> dict:
 
 
 def is_current(meta: dict, dates: dict) -> bool:
-    """A filing is current-period when it is newer than the newest 10-K (a
-    10-Q or 8-K after it), or when it IS the newest annual report and no
-    later quarter has been filed."""
+    """A filing is current-period when it is newer than the newest annual
+    report (a 10-Q / 8-K after the 10-K, a 6-K after the 20-F or 40-F), or
+    when it IS the newest annual report and no later interim report has been
+    filed. Roles, not form names (run #28): a foreign issuer's interim
+    reports are 6-Ks, so any later 6-K supersedes its 20-F; for a domestic
+    filer only a later 10-Q supersedes the 10-K (an 8-K does not)."""
+    from markut.evidence import filers
     form, d = meta.get("form", ""), meta.get("filing_date", "") or ""
-    k = dates.get("10-K", "")
-    if form in ("10-Q", "8-K"):
-        return not k or d >= k
-    if form == "10-K":
-        return not any(dates.get(f, "") > d for f in ("10-Q",))
+    role = filers.role_of(form)
+    annual = max((v for f, v in dates.items() if filers.role_of(f) == "annual" and v), default="")
+    if role in ("interim", "current"):
+        return not annual or d >= annual
+    if role == "annual":
+        return not any(v > d for f, v in dates.items()
+                       if v and (filers.role_of(f) == "interim" or filers.base_form(f) == "6-K"))
     return False
 
 
 def period_label(meta: dict, dates: dict) -> str:
+    from markut.evidence import filers
     form, d = meta.get("form", "?"), meta.get("filing_date", "?")
     if is_current(meta, dates):
         return f"current period ({form} filed {d})"
-    if form == "10-K":
+    if filers.role_of(form) == "annual":
         return f"prior fiscal year ({form} filed {d})"
     return f"earlier filing ({form} filed {d})"
 
@@ -433,19 +441,20 @@ def general_blocks(coll, fs: dict, profile: dict) -> list:
         try:
             release = next((e for e in secs.exhibits_of(fs["8-K"]) if not e["image_only"] and len(e["text"]) > 200), None)
         except Exception as e:
-            lines.append(f"[8-K exhibits unavailable: {e}]")
+            lines.append(f"[{fs['8-K'].get('form', '8-K')} exhibits unavailable: {e}]")
     if release:
         rl = secs.release_lines(release["text"], names, max_figures=10)
-        src = f"[source: EDGAR/8-K {release['name']}, filed {release['filing_date']}, {release['url']}]"
+        rf = release.get("form", "8-K")        # run #28: the release's real form (8-K or 6-K)
+        src = f"[source: EDGAR/{rf} {release['name']}, filed {release['filing_date']}, {release['url']}]"
         if rl["quotes"]:
-            lines.append(f"-- Executive quotes (8-K filed {release['filing_date']}) --")
+            lines.append(f"-- Executive quotes ({rf} filed {release['filing_date']}) --")
             for qt in rl["quotes"]:
                 lines.append(f'- "{qt}"')
             lines.append(f"  {src}")
         # prose revenue statements only: table figures live in [CORE FIGURES] with their context
         prose = [f for f in rl["figures"] if f.get("kind") == "sentence"][:6]
         if prose:
-            lines.append(f"-- Revenue statements in the release (8-K filed {release['filing_date']}) --")
+            lines.append(f"-- Revenue statements in the release ({rf} filed {release['filing_date']}) --")
             for f in prose:
                 period = tag_period(f["text"])
                 if period == "unstated" and f.get("default_period"):
@@ -470,26 +479,29 @@ def guidance_block(fs: dict, transcripts: list) -> list:
     """[GUIDANCE]: every guided item as its own line, with its source; an
     EXTRACTION FAILURE line where forward-looking language exists but no
     figure could be read (never 'no guidance')."""
-    return format_guidance(secs.guidance_lines(secs.guidance_sources(fs, transcripts)))
+    from markut.evidence.filers import source_phrase
+    return format_guidance(secs.guidance_lines(secs.guidance_sources(fs, transcripts)), source_phrase(fs))
 
 
-def format_guidance(g: dict) -> list:
+def format_guidance(g: dict, sources: str = "the latest 8-K exhibits or 10-Q") -> list:
     """PURE. The [GUIDANCE] lines from guidance_lines' result. When no business
-    target was found it says so and names why (run #26, P2 item 10)."""
-    lines = ["[GUIDANCE] (forward-looking business targets with a figure, from the latest 8-K exhibits and 10-Q; "
+    target was found it says so and names why (run #26, P2 item 10).
+    sources names the filings read — the forms this company files (run #28)."""
+    lines = [f"[GUIDANCE] (forward-looking business targets with a figure, from {sources}; "
              "accounting schedules excluded; each line is one guided item)"]
     urls = {}
     for item in g["lines"]:
         where = f"; {item['where']}" if item.get("where") and item["where"] != "text" else ""
         urls.setdefault(item["label"], item.get("url", ""))
-        lines.append(f'- [guidance] "{item["text"]}"  [source: EDGAR/{item["form"]} {item["label"]}, filed {item["filing_date"]}{where}; '
+        label = item["label"] if not item["label"].startswith(item["form"] + " ") else item["label"][len(item["form"]) + 1:]
+        lines.append(f'- [guidance] "{item["text"]}"  [source: EDGAR/{item["form"]} {label}, filed {item["filing_date"]}{where}; '
                      f"{tag_period(item['text'])}; {tag_basis(item['text'])} basis]")
     if urls:
         lines.append("  Guidance sources: " + " | ".join(f"{k} {v}" for k, v in urls.items() if v))
     for f in g["failures"]:
         lines.append(f"- EXTRACTION FAILURE: {f}")
     if not g["lines"] and not g["failures"]:
-        lines.append("- no forward-looking business targets found in the latest 8-K exhibits or 10-Q (accounting schedules such as "
+        lines.append(f"- no forward-looking business targets found in {sources} (accounting schedules such as "
                      "deferred-revenue, lease and debt-maturity tables are excluded). A company that gives guidance only on its "
                      "earnings call is a known gap: no call transcript is available.")
     return lines
