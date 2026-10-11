@@ -177,8 +177,10 @@ def test_question_blocks_tag_dedupe_and_read_once():
     lines = questions.question_blocks(coll, plan, {"segments": []}, profiled_text=docs[2][0], relaxed=[])
     text = "\n".join(lines)
     assert text.count("Comparable restaurant sales increased 5.8%") == 1          # one chunk, one use across questions
-    assert "menu innovation and hospitality" not in text                            # read-once: the profiler already read it
-    assert "; quarter; unstated basis; segment unspecified]" in text
+    # run #26 (P1): read-once against the profiler's text is gone (the latest MD&A must reach the debate);
+    # this generic strategy sentence stays out because it does not address either question
+    assert "menu innovation and hospitality" not in text
+    assert "current period (10-Q filed 2026-08-03); text says quarter; unstated basis; segment unspecified]" in text
     q3 = text.split("[EVIDENCE Q3]")[1]
     assert "could not find:" in q3 and "[source:" not in q3
     assert questions.coverage_from_text(text, ["Q1", "Q2", "Q3"])["Q3"] == 0
@@ -280,8 +282,8 @@ def test_claim_dedupe_merge_and_verdicts(stub_llm, monkeypatch):
     monkeypatch.setattr(rag, "corroborate_claims", fake_corroborate)
     monkeypatch.setattr(nodes, "get_related_leads", lambda claims, t: "")
     review = json.dumps({"claim_reviews": [
-        {"claim": "Bull's claim that operating leverage is already hinted by MRQ earnings growth of 23.7% vs revenue growth of 7.7% is inference", "status": "unresolved", "evidence_summary": "s", "sources": []},
-        {"claim": "a restatement of the first claim about $69.0M deleveraging that was not submitted", "status": "supported", "evidence_summary": "s", "sources": []}],
+        {"claim": "Bull's claim that operating leverage is already hinted by MRQ earnings growth of 23.7% vs revenue growth of 7.7% is inference", "status": "unresolved", "flag": "unresolved", "evidence_summary": "s", "sources": []},
+        {"claim": "a restatement of the first claim about $69.0M deleveraging that was not submitted", "status": "supported", "flag": "upheld", "evidence_summary": "s", "sources": []}],
         "reasoning": "r", "verdict_changed": False, "revised_verdict": ""})
     calls = stub_llm([review])
     state = {"ticker": "CAKE", "evidence": "packet", "verdict": "v", "judge_decision": {"unsupported_claims": [
@@ -297,7 +299,7 @@ def test_claim_dedupe_merge_and_verdicts(stub_llm, monkeypatch):
     assert verdicts["Operating leverage i"] == "unresolved"           # 23.7% was not found, so it went to the re-audit
     assert verdicts["Bear's 'a few points"] == "unresolved" and "no ruling" in reviews[-1]["evidence_summary"]
     assert len(reviews) == 3 and len(calls) == 1 and "FILINGS ADDENDUM" in out["evidence"]
-    assert nodes.CLAIM_VERDICTS["contradicted"] == "flag upheld"
+    assert nodes.CLAIM_FLAG_LABELS["upheld"] == "flag upheld" and reviews[0]["flag"] == "overturned"
 
 
 # ---------------------------------------------------------------- market data

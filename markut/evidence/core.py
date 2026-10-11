@@ -36,7 +36,12 @@ SEGMENT_TABLE_RE = re.compile(r"(?i)segment|revenues? by|disaggregat|revenue (?:
 NON_GAAP_RE = re.compile(r"(?i)non-?gaap|adjusted|excluding|ex\.?\s|constant currency")
 PERCENT_COL_RE = re.compile(r"(?i)percent(?:age)? of (?:total )?(?:revenues?|sales|net sales)|% of (?:revenues?|sales)|as a percentage of")
 BOILERPLATE_LABEL_RE = re.compile(r"(?i)^\(?\d+\)?$|^note|^see |weighted[- ]average|shares outstanding")
-MAX_LINES = {"income": 12, "kpi": 12, "segment": 10, "cash": 8, "derived": 10}
+MAX_LINES = {"income": 12, "kpi": 12, "segment": 10, "cash": 8, "derived": 10, "pct": 14, "lease": 6}
+# run #26 (P2, item 7): lease-liability rows (balance sheet or lease note), so
+# the leverage line can add the filed lease obligations a data provider's
+# "total debt" leaves out; schedules and right-of-use assets are not liabilities
+LEASE_ROW_RE = re.compile(r"(?i)\blease liabilit(?:y|ies)\b")
+_LEASE_SKIP_RE = re.compile(r"(?i)payments?|maturit|right-of-use|cash paid|weighted|discount|obtained in exchange|imputed interest")
 _LEGEND = {}   # per extraction: (form, name, caption, date) -> "T1"
 
 _NUM_RE = re.compile(r"^\(?[-+]?\$?\s?(\d[\d,]*(?:\.\d+)?)\s?\)?\s?(%|x)?\)?$")
@@ -89,6 +94,38 @@ def label_matches(label: str, name: str) -> float:
 
 
 _UNIT_WORD = {"thousands": "thousand", "millions": "million", "billions": "billion"}
+_PER_SHARE_RE = re.compile(r"(?i)per (?:common |diluted |basic |ordinary )?share|\beps\b|earnings per|income per|loss per|per (?:ads|unit holder)")
+_PER_UNIT_RE = re.compile(r"(?i)\bprice\b|per (?:unit|user|customer|member|subscriber|order|account|visit|guest|room|seat)|\barpu\b|\basp\b|average (?:check|ticket|order value)")
+_COUNT_RE = re.compile(r"(?i)weeks|\bdays\b|\bnumber of\b|\bcount\b|headcount|employees|restaurants|stores|locations|open at|opened during|"
+                       r"\bunits\b|subscribers|members|customers|users|accounts|devices|vehicles|deliveries|orders|transactions|shipments|"
+                       r"\((?:kbd|koebd|kboed|mboe|bcf|mcf|bbl|tons?|tonnes|units|x)\)|barrels|\bboe\b")
+_LABEL_SCALE_RE = re.compile(r"(?i)\((?:in\s+)?(thousands|millions|billions)(?:\s+of\s+([a-z ]+?))?\)")
+_COUNT_NOUN_RE = re.compile(r"(?i)\b(units|subscribers|members|customers|users|accounts|devices|vehicles|deliveries|orders|transactions|"
+                            r"shipments|barrels|employees|stores|locations|restaurants)\b")
+
+
+def row_units(label: str, group: str, value: str, table_units: str) -> tuple:
+    """PURE. (units label, scale word to append to the value or None) from
+    the ROW's type, not the table's caption: per-share rows are per share,
+    percentages percent, a label's own '(in thousands)' wins, prices are per
+    unit, counts are counts; only money rows inherit 'in millions'."""
+    text = f"{label} {group}"
+    v = (value or "").strip()
+    if _PER_SHARE_RE.search(text):
+        return "per share", None
+    if "%" in v or re.search(r"(?i)percent(?:age)?\b|\bmargin %", label):
+        return "percent", None
+    own = _LABEL_SCALE_RE.search(label)
+    if own:
+        noun = (own.group(2) or "").strip() or (_COUNT_NOUN_RE.search(label).group(1).lower() if _COUNT_NOUN_RE.search(label) else "")
+        return (f"{_UNIT_WORD.get(own.group(1).lower(), own.group(1).lower())} {noun}".strip(), None)
+    if _PER_UNIT_RE.search(label):
+        return "per unit", None
+    if _COUNT_RE.search(label) and "$" not in v:
+        return "count", None
+    if table_units and ("$" in v or re.match(r"^\(?[\d,]+(?:\.\d+)?\)?$", v)):
+        return table_units, _UNIT_WORD.get(table_units, table_units)
+    return (table_units or "as printed"), None
 
 
 def _fmt_value(value: str, units: str, label: str) -> str:
@@ -173,11 +210,18 @@ def _period_text(cell: dict, src: dict) -> str:
     return f"{p}, {head}" if head and head.lower() not in p.lower() else p
 
 
+def _scaled(value: str, scale) -> str:
+    v = (value or "").strip()
+    return f"{v} {scale}" if scale and v else v
+
+
 def figure_line(label: str, rec: dict, cur: dict, prev, src: dict, segment: str, basis: str, kind: str = "") -> str:
-    units = rec.get("units", "")
-    cur_v = _fmt_value(cur["value"], units, label)
+    # P0 (run #26): units come from the row type ("$2.02 million" was a
+    # per-share figure that inherited the table's "in millions")
+    units, scale = row_units(label, rec.get("group", ""), cur.get("value", ""), rec.get("units", ""))
+    cur_v = _scaled(cur["value"], scale)
     if prev is not None:
-        prev_v = _fmt_value(prev["value"], units, label)
+        prev_v = _scaled(prev["value"], scale)
         change = _change(cur["value"], prev["value"])
         prev_p = _period_text(prev, src)
         if prev.get("period") == cur.get("period"):
@@ -186,11 +230,23 @@ def figure_line(label: str, rec: dict, cur: dict, prev, src: dict, segment: str,
         body = f"{cur_v} ({_period_text(cur, src)}) vs {prev_v} year-ago ({prev_p})" + (f"; change {change}" if change else "")
     else:
         body = f"{cur_v} ({_period_text(cur, src)}); no year-ago column in this table"
-    if "%" in (cur.get("value") or ""):
-        units = "percent"
     grp = f" [{rec['group']}]" if rec.get("group") and rec["group"].lower() not in label.lower() else ""
     kind_t = f"{kind}: " if kind and label_matches(label, kind.replace("KPI ", "")) < 0.9 else ("" if not kind.startswith("KPI ") else f"{kind}: ")
     return (f"- {kind_t}{label}{grp}: {body}  ({units or 'as printed'}; {basis}; {segment})  {_source(src, rec)}")
+
+
+def balance_line(label: str, rec: dict, cur: dict, prev, src: dict) -> str:
+    """A point-in-time balance (run #26, P2 item 7): dated "as of", never a
+    duration and never "year-ago" — the comparison column of a balance sheet
+    is the earlier balance-sheet date, often the fiscal year-end."""
+    units, scale = row_units(label, rec.get("group", ""), cur.get("value", ""), rec.get("units", ""))
+    def at(c):
+        return period_from_heading(c.get("heading", "")).get("ended") or c.get("heading", "") or "date not printed"
+    body = f"{_scaled(cur['value'], scale)} as of {at(cur)}"
+    if prev is not None:
+        body += f" vs {_scaled(prev['value'], scale)} as of {at(prev)}"
+    grp = f" [{rec['group']}]" if rec.get("group") and rec["group"].lower() not in label.lower() else ""
+    return f"- {label}{grp}: {body}  ({units or 'as printed'}; {_basis(rec, label)}; point-in-time balance)  {_source(src, rec)}"
 
 
 def _basis(rec: dict, label: str) -> str:
@@ -279,7 +335,7 @@ def extract_core(fs: dict, profile: dict, plan: dict = None) -> dict:
         for k in q.get("kpis") or []:
             if isinstance(k, str) and k.strip() and all(label_matches(k, n) < 0.6 for n in kpi_names):
                 kpi_names.append(k.strip())
-    blocks = {"income": [], "kpi": [], "segment": [], "cash": [], "derived": []}
+    blocks = {"income": [], "kpi": [], "segment": [], "cash": [], "derived": [], "pct": [], "lease": []}
     seen = set()
     all_records = []          # (src, rec)
     for src in core_sources(fs):
@@ -299,6 +355,12 @@ def extract_core(fs: dict, profile: dict, plan: dict = None) -> dict:
             cur, prev = _pair_cells(rec["cells"])
             if cur is None or num_of(cur["value"]) is None:
                 continue
+            if LEASE_ROW_RE.search(label) and not _LEASE_SKIP_RE.search(label):
+                key = ("lease", low, rec.get("group", ""), cur["period"])
+                if key not in seen and len(blocks["lease"]) < MAX_LINES["lease"]:
+                    seen.add(key)
+                    blocks["lease"].append(balance_line(label, rec, cur, prev, src))
+                continue
             # entity tables (a column per segment / brand): one line per matching entity for revenue-type rows
             entity_cells = [c for c in rec["cells"] if c.get("entity") and _segment_of(c["entity"], segments)]
             if entity_cells and SEGMENT_ROW_RE.search(label) and not re.search(r"(?i)cost|expense", label):
@@ -316,7 +378,8 @@ def extract_core(fs: dict, profile: dict, plan: dict = None) -> dict:
             seg = seg_label or "company-wide"
             basis = _basis(rec, label)
             placed = False
-            if seg_label and (SEGMENT_ROW_RE.search(label) or re.search(r"(?i)revenue|sales|income|profit", rec.get("group", ""))) and not re.search(r"(?i)cost|expense", label):
+            if seg_label and (SEGMENT_ROW_RE.search(label) or re.search(r"(?i)revenue|sales|income|profit", rec.get("group", ""))) \
+                    and not re.search(r"(?i)cost|expense", label + " " + rec.get("group", "")):
                 key = ("seg", label, seg, cur["period"])
                 if key not in seen and len(blocks["segment"]) < MAX_LINES["segment"]:
                     seen.add(key)
@@ -344,29 +407,44 @@ def extract_core(fs: dict, profile: dict, plan: dict = None) -> dict:
                 if key not in seen:
                     seen.add(key)
                     blocks["kpi"].append(figure_line(label, rec, cur, prev, src, seg, "company-defined", ""))
+                placed = True
+            # run #26 (P1): every percentage row (margin by segment or line,
+            # current vs year-ago) — not just the total line
+            if not placed and "%" in (cur.get("value") or "") and len(blocks["pct"]) < MAX_LINES["pct"]:
+                key = ("pct", low, rec.get("group", ""), cur["period"])
+                if key not in seen:
+                    seen.add(key)
+                    blocks["pct"].append(figure_line(label, rec, cur, prev, src, seg, basis, ""))
 
-    # KPI values for every profiled (and planner-linked) KPI
+    # KPI values for every profiled (and planner-linked) KPI. P0 (run #26):
+    # "iPhone net sales" resolved to Total net sales because word overlap
+    # was the only test. A KPI must now be matched by a row that names what
+    # the KPI names — its segment / product (never a company total), or its
+    # distinctive words — and a grouping KPI ("net sales by segment") is
+    # satisfied by the parsed segment lines. A wrong value is worse than none.
     kpi_lines, kpi_values = [], {}
+    seg_rows = blocks["segment"]
     for name in kpi_names:
-        best, best_score = None, 0.0
-        for src, rec in all_records:
-            if BOILERPLATE_LABEL_RE.search(rec["label"]):
-                continue
-            score = label_matches(rec["label"], re.sub(r"(?i)\s*(?:%|percent(?:age)?)\s*of\s*(?:total\s+)?(?:revenues?|sales)\s*$", "", name))
-            if score > best_score:
-                wants_pct = bool(re.search(r"(?i)%|percent|margin|ratio|rate|penetration|mix", name))
-                cur, prev = _pair_cells(rec["cells"], prefer_percent=wants_pct)
-                if wants_pct and cur is not None and "%" not in (cur.get("value") or "") and not PERCENT_COL_RE.search(cur.get("entity", "")):
-                    score -= 0.3                     # a percent metric matched an amount row: weaker
-                if cur is not None and num_of(cur["value"]) is not None and score > best_score:
-                    best, best_score = (src, rec, cur, prev), score
-        if best and best_score >= 0.5:
-            src, rec, cur, prev = best
+        if GROUPING_KPI_RE.search(name):
+            if seg_rows:
+                shown = [re.match(r"^- ([^:\[]+)", l).group(1).strip() for l in seg_rows if re.match(r"^- ([^:\[]+)", l)]
+                uniq = list(dict.fromkeys(shown))
+                kpi_lines.append(f"- KPI {name}: shown as {len(seg_rows)} segment lines above ({', '.join(uniq[:12])}"
+                                 + (f", … {len(uniq) - 12} more" if len(uniq) > 12 else "") + ")")
+                kpi_values[name] = True
+            else:
+                kpi_lines.append(f"- KPI value not found: {name} (no segment or revenue-line table in the latest 8-K exhibits or 10-Q)")
+                kpi_values[name] = False
+            continue
+        found = resolve_kpi(name, all_records, segments)
+        if found:
+            src, rec, cur, prev, note = found
             seg = _segment_of(" ".join([rec.get("group", ""), rec["label"], cur.get("entity", "")]), segments) or "company-wide"
-            kpi_lines.append(figure_line(rec["label"], rec, cur, prev, src, seg, "company-defined", f"KPI {name}"))
+            line = figure_line(rec["label"], rec, cur, prev, src, seg, "company-defined", f"KPI {name}")
+            kpi_lines.append(line.replace("  [source:", f"  ({note})  [source:", 1) if note else line)
             kpi_values[name] = True
         else:
-            kpi_lines.append(f"- KPI value not found: {name} (no table row in the latest 8-K exhibits or 10-Q matched this metric)")
+            kpi_lines.append(f"- KPI value not found: {name} (no table row in the latest 8-K exhibits or 10-Q names this metric)")
             kpi_values[name] = False
     derived, seen_d = [], set()
     for ln in derived_lines(all_records, segments):
@@ -382,9 +460,12 @@ def extract_core(fs: dict, profile: dict, plan: dict = None) -> dict:
              "each line: figure (period) vs year-ago; change — then (units; basis; segment) and its source table; "
              "'KPI value not found' means the metric was not in a table, not that it does not exist)"]
     for title, key in (("Income statement summary", "income"), ("KPI / operating metrics table", "kpi"),
-                       ("Segment and revenue lines", "segment"), ("Cash flow summary", "cash")):
+                       ("Segment and revenue lines", "segment"), ("Percentage tables (each line with its comparison column)", "pct"),
+                       ("Cash flow summary", "cash")):
         lines.append(f"-- {title} --")
         lines.extend(blocks[key] or [f"- none found by table structure in the latest 8-K exhibits or 10-Q"])
+    lines.append("-- Lease liabilities (balance sheet or lease note) --")
+    lines.extend(blocks["lease"] or ["- no lease-liability row in the latest 8-K exhibits or 10-Q tables"])
     lines.append("-- KPI values for the profiled metrics --")
     lines.extend(kpi_lines or ["- the profile listed no KPIs"])
     lines.append("-- Derived metrics and sanity checks (computed in code) --")
@@ -394,6 +475,103 @@ def extract_core(fs: dict, profile: dict, plan: dict = None) -> dict:
         lines.extend(legend_lines())
     return {"text": "\n".join(lines), "kpi_values": kpi_values, "lines": lines,
             "checks": [l for l in blocks["derived"] if "SANITY" in l]}
+
+
+GROUPING_KPI_RE = re.compile(r"(?i)\bby\s+(?:reportable\s+|operating\s+|geographic(?:al)?\s+|product[/ ]?(?:service\s+)?)?"
+                             r"(?:segments?|products?|categor(?:y|ies)|geograph\w*|regions?|brands?|business(?:es)?|lines?|types?|channels?|concepts?|divisions?)\b|"
+                             r"\b(?:segment|revenue|sales) (?:mix|breakdown)\b")
+_GENERIC_WORDS = {"revenue", "revenues", "sale", "sales", "net", "total", "margin", "margins", "percentage", "percent", "rate", "growth",
+                  "income", "profit", "earning", "earnings", "share", "shares", "per", "eps", "value", "amount", "figure", "figures",
+                  "metric", "metrics", "ratio", "ratios", "yoy", "year", "quarter", "change", "reported", "company", "the", "and", "of",
+                  "for", "from", "in", "on", "to", "a", "an", "with", "its", "as", "by", "vs"}
+_COST_RE = re.compile(r"(?i)\bcost|expense")
+
+
+def _norm_words(text: str) -> set:
+    t = re.sub(r"(?i)\beps\b", "earnings per share", text or "")
+    return {w.rstrip("s") if len(w) > 3 else w for w in re.findall(r"[a-z0-9]+", t.lower())}
+
+
+def _distinctive(name: str, entity_aliases: list = ()) -> set:
+    words = _norm_words(name)
+    for a in entity_aliases:
+        words -= _norm_words(a)
+    return {w for w in words if w not in {g.rstrip("s") if len(g) > 3 else g for g in _GENERIC_WORDS} and len(w) > 2}
+
+
+def _kpi_entities(name: str, segments: list) -> list:
+    low = (name or "").lower()
+    out = []
+    for seg in segments:
+        for a in aliases(seg):
+            al = a.lower()
+            if (len(al) <= 6 and re.search(r"(?<![a-z0-9])" + re.escape(al) + r"(?![a-z0-9])", low)) or (len(al) > 6 and al in low):
+                out.append(seg); break
+    return out
+
+
+def resolve_kpi(name: str, all_records: list, segments: list):
+    """-> (src, rec, cur, prev, note) or None. The row must name the KPI's
+    segment/product when the KPI names one (a company-total row never
+    qualifies, unless the company has a single reportable segment — then the
+    consolidated figure IS that segment and the line says so), and must carry
+    at least half of the KPI's distinctive words otherwise. Rows under a
+    cost or expense heading never satisfy a non-cost metric."""
+    wants_pct = bool(re.search(r"(?i)%|percent|margin|ratio|rate|penetration|mix", name))
+    wants_cost = bool(_COST_RE.search(name))
+    base = re.sub(r"(?i)\s*(?:%|percent(?:age)?)\s*of\s*(?:total\s+)?(?:revenues?|sales)\s*$", "", name)
+    entities = _kpi_entities(name, segments)
+    ent_aliases = [a for e in entities for a in aliases(e)]
+    distinctive = _distinctive(base, ent_aliases)
+    metric_words = _norm_words(base) - {w for a in ent_aliases for w in _norm_words(a)}
+    best, best_score = None, 0.0
+    for src, rec in all_records:
+        label, group = rec["label"], rec.get("group", "")
+        if BOILERPLATE_LABEL_RE.search(label):
+            continue
+        context = f"{label} {group}"
+        if _COST_RE.search(context) and not wants_cost:
+            continue
+        if entities:
+            if re.match(r"(?i)^(?:total|consolidated)\b", label):
+                continue
+            ent_cells = [c for c in rec["cells"] if c.get("entity") and _segment_of(c["entity"], entities)]
+            row_names_entity = bool(_segment_of(label, entities))
+            if not row_names_entity and not ent_cells:
+                continue
+            ctx_words = _norm_words(f"{label} {group} {rec.get('caption', '')}")
+            overlap = len((metric_words - {"net", "total"}) & ctx_words) / max(1, len(metric_words - {"net", "total"}))
+            phrase = 1.0 if re.sub(r"\s+", " ", " ".join(w for w in re.findall(r"[a-z]+", base.lower()) if w not in {a.lower() for a in ent_aliases})).strip() in context.lower() else 0.0
+            score = overlap + phrase
+            if score <= 0 and metric_words - {"net", "total"}:
+                continue
+            ent_key = _entity_key(ent_cells[0]) if (ent_cells and not row_names_entity) else None
+            cur, prev = _pair_cells(rec["cells"], prefer_percent=wants_pct, entity=ent_key)
+        else:
+            score = max(label_matches(label, base), label_matches(f"{label} {group}", base))
+            exact = any(label.strip().lower() == a.lower() for a in aliases(base))
+            ctx_words = _norm_words(f"{label} {group}")
+            if not exact:
+                if score < 0.5:
+                    continue
+                if distinctive and len(distinctive & ctx_words) / len(distinctive) < 0.5:
+                    continue
+            cur, prev = _pair_cells(rec["cells"], prefer_percent=wants_pct)
+            if wants_pct and cur is not None and "%" not in (cur.get("value") or "") and not PERCENT_COL_RE.search(cur.get("entity", "")):
+                score -= 0.3                     # a percent metric matched an amount row: weaker
+        if cur is None or num_of(cur.get("value")) is None:
+            continue
+        if score > best_score:
+            best, best_score = (src, rec, cur, prev, ""), score
+    if best is None and entities and len(segments) == 1:
+        # single reportable segment: the consolidated row is that segment
+        metric = re.sub(r"(?i)\b" + "|".join(re.escape(a) for a in ent_aliases) + r"\b", "", base).strip() or "revenue"
+        for src, rec in all_records:
+            if re.match(r"(?i)^(?:total|consolidated)\b", rec["label"]) and label_matches(rec["label"], metric) >= 0.5 and not _COST_RE.search(rec["label"] + " " + rec.get("group", "")):
+                cur, prev = _pair_cells(rec["cells"], prefer_percent=wants_pct)
+                if cur is not None and num_of(cur.get("value")) is not None:
+                    return src, rec, cur, prev, "single reportable segment: the consolidated figure is the segment's"
+    return best
 
 
 def derived_lines(all_records: list, segments: list) -> list:

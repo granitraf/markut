@@ -574,6 +574,25 @@ def select_article_excerpt(article_text: str, identity: dict, context_query: str
     return truncate_to_budget(" ".join(sentences[start:end]), NEWS_BODY_MAX_CHARS)
 
 
+_HEADLINE_STOP = {"what", "sees", "coming", "says", "said", "will", "could", "might", "real", "story", "likely", "after", "before",
+                  "about", "into", "with", "from", "this", "that", "here", "there", "these", "those", "more", "less", "than",
+                  "when", "why", "how", "its", "inc", "corp", "company", "stock", "stocks", "shares", "analyst", "analysts",
+                  "the", "and", "for", "are", "but", "not", "you", "your", "new", "now", "out", "has", "have", "was", "is", "to"}
+
+
+def body_matches_headline(title: str, body: str, identity: dict) -> bool:
+    """PURE. Run #26 (P2, item 13a): a fetched body must share salient terms
+    with its headline (beyond the company's own name), or it is another
+    article — a page that served an unrelated story under this headline."""
+    company = {w for w in re.findall(r"[a-z0-9]+", (identity or {}).get("company", "").lower())} | {(identity or {}).get("ticker", "").lower()}
+    salient = {w for w in re.findall(r"[a-z0-9]+", (title or "").lower()) if len(w) >= 3 and w not in _HEADLINE_STOP and w not in company}
+    if not salient:
+        return True
+    words = set(re.findall(r"[a-z0-9]+", (body or "").lower()))
+    overlap = len(salient & words)
+    return overlap >= 2 or (len(salient) <= 3 and overlap >= 1)
+
+
 def hydrate_news_item(item: dict, identity: dict, context_query: str = "") -> dict:
     hydrated = dict(item)
     link = item.get("link", "")
@@ -589,6 +608,9 @@ def hydrate_news_item(item: dict, identity: dict, context_query: str = "") -> di
     excerpt = select_article_excerpt(article.get("text", ""), identity, context_query)
     if fetch_state == "attempted":
         fetch_state = "fetched body text" if excerpt else "failed (no extractable text)"
+    if excerpt and not body_matches_headline(item.get("title", ""), article.get("text", "") or excerpt, identity):
+        excerpt = ""
+        fetch_state = "fetched body did not match the headline — downgraded"
     # Epistemic ladder, strongest first: body (real page text, still an
     # untrusted quote) > lead (feed-authored snippet — derive_snippet already
     # applied the only-if-it-beats-the-headline rule) > headline-only.
@@ -640,9 +662,13 @@ def format_news_items(items: list, heading: str, coverage: str, token_cap: int) 
             # Falling back to the legacy "access" field keeps items built before
             # the status vocabulary (offline fixtures) rendering unchanged.
             status = item.get("status") or item.get("access", "headline-only")
+            # run #26 (P2, item 13b): the text line names its own kind, and a
+            # lead reads "lead only" — the words the agents' prompts use; every
+            # text line used to say "lead:", so body items were read as leads
             if context:
-                lines.append(f"  lead: {truncate_to_budget(context, context_budget)}")
-            lines.append(f"  Status: {status}")
+                kind = "body" if status == "body" else "lead (feed snippet)"
+                lines.append(f"  {kind}: {truncate_to_budget(context, context_budget)}")
+            lines.append(f"  Status: {'lead only' if status == 'lead' else status}")
             # The tag names the FEED that surfaced the item (provenance).
             feed_label = _FEED_LABELS.get(item.get("source_feed"), "news")
             lines.append(f"  [source: {feed_label}/{item.get('publisher', 'Unknown publisher')}, published {published}, {item.get('url', '')}]")
@@ -692,8 +718,8 @@ def get_news_evidence(ticker: str) -> str:
         return "\n\n" + format_news_items(
             usable, "[NEWS]",
             f"Coverage: last {NEWS_BASELINE_DAYS} days | up to {NEWS_BASELINE_MAX} selected stories | "
-            "status: body=fetched article text (untrusted quote), lead=feed snippet. "
-            "Leads suggest; they cannot establish facts.",
+            "status: body = fetched article text (an untrusted quote); lead only = feed snippet — "
+            "it suggests, it cannot establish a fact.",
             NEWS_BASELINE_TOKEN_CAP,
         )
     except Exception as e:
@@ -925,11 +951,20 @@ def parse_news_review_json(text: str) -> dict:
     if not isinstance(data["claim_reviews"], list):
         raise ValueError("news review claim_reviews must be a list")
     allowed = {"supported", "contradicted", "unresolved"}
+    flags = {"upheld", "overturned", "unresolved"}
     for review in data["claim_reviews"]:
         if not isinstance(review, dict):
             raise ValueError("each claim review must be an object")
         status = str(review.get("status", "unresolved")).lower()
         review["status"] = status if status in allowed else "unresolved"
+        # P0 (run #26): the flag ruling is required — the rendered label is read
+        # from it, so a missing or unknown value is a validation error (corrective
+        # retry), never silently defaulted into a label
+        flag = str(review.get("flag", "")).lower()
+        if flag not in flags:
+            raise ValueError(f"claim review for {str(review.get('claim', ''))[:60]!r} has flag {review.get('flag')!r}; "
+                             "must be upheld, overturned or unresolved")
+        review["flag"] = flag
         if not isinstance(review.get("sources"), list):
             review["sources"] = []
         review.setdefault("evidence_summary", "")

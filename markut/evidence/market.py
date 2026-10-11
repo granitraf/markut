@@ -93,10 +93,19 @@ def format_market_lines(info: dict) -> list:
     add("P/E (forward, price / next-FY consensus non-GAAP EPS)", fmt_ratio(fwd_pe), "computed" if fwd_pe else "yfinance/info")
     add("Price/Book (mrq)", fmt_ratio(info.get("priceToBook")))
     add("EPS (trailing TTM, GAAP)", fmt_price(info.get("trailingEps")))
-    # yfinance forwardEps is the NEXT-FISCAL-YEAR consensus (it equals the
-    # earnings_estimate "+1y" average — verified live: identical values), not a
-    # rolling 12-month figure; the P/E built on it is a next-FY multiple
-    add("EPS (forward, consensus non-GAAP, next fiscal year)", fmt_price(info.get("forwardEps")))
+    # run #26 (P2, item 12): ONE forward EPS. The analysts' estimate table
+    # (+1y average, with its analyst count) is the canonical source; the
+    # provider's single forwardEps field is used only when there is no table,
+    # and the line says which. Two sources printed side by side gave $9.59
+    # and $9.58 with two different forward P/Es.
+    canon = info.get("_fwd_eps_canonical") or {}
+    if canon.get("value") is not None:
+        n = f", {int(canon['analysts'])} analysts" if canon.get("analysts") else ""
+        add(f"EPS (forward, next-FY consensus non-GAAP{n}; canonical source)", fmt_price(canon["value"]),
+            f"{canon.get('source', 'yfinance/earnings_estimate')} (canonical)")
+    else:
+        add("EPS (forward, next-FY consensus non-GAAP; data-provider field)", fmt_price(info.get("forwardEps")),
+            "yfinance/info (no estimate table)")
 
     lines.append("\n[FUNDAMENTALS]")
     add("Profit margin (TTM)", fmt_pct(info.get("profitMargins")))
@@ -123,10 +132,12 @@ def format_market_lines(info: dict) -> list:
 
 
 def forward_pe(info: dict):
-    # PURE. price / forwardEps (the next-FY consensus); the provider's own
-    # forwardPE only when one of the two inputs is missing
+    # PURE. price / the canonical next-FY consensus EPS (the estimate table,
+    # else the provider's forwardEps); the provider's own forwardPE only when
+    # an input is missing — one EPS, one P/E
     try:
-        price, eps = float(info.get("currentPrice")), float(info.get("forwardEps"))
+        canon = (info.get("_fwd_eps_canonical") or {}).get("value")
+        price, eps = float(info.get("currentPrice")), float(canon if canon is not None else info.get("forwardEps"))
         if price > 0 and eps > 0:
             return price / eps
     except (TypeError, ValueError):
@@ -179,18 +190,23 @@ def leverage_lines(bs, info: dict) -> list:
         asof = col.strftime("%Y-%m-%d") if hasattr(col, "strftime") else str(col)[:10]
         provider = info.get("debtToEquity")
         with_l = total_debt / equity * 100
-        ex_l = (total_debt - (leases or 0)) / equity * 100
         def tag(v):
             try:
                 return "  (matches the yfinance Debt/Equity figure)" if provider and abs(v - float(provider)) / float(provider) < 0.03 else ""
             except (TypeError, ValueError, ZeroDivisionError):
                 return ""
-        lines = [f"- Debt/Equity including lease obligations (computed, balance sheet {asof}): {with_l:.1f}% = total debt {fmt_big(total_debt)} "
-                 f"(of which lease obligations {fmt_big(leases or 0)}) / stockholders' equity {fmt_big(equity)}  [source: yfinance/quarterly_balance_sheet, computed]{tag(with_l)}"]
-        if leases:
-            lines.append(f"- Debt/Equity excluding lease obligations (computed, balance sheet {asof}): {ex_l:.1f}% = debt ex-leases {fmt_big(total_debt - leases)} "
-                         f"/ stockholders' equity {fmt_big(equity)}  [source: yfinance/quarterly_balance_sheet, computed]{tag(ex_l)}")
-        return lines
+        if not leases:
+            # run #26 (P2, item 7): the provider's debt figure held $0 of lease
+            # obligations, yet the line said "including lease obligations" —
+            # a label the computation did not earn. Say what it is.
+            return [f"- Debt/Equity on the data provider's total debt (computed, balance sheet {asof}): {with_l:.1f}% = total debt "
+                    f"{fmt_big(total_debt)} / stockholders' equity {fmt_big(equity)}; lease obligations are not included (the provider's "
+                    f"debt figure holds {'$0 of them' if leases == 0 else 'no lease line'})  [source: yfinance/quarterly_balance_sheet, computed]{tag(with_l)}"]
+        ex_l = (total_debt - leases) / equity * 100
+        return [f"- Debt/Equity including lease obligations (computed, balance sheet {asof}): {with_l:.1f}% = total debt {fmt_big(total_debt)} "
+                f"(of which lease obligations {fmt_big(leases)}) / stockholders' equity {fmt_big(equity)}  [source: yfinance/quarterly_balance_sheet, computed]{tag(with_l)}",
+                f"- Debt/Equity excluding lease obligations (computed, balance sheet {asof}): {ex_l:.1f}% = debt ex-leases {fmt_big(total_debt - leases)} "
+                f"/ stockholders' equity {fmt_big(equity)}  [source: yfinance/quarterly_balance_sheet, computed]{tag(ex_l)}"]
     except Exception:
         return []
 
@@ -374,6 +390,16 @@ def market_snapshot(ticker: str) -> str:
     except Exception as e:
         info["_fcf_quarters"] = {}
         out.append(f"[quarterly cash flow unavailable: {e}]")
+    # the canonical forward EPS: the estimate table's next-FY average, before any line is formatted
+    try:
+        _est = t.earnings_estimate
+        if _est is not None and "+1y" in [str(k) for k in _est.index]:
+            _row = {c: _est.loc["+1y", c] for c in _est.columns}
+            if _row.get("avg") == _row.get("avg") and _row.get("avg") is not None:
+                info["_fwd_eps_canonical"] = {"value": float(_row["avg"]), "source": "yfinance/earnings_estimate",
+                                              "analysts": _row.get("numberOfAnalysts") if _row.get("numberOfAnalysts") == _row.get("numberOfAnalysts") else None}
+    except Exception:
+        pass
     # leverage from the balance sheet, with and without leases
     try:
         info["_leverage_lines"] = leverage_lines(t.quarterly_balance_sheet, info)

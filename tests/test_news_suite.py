@@ -80,11 +80,11 @@ def test_news_offline_suite():
                    "Status: body" in _formatted and "[source: Yahoo RSS/reuters.com" in _formatted)
         news_check("formatted news respects its cap", len(_formatted) <= 300 * CHARS_PER_TOKEN)
         _review = parse_news_review_json(
-            '{"claim_reviews":[{"claim":"x","status":"SUPPORTED"}],'
+            '{"claim_reviews":[{"claim":"x","status":"SUPPORTED","flag":"UPHELD"}],'
             '"reasoning":"checked","verdict_changed":false,"revised_verdict":"hold"}'
         )
         news_check("claim-review statuses normalize to the allowed schema",
-                   _review["claim_reviews"][0]["status"] == "supported")
+                   _review["claim_reviews"][0]["status"] == "supported" and _review["claim_reviews"][0]["flag"] == "upheld")
     except Exception as e:
         news_check(f"Yahoo news helper tests (unexpectedly raised: {e})", False)
 

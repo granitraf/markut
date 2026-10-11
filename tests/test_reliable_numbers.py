@@ -177,9 +177,13 @@ def test_coverage_counts_real_answers_and_linked_kpis(monkeypatch):
     assert a["Q5"]["kpis_ok"] is True and "- KPI value not found: Capital expenditures" in out["text"]   # linked KPIs always get a value or an explicit not-found
     missing = {k: v for k, v in out["kpi_values"].items() if "Capital" not in k}
     a_missing = questions.coverage_assess(tagged + "\n" + filler, plan, missing, None)
-    assert a_missing["Q5"]["kpis_ok"] is False and a_missing["Q5"]["covered"] is False
+    # run #26 (P1): covered = at least one linked KPI has a CURRENT-period value (free cash flow margin does);
+    # the KPI with no value is still reported, by name, as missing
+    assert a_missing["Q5"]["kpis_ok"] is False and a_missing["Q5"]["covered"] is True and a_missing["Q5"]["missing"] == ["Capital expenditures"]
     a2 = questions.coverage_assess(tagged + "\n" + filler, plan, out["kpi_values"], {"Q1": [], "Q3": [0], "Q5": []})
-    assert a2["Q1"]["covered"] is False and a2["Q3"]["relevant"] == 1       # the relevance call decides, the code routes
+    # the relevance call decides which excerpts count (Q1 gets none) and the code routes; Q1 stays covered
+    # because its linked KPI has a current-period value (run #26, P1 rule)
+    assert a2["Q1"]["relevant"] == 0 and a2["Q1"]["covered"] is True and a2["Q3"]["relevant"] == 1
 
 
 # ---------------------------------------------------------------- leverage and the planner's mislead items

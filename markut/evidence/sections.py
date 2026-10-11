@@ -319,6 +319,11 @@ _EXCLUDE_RE = re.compile(
     r"today reported|reported (?:financial )?results|results for the (?:first|second|third|fourth) quarter|"
     r"we adopted|became effective|not have a material impact|^prior to|historically|forecasted income before taxes|"
     r"effective tax rate|to be recognized as revenue|remaining performance obligations|"
+    # run #26 (P2, item 10): accounting SCHEDULES are not business targets
+    r"deferred revenue|contract liabilit|performance obligations?|to be realized|realized in less than|"
+    r"lease payments?|lease liabilit|minimum lease|lease obligations?|\bmatur(?:e|es|ity|ities)\b|principal (?:payments|amounts)|"
+    r"unrecognized compensation|expected amortization|amortization expense|expected to be paid|interest payments|"
+    r"purchase obligations?|future (?:minimum )?payments|"
     r"\bVaR\b|confidence level|holding period|(?:adverse|central|baseline) scenario|unemployment rate|"
     r"allowance for credit losses|expected credit loss|risk-weighted assets|stress test|deferred tax")
 _SLIDE_TITLE_RE = re.compile(r"(?i)outlook|guidance|assumptions|targets?|20\d\d (?:key|underlying|financial|guidance|outlook)|"
@@ -328,7 +333,10 @@ _PAST_RESULT_RE = re.compile(r"(?i)\b(?:were|was|increased|decreased|grew|declin
 
 
 def forward_language_present(text: str) -> bool:
-    return bool(FORWARD_RE.search(text or ""))
+    # run #26 (P2, item 10): forward words inside an accounting schedule
+    # ("expects 64% of deferred revenue to be realized…", "debt to mature")
+    # are not a missed business target, so they never raise an EXTRACTION FAILURE
+    return any(FORWARD_RE.search(st) and not _EXCLUDE_RE.search(st) for st in _split_statements(text or ""))
 
 
 _BULLET_SPLIT = re.compile(r"\s+[•●▪]\s+|(?<=[.!?;])\s+(?=[A-Z0-9\"'(“])")
@@ -446,7 +454,7 @@ def guidance_lines(sources: list, max_lines: int = 40) -> dict:
                 failures.append(f"{src['label']}: {src['status']} — image-only exhibit with {src.get('slides', '?')} slides, "
                                 "no guidance could be read from it")
             continue
-        found_here = 0
+        found_here, unreadable = 0, 0
         if src.get("kind") == "slides":
             current_title, under_outlook = "", False
             for raw in text.splitlines():
@@ -467,7 +475,10 @@ def guidance_lines(sources: list, max_lines: int = 40) -> dict:
             for stmt in _split_statements(text):
                 if not (FORWARD_RE.search(stmt) and FIGURE_RE.search(stmt)):
                     continue
-                if _EXCLUDE_RE.search(stmt) or len(stmt) > 500 or len(stmt) < 20:
+                if _EXCLUDE_RE.search(stmt) or len(stmt) < 20:
+                    continue
+                if len(stmt) > 500:
+                    unreadable += 1          # a figure-bearing target too long to isolate
                     continue
                 if _PAST_RESULT_RE.search(stmt) and not re.search(r"(?i)expect|anticipat|outlook|guidance|target|forecast|project", stmt):
                     continue
@@ -477,7 +488,14 @@ def guidance_lines(sources: list, max_lines: int = 40) -> dict:
                 worded = [(p, b) for p, b in bands if not re.match(r"^(?:approximately|about|around|roughly|~)", p, re.I)]
                 add(stmt + (f"  (interpreted: {'; '.join(f'{p} → {b}' for p, b in worded)})" if worded else ""), "text", src)
                 found_here += 1
-        if not found_here and forward_language_present(text):
+        # run #26 (P2, item 10): a 10-Q / 10-K is full of forward-looking risk-factor
+        # and MD&A prose ("expects these trends to intensify…", "intends to increase
+        # its dividend") — no figure in it means no target, not a missed one. Only an
+        # earnings release, slide deck or transcript, where targets live, raises the
+        # failure on forward language alone; a periodic report raises it only for a
+        # figure-bearing forward statement that could not be isolated.
+        periodic = src.get("form") in ("10-Q", "10-K")
+        if not found_here and (unreadable if periodic else forward_language_present(text)):
             failures.append(f"{src['label']}: forward-looking language is present but no guided figure could be extracted")
     if len(lines) > max_lines:
         failures.append(f"guidance lines capped at {max_lines} ({len(lines) - max_lines} more omitted)")
@@ -584,8 +602,10 @@ def note_dollar_blocks(fs: dict, max_items: int = 8) -> list:
             note = _best_section(text, start, _NOTE_END, min_chars=200, max_chars=40000)
             if not note:
                 continue
+            # run #26 (P2, item 11): a topic word must START a word — "release"
+            # is not a lease sentence, "indebtedness" is not a debt figure
             lines = [ln for ln in dollar_sentences(note, max_items=max_items * 2)
-                     if _key(ln) not in seen_lines and any(t in ln.lower() for t in topics)][:max_items]
+                     if _key(ln) not in seen_lines and any(re.search(r"\b" + re.escape(t), ln, re.IGNORECASE) for t in topics)][:max_items]
             if not lines:
                 continue
             for ln in lines:

@@ -31,12 +31,27 @@ _CLAIM_RE = re.compile(
     re.VERBOSE | re.IGNORECASE)
 
 
+# run #26 (P2, item 14): a bare figure right after a valuation metric's name
+# ("trailing P/E of 38.61", "EV/EBITDA 14.2", "PEG ratio of 1.3") has no unit,
+# so the main pattern never saw it and the governor never traced it
+_METRIC_BARE_RE = re.compile(
+    r"(?i)\b(?:P/?E|PE ratio|EV/EBITDA|EV/EBIT|EV/Sales|EV/Revenue|P/S|P/B|P/FCF|PEG(?: ratio)?|"
+    r"price[- ]to[- ](?:earnings|book|sales|free cash flow)|multiple|ratio)"
+    r"(?:\s*\([^)]{0,40}\))?\s*(?:of|at|is|was|near|around|=|:|stands at)?\s*(?:about\s+|roughly\s+|approximately\s+|~)?"
+    r"(\d{1,3}(?:\.\d+)?)(?![\d.%x]|\s?x\b)")
+
+
 def extract_numeric_claims(text: str) -> list:
-    # PURE. Every dollar amount, percent (ranges kept whole), multiple, and
-    # finance-noun-attached number the verdict asserts, in order, deduped.
-    seen, claims = set(), []
+    # PURE. Every dollar amount, percent (ranges kept whole), multiple,
+    # finance-noun-attached number, and bare figure after a valuation metric
+    # the verdict asserts, in order of appearance, deduped.
+    found = []
     for match in _CLAIM_RE.finditer(text or ""):
-        claim = re.sub(r"\s+", " ", match.group(0)).strip()
+        found.append((match.start(), re.sub(r"\s+", " ", match.group(0)).strip()))
+    for match in _METRIC_BARE_RE.finditer(text or ""):
+        found.append((match.start(1), match.group(1)))
+    seen, claims = set(), []
+    for _, claim in sorted(found):
         key = claim.lower()
         if key not in seen:
             seen.add(key)

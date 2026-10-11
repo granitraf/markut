@@ -38,7 +38,9 @@ JUDGE_SCHEMA = {
 }
 
 ARCHETYPES = ["semis_hardware", "software", "consumer_retail_restaurant", "bank", "insurer", "reit",
-              "energy_commodity", "pharma_biotech", "industrial", "utility", "other"]
+              "energy_commodity", "pharma_biotech", "industrial", "utility",
+              # run #26 (P2, item 9): missing archetypes added rather than forcing the closest
+              "consumer_electronics", "internet_media", "payments_fintech", "telecom", "other"]
 ACCOUNTING_FLAGS = ["lease_heavy", "acquisition_amortization", "large_sbc", "unprofitable", "cyclical",
                     "regulated", "financial_balance_sheet"]
 
@@ -120,10 +122,12 @@ CLAIM_REVIEW_SCHEMA = {
                 "properties": {
                     "claim": {"type": "string"},
                     "status": {"type": "string", "enum": ["supported", "contradicted", "unresolved"]},
+                    # the ruling on the JUDGE'S FLAG itself (run #26: rendered labels are read from this, never inferred)
+                    "flag": {"type": "string", "enum": ["upheld", "overturned", "unresolved"]},
                     "evidence_summary": {"type": "string"},
                     "sources": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["claim", "status", "evidence_summary", "sources"],
+                "required": ["claim", "status", "flag", "evidence_summary", "sources"],
                 "additionalProperties": False,
             },
         },

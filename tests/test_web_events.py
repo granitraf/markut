@@ -39,7 +39,9 @@ def test_review_stats_recomputes_the_stats_line():
     report = {"final_status": "annotated", "resolutions": [
         {"resolution": "DERIVED", "qualified": True}, {"resolution": "LABELED", "qualified": False}]}
     s = ev.review_stats(pre, EVIDENCE, final, report)
-    assert s == {"claims": 2, "cited": 1, "flagged": 1, "derived": 1, "labeled": 0,
+    # run #26 (P2, item 14): counts describe the final verdict (tags removed);
+    # the draft's own count is kept as pre_claims
+    assert s == {"claims": 2, "cited": 1, "flagged": 1, "pre_claims": 2, "derived": 1, "labeled": 0,
                  "annotated": 1, "status": "annotated", "sources_unavailable": 0}
 
 

@@ -221,6 +221,19 @@ def _iso(t: float = None) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t if t is not None else time.time()))
 
 
+# P0 (run #26): one explicit table; a record without a flag ruling (runs
+# before the fix) shows its raw status — its stored "verdict" field was
+# inferred from status by negation and is not trusted
+_FLAG_LABELS = {"upheld": "flag upheld", "overturned": "flag overturned", "unresolved": "unresolved"}
+
+
+def claim_label(review: dict) -> str:
+    flag = str((review or {}).get("flag", "")).lower()
+    if flag in _FLAG_LABELS:
+        return _FLAG_LABELS[flag]
+    return f"status {(review or {}).get('status', '?')} (no flag ruling recorded)"
+
+
 def turn_content(event: dict) -> str:
     # the one text a reader wants from each event — what the turns table
     # shows in a plain SELECT, without digging through JSON
@@ -272,7 +285,7 @@ def turn_content(event: dict) -> str:
         return f"{d.get('decision', '')}: {d.get('reason', '')}"
     if name == "news_verify":
         reviews = d.get("claim_reviews") or []
-        lines = [f"- [{r.get('verdict') or r.get('status', '?')}] {r.get('claim', '')}" for r in reviews]
+        lines = [f"- [{claim_label(r)}] {r.get('claim', '')}" for r in reviews]
         return "\n".join(lines + ([d["reasoning"]] if d.get("reasoning") else []))
     if name == "review":
         return d.get("verdict", "")

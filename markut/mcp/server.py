@@ -59,7 +59,7 @@ def news_evidence_tool(ticker: str) -> str:
     """Recent-news evidence for one stock ticker: a token-capped [NEWS] section
     from Yahoo Finance's per-ticker feed over a rolling 14-day window. Items
     are epistemically labeled — Status: body (fetched article text, an
-    untrusted quote) or Status: lead (feed blurb); leads suggest but can never
+    untrusted quote) or Status: lead only (feed blurb); leads suggest but can never
     establish facts, and bare headlines are excluded entirely. Source tags name
     the feed, publisher, date, and URL. Never raises; degrades to bracketed
     "[news unavailable: ...]" or "[no news items ...]" markers."""

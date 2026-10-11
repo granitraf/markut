@@ -39,8 +39,12 @@ def format_history(state: DebateState) -> str:
     # SEE every prior round to spot repetition ACROSS rounds. This zips the two
     # accumulating histories into numbered rounds so the judge reads the debate
     # as a chronological transcript, not two disconnected latest-cases.
-    bull = state["bull_history"]
-    bear = state["bear_history"]
+    # P0 (run #26): the LATEST round is shown once, under "Latest Bull/Bear
+    # case"; the history holds the rounds BEFORE it. The old prompt printed
+    # the latest cases twice (history + latest), so every judge call carried
+    # each new case twice.
+    bull = state["bull_history"][:-1] if state["bull_history"] and state["bull_history"][-1] == state.get("bull_case") else state["bull_history"]
+    bear = state["bear_history"][:-1] if state["bear_history"] and state["bear_history"][-1] == state.get("bear_case") else state["bear_history"]
     rounds = max(len(bull), len(bear))
     if rounds == 0:
         return "(no prior rounds)"
@@ -97,13 +101,13 @@ def research_node(state: DebateState) -> dict:
             kpi_values[m.group(1).strip()] = "not found" not in ln
     relevance = assess_relevance(plan, candidate_lines(filings, qids)) if qids else None
     assessment = coverage_assess(filings, plan, kpi_values, relevance)
-    coverage = {q: (a["relevant"] if a["kpis_ok"] else 0) for q, a in assessment.items()}
+    coverage = {q: (max(1, a["current"]) if a["covered"] else 0) for q, a in assessment.items()}
     packet, gaps = assemble_packet(profile, plan, filings, market, (news or "") + extra, coverage,
                                    research_pass=pass_no, profile_gaps=state.get("profile_gaps") or [],
-                                   profile_sources=state.get("profile_sources") or [])
+                                   profile_sources=state.get("profile_sources") or [], detail=assessment)
     if gaps:
         print("RESEARCH: data gaps — " + "; ".join(f"{g['source']} ({g['reason']})" for g in gaps))
-    print("RESEARCH: coverage " + " ".join(f"{q}:{a['relevant']}/{a['lines']}{'' if a['kpis_ok'] else ' (KPI missing)'}" for q, a in assessment.items())
+    print("RESEARCH: coverage " + " ".join(f"{q}:{a['current']}cur/{a['relevant']}rel{'' if a['covered'] else ' GAP'}" for q, a in assessment.items())
           + f"  (packet {len(packet) // 4:,} tok est.)")
     return {"evidence": packet, "coverage": coverage, "uncovered": [q for q, n in coverage.items() if not n],
             "research_pass": pass_no, "market_evidence": market, "coverage_detail": assessment}
@@ -124,14 +128,19 @@ def assess_relevance(plan: dict, cands: dict) -> dict:
         parts.append(f"{qid}: {q.get('question', '')}\n" + "\n".join(f"  [{i}] {re.sub(r'\s*\[source:.*$', '', ln)[:300]}" for i, ln in enumerate(lines)))
     if not parts:
         return None
-    try:
-        raw = llm.call_claude(prompts.COVERAGE_SYSTEM_PROMPT, "QUESTIONS AND CANDIDATE LINES:\n\n" + "\n\n".join(parts),
-                              max_tokens=800, schema=COVERAGE_SCHEMA)
+    from markut.agents.structured import call_structured
+
+    def parse(raw):
         data = _json.loads(raw)
-        return {q.get("id"): list(q.get("answering_lines") or []) for q in data.get("questions", []) if q.get("id")}
-    except Exception as e:
-        print(f"RESEARCH: relevance check skipped ({e}) — counting every real candidate line")
-        return None
+        if not isinstance(data.get("questions"), list):
+            raise ValueError("coverage JSON must have a 'questions' list")
+        return {q.get("id"): [i for i in (q.get("answering_lines") or []) if isinstance(i, int)]
+                for q in data["questions"] if isinstance(q, dict) and q.get("id")}
+    res = call_structured(prompts.COVERAGE_SYSTEM_PROMPT, "QUESTIONS AND CANDIDATE LINES:\n\n" + "\n\n".join(parts),
+                          COVERAGE_SCHEMA, parse, max_tokens=800, label="RESEARCH relevance check")
+    if res["value"] is None:
+        print("RESEARCH: relevance check failed twice — counting every real candidate line")
+    return res["value"]
 
 
 def complete_argument(system_prompt: str, user_content: str, label: str, cached_prefix: str = None) -> str:
@@ -188,6 +197,17 @@ def bear_node(state: DebateState) -> dict:
                              cached_prefix=evidence_prefix(state["evidence"]))
     return {"bear_case": case, "bear_history": [case]}
 
+def coverage_gap_note(evidence: str) -> str:
+    """Run #26 (P1): the judge is told, in its own input, which questions the
+    packet cannot answer for the current period and which metric is missing
+    — so an unresolved ruling names the gap instead of rediscovering it."""
+    gaps = [l.strip() for l in (evidence or "").splitlines() if l.strip().startswith("- COVERAGE GAP")]
+    if not gaps:
+        return ""
+    return ("\n\nCOVERAGE GAPS (these questions cannot be answered for the current period from the packet; rule them "
+            "unresolved for that reason and name the missing metric — never treat a gap as evidence either way):\n" + "\n".join(gaps))
+
+
 def judge_node(state: DebateState) -> dict:
     new_round = state["round"] + 1
     print(f"JUDGE (round {new_round}): weighing both sides")
@@ -211,10 +231,11 @@ def judge_node(state: DebateState) -> dict:
         # rides in the CACHED system prefix (one write per run, cheap reads), so
         # giving it to the judge every round no longer costs ~3k fresh tokens.
         "The EVIDENCE PACKET (the exact source material both analysts saw) is in your system context above.\n\n"
-        f"FULL DEBATE HISTORY (all rounds so far):\n{format_history(state)}\n\n"
+        f"EARLIER ROUNDS (the debate before the latest round):\n{format_history(state)}\n\n"
         f"Latest Bull case:\n{state['bull_case']}\n\n"
         f"Latest Bear case:\n{state['bear_case']}\n\n"
         f"Rounds completed so far (including this one): {new_round}"
+        + coverage_gap_note(state["evidence"])
     )
     prefix = evidence_prefix(state["evidence"])
 
@@ -225,59 +246,39 @@ def judge_node(state: DebateState) -> dict:
     # max_tokens a SHORTER retry; the JSON-repair retry is kept for genuinely
     # invalid replies. If both fail, salvage the completed fields and SAY the
     # reply was truncated — never pass raw JSON on as the verdict.
-    raw = llm.call_claude(system_prompt, user_content, max_tokens=config.JUDGE_MAX_TOKENS,
-                          schema=JUDGE_SCHEMA, cached_prefix=prefix)
-    truncated_first = llm.LAST_STOP_REASON == "max_tokens"
-    decision = None
-    try:
-        if truncated_first:
-            raise ValueError("reply cut off at the output cap")
-        decision = parse_judge_json(raw)
-    except Exception as first_error:
-        print(f"JUDGE: {'reply truncated' if truncated_first else f'JSON parse failed ({first_error})'}; "
-              f"doing one {'shorter' if truncated_first else 'corrective'} retry.")
-        print("JUDGE DEBUG raw reply:", (raw or "")[:400])
-        if truncated_first:
-            retry_user_content = (
-                user_content
-                + "\n\nYour previous reply exceeded the output limit and was cut off before the JSON closed. "
-                  "Reply again MUCH SHORTER: each strongest point under 40 words, reasoning under 80 words, "
-                  "at most 4 unsupported_claims of one short sentence each, verdict under 250 words including "
-                  "its three closing parts. Finish the JSON.")
-        else:
-            retry_user_content = (
-                user_content
-                + "\n\nYour previous response was NOT valid JSON:\n"
-                + raw
-                + "\n\nRespond again with ONLY the JSON object described, and nothing else."
-            )
-        raw_retry = llm.call_claude(system_prompt, retry_user_content, max_tokens=config.JUDGE_MAX_TOKENS,
-                                    schema=JUDGE_SCHEMA, cached_prefix=prefix)
-        try:
-            if llm.LAST_STOP_REASON == "max_tokens":
-                raise ValueError("retry also cut off at the output cap")
-            decision = parse_judge_json(raw_retry)
-        except Exception as second_error:
-            print(f"JUDGE: retry also failed ({second_error}); salvaging the completed fields.")
-            print("JUDGE DEBUG raw retry reply:", (raw_retry or "")[:400])
-            # WHY salvage instead of the old "fail closed with converged=True":
-            # the round cap and the token budget already guarantee termination,
-            # so convergence can come only from the judge's actual ruling. What
-            # the judge DID write (strongest points, flagged claims, most of the
-            # verdict) is kept and labeled truncated; nothing is invented.
-            salvaged = salvage_judge_json(raw_retry) or salvage_judge_json(raw)
-            decision = {
-                "questions": salvaged.get("questions") if isinstance(salvaged.get("questions"), list) else [],
-                "planner_coverage": salvaged.get("planner_coverage", ""),
-                "bull_strongest": salvaged.get("bull_strongest", ""),
-                "bear_strongest": salvaged.get("bear_strongest", ""),
-                "unsupported_claims": salvaged.get("unsupported_claims", []),
-                "reasoning": (salvaged.get("reasoning") or "")
-                             + " [Judge reply was cut off at the output cap twice; fields recovered from the partial reply.]",
-                "verdict": salvaged.get("verdict") or "[Judge reply truncated twice — no verdict text was recovered for this round.]",
-                "converged": bool(salvaged.get("converged", False)),
-                "truncated": True,
-            }
+    # P0 (run #26): the shared structured path — a truncated reply gets a
+    # SHORTER retry, an invalid one the corrective retry (error + previous
+    # reply + skeleton); both failing -> salvage below, never raw JSON
+    from markut.agents.structured import call_structured
+    res = call_structured(system_prompt, user_content, JUDGE_SCHEMA, parse_judge_json,
+                          max_tokens=config.JUDGE_MAX_TOKENS, label="JUDGE", cached_prefix=prefix,
+                          shorter="Reply again MUCH SHORTER: each strongest point under 40 words, reasoning under 80 words, "
+                                  "at most 4 unsupported_claims of one short sentence each, verdict under 250 words including "
+                                  "its three closing parts.")
+    decision = res["value"]
+    if decision is None:
+        # WHY salvage instead of the old "fail closed with converged=True":
+        # the round cap and the token budget already guarantee termination,
+        # so convergence can come only from the judge's actual ruling. What
+        # the judge DID write (strongest points, flagged claims, most of the
+        # verdict) is kept and labeled truncated; nothing is invented.
+        salvaged = {}
+        for raw_reply in reversed(res["raws"]):
+            salvaged = salvage_judge_json(raw_reply)
+            if salvaged:
+                break
+        decision = {
+            "questions": salvaged.get("questions") if isinstance(salvaged.get("questions"), list) else [],
+            "planner_coverage": salvaged.get("planner_coverage", ""),
+            "bull_strongest": salvaged.get("bull_strongest", ""),
+            "bear_strongest": salvaged.get("bear_strongest", ""),
+            "unsupported_claims": salvaged.get("unsupported_claims", []),
+            "reasoning": (salvaged.get("reasoning") or "")
+                         + " [Judge reply was cut off at the output cap twice; fields recovered from the partial reply.]",
+            "verdict": salvaged.get("verdict") or "[Judge reply truncated twice — no verdict text was recovered for this round.]",
+            "converged": bool(salvaged.get("converged", False)),
+            "truncated": True,
+        }
 
     decision.setdefault("questions", [])
     decision.setdefault("planner_coverage", "")
@@ -291,9 +292,14 @@ def judge_node(state: DebateState) -> dict:
 
 import re as _re
 
-# the three rulings a reader sees; the model's status vocabulary stays
-# supported / contradicted / unresolved (clearer for the re-audit itself)
-CLAIM_VERDICTS = {"supported": "flag overturned", "contradicted": "flag upheld", "unresolved": "unresolved"}
+# P0 (run #26): the label a reader sees comes from an EXPLICIT flag ruling,
+# never inferred from status by negation. status describes the flagged
+# STATEMENT and the judge's flags are themselves statements of the form
+# "X is unsupported" — so "supported" meant the FLAG holds, and the old
+# negation table (supported -> flag overturned) labelled every confirmed
+# flag "overturned". The model now returns flag = upheld | overturned |
+# unresolved, and this table is the only place a label is made.
+CLAIM_FLAG_LABELS = {"upheld": "flag upheld", "overturned": "flag overturned", "unresolved": "unresolved"}
 
 
 def _claim_key(claim) -> str:
@@ -360,7 +366,11 @@ def inferential(claim) -> bool:
 
 def with_verdict(review: dict) -> dict:
     review = dict(review)
-    review["verdict"] = CLAIM_VERDICTS.get(str(review.get("status", "")).lower(), "unresolved")
+    flag = str(review.get("flag", "")).lower()
+    if flag not in CLAIM_FLAG_LABELS:
+        flag = "unresolved"       # no explicit ruling -> no label claims more than that
+    review["flag"] = flag
+    review["verdict"] = CLAIM_FLAG_LABELS[flag]
     return review
 
 
@@ -426,7 +436,8 @@ def news_verify_node(state: DebateState) -> dict:
                     m = first["metadata"]
                     passages = "; ".join(f"{h['number']}: \u201c{h.get('passage') or h['text'][:240]}\u201d" for h in by_claim[claim])
                     corroborated.append(with_verdict({
-                        "claim": claim, "status": "supported",
+                        # the flag said the figure is absent; the figure is in the filing -> the flag is wrong
+                        "claim": claim, "status": "contradicted", "flag": "overturned",
                         "evidence_summary": (f"every figure found verbatim in the {m.get('form', 'filing')} "
                                              f"({m.get('section', '?')}, filed {m.get('filing_date', '?')}): {passages}"),
                         "sources": [h["metadata"].get("url", "") for h in by_claim[claim]]}))
@@ -466,38 +477,12 @@ def news_verify_node(state: DebateState) -> dict:
         + (("\n\n" + split_addendum(evidence)[1]) if split_addendum(evidence)[1] else "")
     )
     prefix = evidence_prefix(evidence)
-    raw = llm.call_claude(system_prompt, user_content, max_tokens=config.CLAIM_REVIEW_MAX_TOKENS,
-                          schema=CLAIM_REVIEW_SCHEMA, cached_prefix=prefix)
-    verification, last_error = None, None
-    truncated_first = llm.LAST_STOP_REASON == "max_tokens"
-    try:
-        if truncated_first:
-            raise ValueError("reply cut off at the output cap")
-        verification = parse_news_review_json(raw)
-    except Exception as first_error:
-        last_error = first_error
-        print(f"CLAIM REVIEW: {'reply truncated' if truncated_first else f'review JSON invalid ({first_error})'}; "
-              f"one {'shorter' if truncated_first else 'repair'} retry.")
-        print("CLAIM REVIEW DEBUG raw reply:", (raw or "")[:400])
-        if truncated_first:
-            retry_content = (user_content + "\n\nYour previous reply exceeded the output limit and was cut off. "
-                             "Reply again MUCH SHORTER: evidence_summary under 30 words each, reasoning under 60 words, "
-                             "revised_verdict an empty string unless verdict_changed is true. Finish the JSON.")
-        else:
-            retry_content = (user_content + "\n\nYour previous response FAILED validation with this exact error:\n  "
-                             + str(first_error) + "\n\nYour previous response was:\n" + (raw or "")
-                             + "\n\nFix exactly that problem and respond again with the JSON object only.")
-        raw_retry = ""
-        try:
-            raw_retry = llm.call_claude(system_prompt, retry_content, max_tokens=config.CLAIM_REVIEW_MAX_TOKENS,
-                                        schema=CLAIM_REVIEW_SCHEMA, cached_prefix=prefix)
-            if llm.LAST_STOP_REASON == "max_tokens":
-                raise ValueError("retry also cut off at the output cap")
-            verification = parse_news_review_json(raw_retry)
-        except Exception as second_error:
-            last_error = second_error
-            print(f"CLAIM REVIEW: retry also failed ({second_error}); preserving verdict and failing unresolved.")
-            print("CLAIM REVIEW DEBUG raw retry reply:", (raw_retry or "")[:400])
+    from markut.agents.structured import call_structured
+    res = call_structured(system_prompt, user_content, CLAIM_REVIEW_SCHEMA, parse_news_review_json,
+                          max_tokens=config.CLAIM_REVIEW_MAX_TOKENS, label="CLAIM REVIEW", cached_prefix=prefix,
+                          shorter="Reply again MUCH SHORTER: evidence_summary under 30 words each, reasoning under 60 words, "
+                                  "revised_verdict an empty string unless verdict_changed is true.")
+    verification, last_error = res["value"], res["error"]
     if verification is not None:
         verification.setdefault("reasoning", "")
         verification.setdefault("verdict_changed", False)
@@ -519,7 +504,7 @@ def news_verify_node(state: DebateState) -> dict:
                 used.add(best)
                 matched.append(with_verdict({**returned[best], "claim": claim}))
             else:
-                matched.append(with_verdict({"claim": claim, "status": "unresolved",
+                matched.append(with_verdict({"claim": claim, "status": "unresolved", "flag": "unresolved",
                                              "evidence_summary": "the re-audit returned no ruling for this claim",
                                              "sources": []}))
         dropped = len(returned) - len(used)
@@ -529,7 +514,7 @@ def news_verify_node(state: DebateState) -> dict:
     else:
         verification = {
             "claim_reviews": [
-                with_verdict({"claim": claim, "status": "unresolved",
+                with_verdict({"claim": claim, "status": "unresolved", "flag": "unresolved",
                               "evidence_summary": "Claim-review response was invalid JSON.", "sources": []})
                 for claim in remaining
             ],

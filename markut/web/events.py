@@ -85,13 +85,20 @@ def review_stats(pre_verdict: str, evidence: str, final_verdict: str, report: di
     # labeled count QUALIFIED resolutions only — the one judgment the node
     # recorded in the report — and annotated counts tag OCCURRENCES in the
     # final text, matching the node's D2-era definition.
-    claims = extract_numeric_claims(pre_verdict or "")
+    # run #26 (P2, item 14): the counts describe the FINAL verdict a reader sees
+    # (the governor's own inline tags removed first); the pre-review draft is
+    # kept as pre_claims — "7 claims" described a draft, not the 16-figure verdict
+    from markut.guardrails.review import _TAG_RE
+    final_clean = _TAG_RE.sub("", final_verdict or "")
+    claims = extract_numeric_claims(final_clean)
     flagged = [c for c in claims if trace_claim(c, evidence or "") == "FLAGGED"]
+    pre = extract_numeric_claims(pre_verdict or "")
     resolutions = report.get("resolutions", []) or []
     return {
         "claims": len(claims),
         "cited": len(claims) - len(flagged),
         "flagged": len(flagged),
+        "pre_claims": len(pre),
         "derived": sum(1 for r in resolutions if r.get("qualified") and r.get("resolution") == "DERIVED"),
         "labeled": sum(1 for r in resolutions if r.get("qualified") and r.get("resolution") == "LABELED"),
         "annotated": (final_verdict or "").count("[UNGROUNDED"),

@@ -18,6 +18,8 @@ embedded from markut/web/static/fonts.
 import io
 import os
 import re
+
+from markut.store import claim_label
 import time
 from xml.sax.saxutils import escape
 
@@ -103,6 +105,32 @@ def _inline(text: str, strip_bold: bool = True) -> str:
     parts = re.split(r"(<[^>]+>)", t)
     t = "".join(p if p.startswith("<") else _NUM_RE.sub(r'<font name="Mono" size="9">\1</font>', p) for p in parts)
     return t
+
+
+def _turn_key(event: dict) -> str:
+    d = event.get("data", {}) or {}
+    return d.get("turn_id") or f"{event.get('event')}:{d.get('round')}:{hash(d.get('text', ''))}"
+
+
+def debate_sections(events: list) -> list:
+    """[(turn key, body)] for the bull/bear turns the report renders —
+    RENDERER INVARIANT: each turn once (deduped by turn id), and no section
+    body twice (an identical body under a second id is dropped and logged)."""
+    out, seen_ids, seen_bodies = [], set(), set()
+    for e in events or []:
+        if e.get("event") not in ("bull", "bear"):
+            continue
+        tid = _turn_key(e)
+        body = re.sub(r"\s+", " ", (e.get("data", {}) or {}).get("text", "")).strip()
+        if tid in seen_ids:
+            continue
+        seen_ids.add(tid)
+        if body and body in seen_bodies:
+            print(f"REPORT: turn {tid} repeats an earlier section body verbatim — rendered once")
+            continue
+        seen_bodies.add(body)
+        out.append((tid, body))
+    return out
 
 
 def split_argument(text: str) -> dict:
@@ -330,9 +358,15 @@ def build_report(run: dict) -> bytes:
               Paragraph("Bull and bear analysts argue over the same evidence packet; from round two each rebuts the other. "
                         "The judge rules on each round and decides whether the debate has converged.", st["small"])]
     round_no = 0
+    rendered_turns = {tid for tid, _ in debate_sections(events)}
+    seen_turns = set()
     for e in events:
         name, d = e.get("event"), e.get("data", {}) or {}
         if name in ("bull", "bear"):
+            tid = _turn_key(e)
+            if tid in seen_turns or tid not in rendered_turns:
+                continue          # invariant: a turn delivered twice renders once
+            seen_turns.add(tid)
             r = d.get("round") or round_no or 1
             if r != round_no:
                 round_no = r
@@ -341,15 +375,18 @@ def build_report(run: dict) -> bytes:
             side = "Bull case" if name == "bull" else "Bear case"
             head = escape(arg["title"]) if arg["title"] and side.lower() in arg["title"].lower() else (side + (f" — {escape(arg['title'])}" if arg["title"] else ""))
             story.append(Paragraph(head, st["h2bull" if name == "bull" else "h2bear"]))
-            if arg["intro"]:
-                story += _md_flow(arg["intro"], st)
+            # P0 (run #26): every case appeared twice — with no numbered
+            # sections the whole text was the "intro" AND was rendered again
+            # by the no-sections fallback. Exactly one of the two paths runs.
             if arg["sections"]:
+                if arg["intro"]:
+                    story += _md_flow(arg["intro"], st)
                 for i, sec in enumerate(arg["sections"], 1):
                     head = re.sub(r"^\d+[.)]\s*", "", sec["heading"])
                     story.append(Paragraph(f"{i}. {_inline(head)}", st["pt"]))
                     story += _md_flow(sec["body"], st)
             else:
-                story += _md_flow(d.get("text", ""), st)
+                story += _md_flow(arg["intro"] or d.get("text", ""), st)
         elif name == "judge":
             if d.get("recorded") is False:
                 story.append(Paragraph(escape(d.get("note", "")), st["small"]))
@@ -387,7 +424,7 @@ def build_report(run: dict) -> bytes:
             reviews = d.get("claim_reviews") or []
             if reviews:
                 for r in reviews:
-                    story.append(Paragraph(f"<font name='Mono' size='8'>[{escape(r.get('verdict') or r.get('status', '?'))}]</font> {_inline(r.get('claim', ''))}"
+                    story.append(Paragraph(f"<font name='Mono' size='8'>[{escape(claim_label(r))}]</font> {_inline(r.get('claim', ''))}"
                                            + (f" — {_inline(r.get('evidence_summary', ''))}" if r.get("evidence_summary") else ""), st["bullet"], bulletText="•"))
             else:
                 story.append(Paragraph(_inline(d.get("reasoning") or "No unsupported claims to re-audit."), st["body"]))

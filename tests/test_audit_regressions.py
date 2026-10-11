@@ -45,7 +45,9 @@ def test_market_lines_name_period_and_basis():
             "revenueGrowth": 0.855, "earningsGrowth": 1.2, "currentPrice": 375.81}
     text = "\n".join(market.format_market_lines(info))
     assert "EPS (trailing TTM, GAAP): $8.12" in text
-    assert "EPS (forward, consensus non-GAAP, next fiscal year): $19.39" in text
+    # run #26 (P2, item 12): the forward EPS line names which source it is;
+    # without an estimate table it is the provider's own field
+    assert "EPS (forward, next-FY consensus non-GAAP; data-provider field): $19.39" in text
     assert "P/E (forward, price / next-FY consensus non-GAAP EPS): 19.38" in text
     assert "Revenue growth (MRQ YoY, most recent quarter vs year-ago quarter): 85.50%" in text
     assert "Revenue growth (yoy)" not in text
@@ -166,7 +168,7 @@ def test_judge_and_claim_review_request_schemas(stub_llm):
 
 def test_claim_review_repairs_once_and_logs_raw(stub_llm, monkeypatch, capsys):
     monkeypatch.setattr(nodes, "get_related_leads", lambda claims, ticker: "")
-    good = json.dumps({"claim_reviews": [{"claim": "c1", "status": "unresolved", "evidence_summary": "", "sources": []}],
+    good = json.dumps({"claim_reviews": [{"claim": "c1", "status": "unresolved", "flag": "unresolved", "evidence_summary": "", "sources": []}],
                        "reasoning": "ok", "verdict_changed": False, "revised_verdict": "v"})
     calls = stub_llm(["not json at all", good])
     out = nodes.news_verify_node({"ticker": "AVGO", "evidence": EVIDENCE, "verdict": "v",
@@ -299,13 +301,16 @@ def test_claim_review_corroborates_before_the_paid_reaudit(stub_llm, monkeypatch
         {"claim": claims[0], "number": "221%", "match": "221 percent",
          "text": "AI semiconductor revenue grew 221 percent.", "metadata": {"form": "8-K", "section": "press release",
                                                                         "filing_date": "2026-09-02", "url": "u"}}])
-    good = json.dumps({"claim_reviews": [{"claim": "c2", "status": "unresolved", "evidence_summary": "", "sources": []}],
+    good = json.dumps({"claim_reviews": [{"claim": "c2", "status": "unresolved", "flag": "unresolved", "evidence_summary": "", "sources": []}],
                        "reasoning": "ok", "verdict_changed": False, "revised_verdict": "v"})
     calls = stub_llm([good])
     out = nodes.news_verify_node({"ticker": "AVGO", "evidence": EVIDENCE, "verdict": "v",
                                   "judge_decision": {"unsupported_claims": ["c1: the 221% growth figure appears only in a news item", "c2"]}})
     reviews = out["claim_verification"]["claim_reviews"]
-    assert reviews[0]["status"] == "supported" and reviews[0]["claim"].startswith("c1") and reviews[0]["sources"] == ["u"]
+    # the flag said the figure appears only in news; it is in the filing -> the flagged statement is
+    # contradicted and the FLAG is overturned (explicit, run #26 fix)
+    assert reviews[0]["status"] == "contradicted" and reviews[0]["flag"] == "overturned" and reviews[0]["verdict"] == "flag overturned"
+    assert reviews[0]["claim"].startswith("c1") and reviews[0]["sources"] == ["u"]
     assert reviews[1]["claim"] == "c2"
     flagged_list = calls[0]["user"].split("EVIDENCE PACKET")[0]
     assert "- c1 says 221% growth" not in flagged_list and "- c2" in flagged_list   # only the rest is re-audited
@@ -314,7 +319,7 @@ def test_claim_review_corroborates_before_the_paid_reaudit(stub_llm, monkeypatch
     calls = stub_llm([])
     out = nodes.news_verify_node({"ticker": "AVGO", "evidence": EVIDENCE, "verdict": "v",
                                   "judge_decision": {"unsupported_claims": ["the 221% figure appears only in a news item"]}})
-    assert calls == [] and out["claim_verification"]["claim_reviews"][0]["status"] == "supported"
+    assert calls == [] and out["claim_verification"]["claim_reviews"][0]["flag"] == "overturned"
     assert out["claim_verification"]["claim_reviews"][0]["verdict"] == "flag overturned"
 
 
@@ -518,8 +523,8 @@ def test_claim_review_truncation_shorter_retry_and_no_crash(stub_llm, monkeypatc
     monkeypatch.setattr(nodes, "get_related_leads", lambda claims, ticker: "")
     monkeypatch.setattr(rag, "corroborate_claims", lambda ticker, claims, coll=None, max_hits=2: [])
     state = {"ticker": "AVGO", "evidence": EVIDENCE6, "verdict": "v", "judge_decision": {"unsupported_claims": ["c1", "c2"]}}
-    cut = '{"claim_reviews":[{"claim":"c1","status":"unresolved","evidence_summary":"long long'
-    good = json.dumps({"claim_reviews": [{"claim": "c1", "status": "unresolved", "evidence_summary": "", "sources": []}],
+    cut = '{"claim_reviews":[{"claim":"c1","status":"unresolved","flag":"unresolved","evidence_summary":"long long'
+    good = json.dumps({"claim_reviews": [{"claim": "c1", "status": "unresolved", "flag": "unresolved", "evidence_summary": "", "sources": []}],
                        "reasoning": "ok", "verdict_changed": False, "revised_verdict": ""})
     # 1. cut off once -> a SHORTER retry (not a repair), which succeeds; empty revised_verdict keeps the verdict
     calls = stub_llm([cut, good], ["max_tokens", "end_turn"])

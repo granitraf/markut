@@ -589,6 +589,17 @@ def extract_highlights(press_text: str, char_limit: int = 1500) -> str:
 _UNITS_RE = re.compile(r"(?i)\b(?:in|\$ in|us\$ in|dollars in|amounts in)\s+(?:us\s*\$\s*|\$\s*|u\.s\. dollars? )?(thousands|millions|billions)\b")
 _PAGE_FIELD_RE = re.compile(r"^\s*Field:\s*/", re.IGNORECASE)
 _FOOTNOTE_MARK_RE = re.compile(r"\s*\(\d{1,2}\)\s*$|\s*\(\d{1,2}\)(?=\s*:)|\*+$")
+_re_pct_of = re.compile(r"(?i)^(?:as a )?(?:percent(?:age)?|%) of (?:total |net |total net )?(?:revenues?|sales|net sales)\b")
+_LEAD_FOOTNOTE_RE = re.compile(r"^\s*(?:\(\d{1,2}\)|\[\d{1,2}\]|\*+)\s*")
+_RESULT_ROW_RE = re.compile(r"(?i)^(?:gross (?:margin|profit)|operating (?:income|profit|loss)|income (?:\(loss\) )?from operations|"
+                            r"(?:income|loss|earnings)(?:/\(loss\))? (?:from operations|before)|net (?:income|earnings|loss))")
+
+
+def _group_text(text: str) -> str:
+    # "(1) Net sales by reportable segment:" -> "Net sales by reportable segment"
+    return _FOOTNOTE_MARK_RE.sub("", _LEAD_FOOTNOTE_RE.sub("", text or "")).rstrip(":").strip()
+
+
 _PERIOD_WORDS_RE = re.compile(r"(?i)\b(?:weeks?|months?|quarter|year|fiscal|ended|ending|as of|q[1-4]\b|fy\s?\d|\d{4})")
 _DATE_RE = re.compile(r"(?i)\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b|\b\d{4}-\d{2}-\d{2}\b")
 
@@ -611,7 +622,10 @@ def table_caption(table) -> tuple:
         prevs.append(s)
         if len(prevs) == 6:
             break
-    head_text = " ".join(prevs) + " " + _ZERO_WIDTH.sub("", table.get_text(" ", strip=True))[:300]
+    # units come from the caption lines only — never from a row label inside
+    # the table ("Units shipped (in thousands)" is that row's unit, not the
+    # table's); header rows are checked by parse_tables
+    head_text = " ".join(prevs)
     units = ""
     m = _UNITS_RE.search(head_text)
     if m:
@@ -696,16 +710,23 @@ def parse_tables(html: str) -> list:
     heading, group and period."""
     soup = BeautifulSoup(html, "html.parser")
     out = []
+    prev = None    # (headers, duration, caption, units) of the previous table that had column headings
     for ti, table in enumerate(soup.find_all("table")):
         if table.find_parent("table") is not None:
             continue
         caption, units = table_caption(table)
         headers, group, duration = [], "", ""
+        seen_figure_row = False
+        inherited = False
         for tr in table.find_all("tr"):
             cells = _cells_positional(tr)
             if not cells:
                 continue
             numeric = [is_figure_cell(c[2]) for c in cells]
+            if not units and not seen_figure_row and not any(numeric):
+                m = _UNITS_RE.search(" ".join(c[2] for c in cells))
+                if m:                          # "(in millions)" printed in the table's own header row
+                    units = (m.group(1) or "").lower()
             if len(cells) == 1 and not numeric[0]:
                 text = cells[0][2]
                 label_col = min([h[0] for h in headers] + [cells[0][0]]) if headers else 0
@@ -716,19 +737,41 @@ def parse_tables(html: str) -> list:
                     # three rows above one column): it sits over a value column
                     headers = _stack_headers(headers, cells)
                 else:
-                    group = _FOOTNOTE_MARK_RE.sub("", text).rstrip(":").strip()
+                    group = _group_text(text)
                 continue
             if not any(numeric):
                 if all(len(c[2]) < 80 for c in cells):
                     label_cell = cells[0] if cells[0][2].rstrip().endswith(":") else None
                     if label_cell is not None:
-                        group = _FOOTNOTE_MARK_RE.sub("", label_cell[2]).rstrip(":").strip()
+                        group = _group_text(label_cell[2])
                         cells = cells[1:]
                     headers = _stack_headers(headers, cells) if cells else headers
                 continue
+            vals = cells[1:] if not numeric[0] else cells
+            if (not seen_figure_row and not headers and not duration and prev is not None and not caption
+                    and vals and all(any(_overlap(h, (c0, c1)) for h in prev[0]) for c0, c1, _ in vals)):
+                # run #26 (P1): a HEADERLESS table directly after a headed one
+                # is its continuation (a filer splits one visual table in two:
+                # "Gross margin" amounts, then "Gross margin percentage"); it
+                # inherits the column headings, so its percentages keep their
+                # current and year-ago periods instead of "unstated"
+                headers, duration = [list(h) for h in prev[0]], prev[1]
+                caption, units = (prev[2] + " (continued)") if prev[2] else "", units or prev[3]
+                inherited = True
+            seen_figure_row = True
             label = "" if numeric[0] else cells[0][2]
             values = cells[1:] if label else cells
             label = _FOOTNOTE_MARK_RE.sub("", label).strip() or (f"Total ({group}, unlabeled row)" if group else "(unlabeled row)")
+            # run #26 (P1): a "Percentage of total net sales" row describes the
+            # row ABOVE it; on its own the label names nothing
+            if _re_pct_of.match(label) and out and out[-1]["table"] == ti and not _re_pct_of.match(out[-1]["label"]):
+                label = f"{out[-1]['label']} — {label}"
+            # P0 (run #26): a result line (gross margin, operating income, net
+            # income...) is never part of the cost or expense section above it
+            # — "Operating income [Operating expenses]" was a label the row
+            # does not have
+            if _RESULT_ROW_RE.match(label) and re.search(r"(?i)cost|expense", group):
+                group = ""
             row_cells = []
             for c0, c1, v in values:
                 heading = _heading_for(headers, (c0, c1))
@@ -740,6 +783,12 @@ def parse_tables(html: str) -> list:
             has_periods = bool(duration) or any(_PERIOD_WORDS_RE.search(h) or _DATE_RE.search(h) for h in periods)
             out.append({"table": ti, "caption": caption, "units": units, "group": group, "label": label,
                         "cells": row_cells, "periods": periods, "duration": duration, "has_period_headings": has_periods})
+            # a section ends at its Total row: the rows after it belong to no
+            # group until the next heading
+            if group and re.match(r"(?i)^total\b", label):
+                group = ""
+        if headers and not inherited:
+            prev = (headers, duration, caption, units)
     return out
 
 

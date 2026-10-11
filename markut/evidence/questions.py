@@ -113,40 +113,136 @@ def question_queries(q: dict, relaxed: bool = False) -> list:
     return [x for x in queries if x]
 
 
+# a TIER, not a nudge: rerank logits run about -10..+10, so +100 puts every
+# relevant current-period passage ahead of every prior-year one for a question
+# about now (run #26: a prior-year passage echoing the question's wording
+# outscored the current quarter's figures by more than any small bonus)
+CURRENT_BONUS = 100.0
+_HISTORY_Q_RE = re.compile(r"(?i)\b(?:historically|history|over the (?:past|last) (?:\d+|several|few|five|ten) years|since (?:19|20)\d\d|"
+                           r"multi-year|long[- ]term track record|decade)\b")
+_BOILERPLATE_EXCERPT_RE = re.compile(
+    r"(?i)fiscal years? (?:\d{4}(?:,? and \d{4})? )?(?:spanned|was|were|is|are) (?:the )?(?:52|53)\b|52- or 53-week|53-week (?:fiscal )?(?:year|period)|"
+    r"forward-looking statements?|safe harbor|basis of presentation|recently (?:issued|adopted) accounting|incorporated (?:herein )?by reference|"
+    r"should be read in conjunction with|table of contents")
+_TOPIC_STOP = {"which", "where", "while", "their", "these", "those", "about", "could", "would", "should", "versus", "given", "company",
+               "business", "quarter", "fiscal", "whether", "against", "durable", "sustainable", "growth", "growing", "trend", "trends",
+               "imply", "implies", "really", "still", "keep", "keeps", "comes", "from", "there", "being", "rather", "drive", "driven",
+               "much", "many", "level", "levels", "exposed", "exposure", "expand", "expanding", "spike", "rebound"}
+
+
+def _stem(w: str) -> str:
+    return w[:-1] if len(w) > 4 and w.endswith("s") else w
+
+
+def _mentions(text_low: str, name: str) -> bool:
+    for a in _aliases(name):
+        al = a.lower()
+        if len(al) > 2 and ((len(al) <= 6 and re.search(r"(?<![a-z0-9])" + re.escape(al) + r"(?![a-z0-9])", text_low)) or (len(al) > 6 and al in text_low)):
+            return True
+    return False
+
+
+def question_entities(q: dict, segments: list) -> list:
+    blob = " ".join([q.get("question", "")] + [str(x) for x in (q.get("segments") or [])] + [str(x) for x in (q.get("kpis") or [])]).lower()
+    return [sname for sname in segments if _mentions(blob, sname)]
+
+
+def topic_words(q: dict) -> set:
+    blob = " ".join([q.get("question", "")] + [str(x) for x in (q.get("kpis") or [])])
+    return {_stem(w) for w in re.findall(r"[a-z][a-z-]{4,}", blob.lower()) if w not in _TOPIC_STOP and _stem(w) not in _TOPIC_STOP}
+
+
+def excerpt_relevant(q: dict, text: str, segments: list) -> bool:
+    """PURE. Run #26 (P1): an excerpt must address its question's topic.
+    Generic boilerplate (fiscal-year length, safe harbor) never does. When
+    the question is about named segments, the excerpt must name one of them
+    or carry two of the question's topic words without naming a different
+    segment; otherwise it must carry at least one topic word."""
+    if _BOILERPLATE_EXCERPT_RE.search(text or ""):
+        return False
+    low = (text or "").lower()
+    words = {_stem(w) for w in re.findall(r"[a-z][a-z-]{4,}", low)}
+    hits = len(topic_words(q) & words)
+    ents = question_entities(q, segments)
+    if ents:
+        if any(_mentions(low, e) for e in ents):
+            return True
+        others = [sname for sname in segments if sname not in ents and _mentions(low, sname)]
+        return hits >= 2 and not others
+    return hits >= 1
+
+
+def filing_dates(coll) -> dict:
+    """{"10-K": newest 10-K date, "10-Q": newest 10-Q date, "8-K": newest 8-K date} from the index."""
+    out = {}
+    try:
+        for m in coll.get(include=["metadatas"])["metadatas"] or []:
+            f, d = m.get("form", ""), m.get("filing_date", "") or ""
+            if d and d > out.get(f, ""):
+                out[f] = d
+    except Exception:
+        pass
+    return out
+
+
+def is_current(meta: dict, dates: dict) -> bool:
+    """A filing is current-period when it is newer than the newest 10-K (a
+    10-Q or 8-K after it), or when it IS the newest annual report and no
+    later quarter has been filed."""
+    form, d = meta.get("form", ""), meta.get("filing_date", "") or ""
+    k = dates.get("10-K", "")
+    if form in ("10-Q", "8-K"):
+        return not k or d >= k
+    if form == "10-K":
+        return not any(dates.get(f, "") > d for f in ("10-Q",))
+    return False
+
+
+def period_label(meta: dict, dates: dict) -> str:
+    form, d = meta.get("form", "?"), meta.get("filing_date", "?")
+    if is_current(meta, dates):
+        return f"current period ({form} filed {d})"
+    if form == "10-K":
+        return f"prior fiscal year ({form} filed {d})"
+    return f"earlier filing ({form} filed {d})"
+
+
 def question_blocks(coll, plan: dict, profile: dict, profiled_text: str, relaxed: list = None) -> list:
     """[EVIDENCE Qn] sections: up to EXCERPTS_PER_QUESTION tagged lines per
-    question, every chunk used at most once across the run, nothing the
-    profiler already read, and an explicit 'could not find' line where
-    retrieval came up empty."""
+    question, every chunk used at most once across the run, current-period
+    filings ranked ahead of prior-year text for a question about now, every
+    excerpt labelled with its period, off-topic text rejected, and an
+    explicit 'could not find' line where nothing qualifies.
+    Run #26 (P1): profiled_text no longer excludes chunks — the profile is a
+    summary, so the latest MD&A it read must still reach the debate."""
     relaxed = set(relaxed or [])
     names = segment_names(profile)
-    profiled = _norm(profiled_text)
     seen_ids = set()
+    dates = filing_dates(coll)
     lines = []
-
-    def already_read(cand):
-        if cand.get("id") in seen_ids:
-            return True
-        head = _norm(cand.get("text", ""))[:160]
-        return bool(head) and head in profiled
 
     for q in plan.get("key_questions", []):
         qid = q.get("id", "Q?")
         lines.append(f"[EVIDENCE {qid}] {q.get('question', '')}")
         is_relaxed = qid in relaxed
+        about_now = not _HISTORY_Q_RE.search(q.get("question", ""))
         queries = question_queries(q, relaxed=is_relaxed)
         results, best = retrieve_theme(
-            coll, q.get("question", ""), queries, None, k=config.EXCERPTS_PER_QUESTION,
-            floor=RELAXED_FLOOR if is_relaxed else SIM_FLOOR, exclude=already_read,
-            per_query=config.CHUNKS_PER_QUERY + 2, dup_overlap=0.55)
+            coll, q.get("question", ""), queries, None, k=config.EXCERPTS_PER_QUESTION + 3,
+            floor=RELAXED_FLOOR if is_relaxed else SIM_FLOOR, exclude=lambda c: c.get("id") in seen_ids,
+            per_query=config.CHUNKS_PER_QUERY + 2, dup_overlap=0.55,
+            boost=(lambda c: CURRENT_BONUS if is_current(c["metadata"], dates) else 0.0) if about_now else None)
         kept = 0
         for r in results:
-            seen_ids.add(r.get("id"))
+            if kept >= config.EXCERPTS_PER_QUESTION:
+                break
             text = excerpt(r["text"])
-            if not text:
+            if not text or not excerpt_relevant(q, text, names):
                 continue
-            period, basis, segment = tag_period(text), tag_basis(text), tag_segment(text, names)
+            seen_ids.add(r.get("id"))
+            stated, basis, segment = tag_period(text), tag_basis(text), tag_segment(text, names)
             m = r["metadata"]
+            period = period_label(m, dates) + (f"; text says {stated}" if stated != "unstated" else "")
             prefix = f"- [{qid}] "
             if m.get("risk_title"):
                 lines.append(f"{prefix}Risk: {m['risk_title']}")
@@ -154,7 +250,8 @@ def question_blocks(coll, plan: dict, profile: dict, profiled_text: str, relaxed
             kept += 1
         if not kept:
             why = (f"best match {best:.2f} below the {RELAXED_FLOOR if is_relaxed else SIM_FLOOR} floor"
-                   if best is not None else "no candidate chunks")
+                   if best is not None and best < (RELAXED_FLOOR if is_relaxed else SIM_FLOOR) else
+                   "no retrieved passage addressed the question" if best is not None else "no candidate chunks")
             lines.append(f"- [{qid}] could not find: {q.get('question', '')} ({why}; pass {'2 (relaxed)' if is_relaxed else '1'})")
         lines.append("")
     return lines
@@ -263,27 +360,55 @@ def _kpi_match(a: str, b: str) -> bool:
     return bool(wa and wb) and len(wa & wb) / len(wa | wb) >= 0.5
 
 
+_CURRENT_PERIOD_RE = re.compile(r"\((?:quarter|YTD \(H1\)|YTD \(9M\)|ttm)\b")
+
+
+def _line_is_current(line: str, annual_is_current: bool) -> bool:
+    if "current period (" in line:
+        return True
+    if "prior fiscal year (" in line or "earlier filing (" in line:
+        return False
+    if _CURRENT_PERIOD_RE.search(line):
+        return True
+    return annual_is_current and "(annual" in line
+
+
 def coverage_assess(filings_text: str, plan: dict, kpi_values: dict, relevance: dict = None) -> dict:
-    """{qid: {"lines", "relevant", "kpis_ok", "covered"}}. A question is covered
-    only when at least one candidate line answers it (per the model's
-    relevance call when available, else every real candidate counts) AND every
-    KPI the planner linked to it has a value or an explicit not-found entry.
-    The routing decision itself stays in code (graph.coverage_decision)."""
+    """{qid: {"lines", "relevant", "current", "kpis_ok", "covered", "missing"}}.
+    Run #26 (P1): a question counts as covered only if at least one KPI the
+    planner linked to it has a CURRENT-PERIOD value, or a current-period
+    excerpt or figure addressing it is attached (per the relevance call when
+    available). Prior-year text alone does not answer a question about now.
+    missing = the linked KPIs with no current-period value — the coverage
+    gap names them. The routing decision itself stays in code."""
     qs = (plan or {}).get("key_questions", [])
     qids = [q.get("id") for q in qs if q.get("id")]
     cands = candidate_lines(filings_text, qids)
+    text = filings_text or ""
+    annual_is_current = not re.search(r"\(quarter\b|\(YTD \(", text)       # the latest filing is an annual report
+    kpi_lines = {}
+    for line in text.splitlines():
+        m = re.match(r"^- KPI (?!value not found)(.+?): ", line.strip())
+        if m:
+            kpi_lines[m.group(1).strip()] = line
     out = {}
     for q in qs:
         qid = q.get("id")
         lines = cands.get(qid, [])
         if relevance is not None and qid in relevance:
             idx = {i for i in relevance[qid] if isinstance(i, int)}
-            relevant = sum(1 for i in range(len(lines)) if i in idx)
+            chosen = [l for i, l in enumerate(lines) if i in idx]
         else:
-            relevant = len(lines)
+            chosen = list(lines)
+        current = [l for l in chosen if _line_is_current(l, annual_is_current)]
         linked = [k for k in (q.get("kpis") or []) if isinstance(k, str) and k.strip()]
         kpis_ok = all(any(_kpi_match(k, name) for name in (kpi_values or {})) for k in linked)
-        out[qid] = {"lines": len(lines), "relevant": relevant, "kpis_ok": kpis_ok, "covered": relevant >= 1 and kpis_ok}
+        current_kpis = [k for k in linked
+                        if any(_kpi_match(k, name) and _line_is_current(line, annual_is_current) for name, line in kpi_lines.items())]
+        covered = bool(current_kpis) or bool(current)
+        out[qid] = {"lines": len(lines), "relevant": len(chosen), "current": len(current), "kpis_ok": kpis_ok,
+                    "covered": covered, "missing": [k for k in linked if k not in current_kpis],
+                    "prior_only": bool(chosen) and not current}
     return out
 
 
@@ -345,9 +470,14 @@ def guidance_block(fs: dict, transcripts: list) -> list:
     """[GUIDANCE]: every guided item as its own line, with its source; an
     EXTRACTION FAILURE line where forward-looking language exists but no
     figure could be read (never 'no guidance')."""
-    lines = ["[GUIDANCE] (forward-looking statements with a figure, from the latest 8-K exhibits and 10-Q MD&A; "
-             "each line is one guided item)"]
-    g = secs.guidance_lines(secs.guidance_sources(fs, transcripts))
+    return format_guidance(secs.guidance_lines(secs.guidance_sources(fs, transcripts)))
+
+
+def format_guidance(g: dict) -> list:
+    """PURE. The [GUIDANCE] lines from guidance_lines' result. When no business
+    target was found it says so and names why (run #26, P2 item 10)."""
+    lines = ["[GUIDANCE] (forward-looking business targets with a figure, from the latest 8-K exhibits and 10-Q; "
+             "accounting schedules excluded; each line is one guided item)"]
     urls = {}
     for item in g["lines"]:
         where = f"; {item['where']}" if item.get("where") and item["where"] != "text" else ""
@@ -359,5 +489,7 @@ def guidance_block(fs: dict, transcripts: list) -> list:
     for f in g["failures"]:
         lines.append(f"- EXTRACTION FAILURE: {f}")
     if not g["lines"] and not g["failures"]:
-        lines.append("- no forward-looking statements with a figure were found in the latest 8-K exhibits or 10-Q MD&A")
+        lines.append("- no forward-looking business targets found in the latest 8-K exhibits or 10-Q (accounting schedules such as "
+                     "deferred-revenue, lease and debt-maturity tables are excluded). A company that gives guidance only on its "
+                     "earnings call is a known gap: no call transcript is available.")
     return lines

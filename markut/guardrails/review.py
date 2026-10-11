@@ -369,7 +369,10 @@ def review_node(state: DebateState) -> dict:
                     if r.get("qualified") and r.get("resolution") == "LABELED")
     mis_n = len(report.get("mislabeled_after", report["mislabeled"]))
     sc_n = len(report.get("scenario_flags_after", report["scenario_flags"]))
-    print(f"REVIEW STATS: claims={len(claims)} cited={cited_count} "
+    _final = extract_numeric_claims(_TAG_RE.sub("", revised))
+    _final_flagged = sum(1 for c in _final if trace_claim(c, evidence) == "FLAGGED")
+    print(f"REVIEW STATS (final verdict): claims={len(_final)} cited={len(_final) - _final_flagged} | draft: "
+          f"claims={len(claims)} cited={cited_count} "
           f"flagged={len(flagged)} | derived={derived_n} labeled={labeled_n} "
           f"annotated={annotated_count} | mislabeled={mis_n} scenario={sc_n} "
           f"miscomputed={len(report['miscomputed'])} | sources_unavailable={sources_unavailable} | status={report['final_status']}"

@@ -107,6 +107,7 @@ window.Markut = (function () {
      BASIS/PERIOD notes become full-width text. Values never wrap —
      labels do. Everything after the market lines (filings, news) stays
      collapsed as text. */
+  const FLAG_LABELS = { upheld: "flag upheld", overturned: "flag overturned", unresolved: "unresolved" };
   const WRAP_SECTIONS = /^(PROFILE|KEY QUESTIONS|WHAT WOULD MISLEAD|COVERAGE GAPS)$/;
   function packetHtml(evidence) {
     const lines = String(evidence || "").split("\n");
@@ -270,7 +271,8 @@ window.Markut = (function () {
       news_verify(d) {
         clearPending();
         let body = "";
-        if (d.claim_reviews && d.claim_reviews.length) body += `<ul class="claims">${d.claim_reviews.map((r) => { const v = r.verdict || ({ supported: "flag overturned", contradicted: "flag upheld" }[r.status] || r.status || "?"); return `<li><span class="pill ${/overturned/.test(v) ? "yes" : /upheld/.test(v) ? "no" : ""}">${esc(v)}</span> ${esc(r.claim || "")}${r.evidence_summary ? " — " + esc(r.evidence_summary) : ""}</li>`; }).join("")}</ul>`;
+        // P0 (run #26): the label comes from the explicit flag ruling only; a record without one shows its raw status
+        if (d.claim_reviews && d.claim_reviews.length) body += `<ul class="claims">${d.claim_reviews.map((r) => { const v = FLAG_LABELS[r.flag] || `status ${r.status || "?"} (no flag ruling recorded)`; return `<li><span class="pill ${r.flag === "overturned" ? "yes" : r.flag === "upheld" ? "no" : ""}">${esc(v)}</span> ${esc(r.claim || "")}${r.evidence_summary ? " — " + esc(r.evidence_summary) : ""}</li>`; }).join("")}</ul>`;
         else body += `<p class="note">${esc(d.reasoning || "No unsupported claims to re-audit.")}</p>`;
         if (d.verdict_changed) body += `<p class="note">The re-audit revised the verdict.</p>`;
         if (d.leads) body += `<details class="pt"><summary>related news leads (display only, never evidence)</summary><pre class="evidence">${esc(d.leads)}</pre></details>`;

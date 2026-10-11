@@ -21,7 +21,11 @@ def split_sentences(text: str) -> list:
     # prose well enough, and the lookahead keeps decimals ("$4.5 billion") from
     # producing fake sentence breaks — there is no space after the dot inside
     # a number, so the split pattern can never fire there.
-    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(])", text)
+    # run #26 (P1): a sentence may also start with a camel-case product name
+    # ("iPhone net sales increased ...") — those sentences were never split,
+    # so a real MD&A window read as one "sentence" and the boilerplate filter
+    # dropped it
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(]|[a-z][A-Z])", text)
     return [p.strip() for p in parts if p.strip()]
 
 
@@ -359,7 +363,7 @@ def is_boilerplate_chunk(text: str) -> bool:
 
 def retrieve_theme(collection, rerank_query: str, sub_queries: list,
                    section_filter: list = None, k: int = 4, floor: float = None,
-                   exclude=None, per_query: int = None, dup_overlap: float = 0.9):
+                   exclude=None, per_query: int = None, dup_overlap: float = 0.9, boost=None):
     # Three retrieval stages, ALL local and free (zero API tokens):
     #   1. FAN-OUT — embed every concrete sub-query and pull POOL_PER_QUERY
     #      nearest chunks for each, inside the section fence. Embeddings match
@@ -422,6 +426,9 @@ def retrieve_theme(collection, rerank_query: str, sub_queries: list,
     scores = get_reranker().predict([(rerank_query, text) for text in rerank_texts])
     for cand, score in zip(candidates, scores):
         cand["rerank"] = round(float(score), 3)
+        if boost is not None:
+            # e.g. current-period filings ahead of prior-year text for a question about now
+            cand["rerank"] = round(cand["rerank"] + float(boost(cand) or 0.0), 3)
     candidates.sort(key=lambda c: c["rerank"], reverse=True)
 
     # Deduplicate sentence windows in rerank order. First use positional overlap:
