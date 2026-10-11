@@ -633,7 +633,9 @@ def tracing_evidence(packet: str) -> str:
     out, section = [], ""
     for raw in (packet or "").splitlines():
         line = raw.strip()
-        m = re.match(r"^\[([A-Z][A-Z0-9 &/]+?)(?:\s+Q\d)?\](.*)$", line)
+        # a header may carry text after a dash ("[FILINGS ADDENDUM — passages …]",
+        # appended after [DATA GAPS] by the claim review — data, not a gap note)
+        m = re.match(r"^\[([A-Z][A-Z0-9 &/]+?)(?:\s+Q\d)?(?:\s+—[^\]]*)?\](.*)$", line)
         if m:
             section = m.group(1)
             out.append(line[:m.start(2)])          # keep the header, drop a question's text after it
@@ -650,7 +652,7 @@ def _source_lines(evidence: str) -> list:
     out, section = [], ""
     for raw in (evidence or "").splitlines():
         line = raw.strip()
-        m = re.match(r"^\[([A-Z][A-Z0-9 &/]+?)(?:\s+Q\d)?\]", line)
+        m = re.match(r"^\[([A-Z][A-Z0-9 &/]+?)(?:\s+Q\d)?(?:\s+—[^\]]*)?\]", line)
         if m:
             section = m.group(1)
             continue
@@ -674,7 +676,7 @@ def _short(line: str, limit: int = 220) -> str:
     return body + (f"  {tag.group(1)}" if tag else "")
 
 
-def figure_sources(verdict: str, evidence: str, resolutions=None, moved_anchors=None) -> list:
+def figure_sources(verdict: str, evidence: str, resolutions=None, moved_anchors=None, rounded=None) -> list:
     """PURE. One entry per figure in the verdict: {"figure", "kind", "line"}.
     kind: cited (the packet line it traces to, preferring a sourced fact
     line), derived (computed from anchors the governor verified), judgment
@@ -711,6 +713,10 @@ def figure_sources(verdict: str, evidence: str, resolutions=None, moved_anchors=
         seen.add(fig)
         line = find(fig) if trace_claim(fig, evidence or "") == "CITED" else None
         res = by_claim.get(fig)
+        src_round = (rounded or {}).get(fig)
+        if not line and src_round:
+            base = find(src_round)
+            line = f"{base} — rounded from {src_round}" if base else f"rounded from {src_round}"
         if line:
             out.append({"figure": fig, "kind": "cited", "line": line})
         elif res and res.get("resolution") == "DERIVED" and res.get("qualified", True):
@@ -738,3 +744,81 @@ def figure_sources(verdict: str, evidence: str, resolutions=None, moved_anchors=
             out.append({"figure": fig, "kind": "untraced",
                         "line": "no line in the evidence packet holds this figure" + (f"; the governor's note: {hint}" if hint else "")})
     return out
+
+
+
+# ---------------- P1 (run #28 / #27 audit): honest rounding traces ----------------
+# WHY: "38.6x trailing P/E" for 38.61 and "64% gross margin" for 64.23% are
+# fair roundings, but the literal tracer flagged them (run #27's 38.6x) or —
+# before P0 — matched them against the planner's own text. A rounding counts
+# only when (a) the data value rounds to the claim at the CLAIM's precision,
+# with a matching unit, and (b) the data line's label shares a word with the
+# words around the claim — so "revenue rose 64%" never borrows the 64.23%
+# gross margin.
+_ROUND_STOP = {"the", "and", "for", "with", "from", "this", "that", "its", "are", "was", "were", "has", "have", "year", "years",
+               "quarter", "quarters", "annual", "total", "net", "per", "share", "rate", "about", "near", "roughly", "around",
+               "over", "under", "into", "than", "more", "less", "after", "before", "while", "which", "source", "computed",
+               "data", "provider", "field", "yfinance", "info"}
+
+
+def _round_words(text: str) -> set:
+    t = (text or "").lower().replace("p/e", " pe ").replace("ev/", " ev ")
+    # a plural matches its label ("margins" / "Profit margin"): drop a final s
+    return {(w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w)
+            for w in re.findall(r"[a-z][a-z]{1,}", t) if w not in _ROUND_STOP and len(w) >= 2}
+
+
+def rounded_source(claim: str, sentence: str, evidence: str):
+    """PURE. The data value a claim honestly rounds, or None. sentence is the
+    claim's own sentence (its nearby words are matched to the line label)."""
+    c = (claim or "").strip()
+    m = re.match(r"^([+-]?)\$?\s?(\d[\d,]*(?:\.(\d+))?)\s*(%|x)?$", c)
+    if not m:
+        return None
+    sign, body, frac, unit = m.group(1), m.group(2), m.group(3) or "", m.group(4) or ""
+    dollars = "$" in c
+    target = float(body.replace(",", "")) * (-1 if sign == "-" else 1)
+    decimals = len(frac)
+    i = (sentence or "").find(c.lstrip("+"))
+    ctx = _round_words((sentence or "")[max(0, i - 50): i + len(c) + 25] if i >= 0 else sentence)
+    for raw in tracing_evidence(evidence).splitlines():
+        line = raw.strip()
+        if not line.startswith("- ") or ":" not in line:
+            continue
+        label = line[2:line.index(":")]
+        if not (ctx & _round_words(label)):
+            continue
+        multiple_label = re.search(r"(?i)p/e|ev/|multiple|ratio|x\b", label)
+        for tok in re.finditer(r"([+-]?)(\$?)\s?(\d[\d,]*\.(\d+))\s*(%|x)?", line[line.index(":"):]):
+            t_sign, t_dollar, t_body, t_frac, t_unit = tok.groups()
+            t_unit = t_unit or ""
+            if len(t_frac) <= decimals:
+                continue                                   # not a more precise value — not a rounding
+            if unit == "%" and t_unit != "%":
+                continue
+            if unit == "x" and not (t_unit == "x" or (t_unit == "" and multiple_label)):
+                continue
+            if unit == "" and t_unit:
+                continue
+            if dollars != bool(t_dollar):
+                continue
+            value = float(t_body.replace(",", "")) * (-1 if t_sign == "-" else 1)
+            if abs(round(value, decimals) - target) < 1e-9:
+                return f"{'-' if t_sign == '-' else ''}{t_dollar}{t_body}{t_unit}"
+    return None
+
+
+# ---------------- P1: no meta-text in the verdict ----------------
+# WHY: told that sources are listed by code, the judge wrote "(the page lists
+# the exact figure and its source)" in place of the figure (run #28). A
+# reference to the page or a source list is never content: the parenthetical
+# is removed (the prompt now asks for the figure itself).
+_META_RE = re.compile(r"\s*\((?:[^()]*?)\b(?:the page|this page|the sources?(?: list)?|source list|listed (?:below|beneath)|"
+                      r"see (?:the )?sources?|shown below|listed on the page)\b[^()]*\)", re.IGNORECASE)
+
+
+def strip_meta_references(text: str) -> tuple:
+    """PURE. (text without parentheticals that point at the page / a source
+    list, [what was removed])."""
+    removed = [m.group(0).strip() for m in _META_RE.finditer(text or "")]
+    return _META_RE.sub("", text or ""), removed

@@ -208,7 +208,9 @@ def leverage_lines(bs, info: dict, ccy: str = "USD") -> list:
         with_l = total_debt / equity * 100
         def tag(v):
             try:
-                return "  (matches the yfinance Debt/Equity figure)" if provider and abs(v - float(provider)) / float(provider) < 0.03 else ""
+                # P1 (run #28): within 1% — the provider computes from the same
+                # balance sheet; 3% let TSM's 16.0% "match" 16.50 too
+                return "  (matches the yfinance Debt/Equity figure)" if provider and abs(v - float(provider)) / float(provider) < 0.01 else ""
             except (TypeError, ValueError, ZeroDivisionError):
                 return ""
         if not leases:
@@ -219,10 +221,19 @@ def leverage_lines(bs, info: dict, ccy: str = "USD") -> list:
                     f"{money_c(total_debt)} / stockholders' equity {money_c(equity)}; lease obligations are not included (the provider's "
                     f"debt figure holds {'$0 of them' if leases == 0 else 'no lease line'})  [source: yfinance/quarterly_balance_sheet, computed]{tag(with_l)}"]
         ex_l = (total_debt - leases) / equity * 100
+        # P1 (run #28): both lines said "matches" (TSM: 16.6% and 16.0% vs 16.50 —
+        # leases are 3% of its debt). Only the closer line is tagged, and when
+        # both sit within rounding of the provider's figure the tag says so.
+        tag_with, tag_ex = tag(with_l), tag(ex_l)
+        if tag_with and tag_ex:
+            note = (f"  (closest to the yfinance Debt/Equity figure of {float(provider):.2f}; leases are too small to tell "
+                    f"which of the two lines it includes)")
+            closer_with = abs(with_l - float(provider)) <= abs(ex_l - float(provider))
+            tag_with, tag_ex = (note, "") if closer_with else ("", note)
         return [f"- Debt/Equity including lease obligations (computed, balance sheet {asof}): {with_l:.1f}% = total debt {money_c(total_debt)} "
-                f"(of which lease obligations {money_c(leases)}) / stockholders' equity {money_c(equity)}  [source: yfinance/quarterly_balance_sheet, computed]{tag(with_l)}",
+                f"(of which lease obligations {money_c(leases)}) / stockholders' equity {money_c(equity)}  [source: yfinance/quarterly_balance_sheet, computed]{tag_with}",
                 f"- Debt/Equity excluding lease obligations (computed, balance sheet {asof}): {ex_l:.1f}% = debt ex-leases {money_c(total_debt - leases)} "
-                f"/ stockholders' equity {money_c(equity)}  [source: yfinance/quarterly_balance_sheet, computed]{tag(ex_l)}"]
+                f"/ stockholders' equity {money_c(equity)}  [source: yfinance/quarterly_balance_sheet, computed]{tag_ex}"]
     except Exception:
         return []
 

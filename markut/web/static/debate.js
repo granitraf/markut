@@ -361,6 +361,7 @@ window.Markut = (function () {
         if (d.claim_reviews && d.claim_reviews.length) body += `<ul class="claims">${d.claim_reviews.map((r) => { const v = FLAG_LABELS[r.flag] || `status ${r.status || "?"} (no flag ruling recorded)`; return `<li><span class="pill ${r.flag === "overturned" ? "yes" : r.flag === "upheld" ? "no" : ""}">${esc(v)}</span> ${esc(r.claim || "")}${r.evidence_summary ? " — " + esc(r.evidence_summary) : ""}</li>`; }).join("")}</ul>`;
         else body += `<p class="note">${esc(d.reasoning || "No unsupported claims to re-audit.")}</p>`;
         if (d.verdict_changed) body += `<p class="note">The re-audit revised the verdict.</p>`;
+        if (d.addendum) body += `<details class="pt"><summary>filings addendum the claim review used</summary><pre class="evidence">${esc(d.addendum)}</pre></details>`;
         if (d.leads) body += `<details class="pt"><summary>related news leads (display only, never evidence)</summary><pre class="evidence">${esc(d.leads)}</pre></details>`;
         const c = card("news", `<h3><span class="who">claim review</span></h3>${body}${d.recorded === false ? note(d) : ""}`);
         setPending("review governor is tracing every number in the verdict…"); return c;

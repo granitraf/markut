@@ -580,16 +580,42 @@ _HEADLINE_STOP = {"what", "sees", "coming", "says", "said", "will", "could", "mi
                   "the", "and", "for", "are", "but", "not", "you", "your", "new", "now", "out", "has", "have", "was", "is", "to"}
 
 
+_MONTHS_RE = re.compile(r"\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b", re.IGNORECASE)
+
+
+def _lead(body: str, min_chars: int = 200, max_chars: int = 600) -> str:
+    """The article's opening: its first two sentences, at least min_chars."""
+    t = re.sub(r"\s+", " ", body or "").strip()
+    sents = re.split(r"(?<=[.!?])\s+", t)
+    lead = " ".join(sents[:2])
+    if len(lead) < min_chars:
+        lead = t[:min_chars]
+    return lead[:max_chars]
+
+
 def body_matches_headline(title: str, body: str, identity: dict) -> bool:
-    """PURE. Run #26 (P2, item 13a): a fetched body must share salient terms
-    with its headline (beyond the company's own name), or it is another
-    article — a page that served an unrelated story under this headline."""
-    company = {w for w in re.findall(r"[a-z0-9]+", (identity or {}).get("company", "").lower())} | {(identity or {}).get("ticker", "").lower()}
+    """PURE. Run #26 (P2) + P1 (run #27): a fetched body must be the article
+    its headline names. Checked against the article's LEAD — a page that
+    lists the headline under "related" further down is another article (run
+    #27: a valuation piece fetched for the UBS App Store headline) — and the
+    headline's distinctive tokens (all-caps names, numbers, months) must
+    appear in that lead when it has any."""
+    ident = identity or {}
+    company = {w for w in re.findall(r"[a-z0-9]+", ident.get("company", "").lower())} | {ident.get("ticker", "").lower()}
     salient = {w for w in re.findall(r"[a-z0-9]+", (title or "").lower()) if len(w) >= 3 and w not in _HEADLINE_STOP and w not in company}
     if not salient:
         return True
-    words = set(re.findall(r"[a-z0-9]+", (body or "").lower()))
-    overlap = len(salient & words)
+    lead = _lead(body)
+    lead_low = lead.lower()
+    lead_words = set(re.findall(r"[a-z0-9]+", lead_low))
+    caps = {w.lower() for w in re.findall(r"\b[A-Z][A-Z0-9&]{1,}\b", title or "")} - company
+    months = {m.lower() for m in _MONTHS_RE.findall(title or "")}
+    numbers = set(re.findall(r"\d+", title or ""))
+    lead_numbers = {n.split(".")[0] for n in re.findall(r"\d+(?:\.\d+)?", lead)}
+    distinct_hits = (caps & lead_words) | (months & lead_words) | (numbers & lead_numbers)
+    if (caps or months or numbers) and not distinct_hits:
+        return False
+    overlap = len(salient & lead_words)
     return overlap >= 2 or (len(salient) <= 3 and overlap >= 1)
 
 

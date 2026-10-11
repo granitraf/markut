@@ -64,7 +64,29 @@ def test_review_stats_and_sources_use_data_only():
     from markut.web.events import review_stats
     verdict = "Gross margin of 64% and net margin near 50% must hold; next year's 22.05 consensus is the bar."
     s = review_stats(verdict, TSM_PACKET, verdict, {"final_status": "revised"})
-    check(f"TSM run #28: three figures, and none traces to the planner's text ({s})", s["claims"] == 3 and s["cited"] == 1)
-    src = {x["figure"]: x for x in tracer.figure_sources(verdict, TSM_PACKET, [])}
-    check(f"'64%' is listed untraced, never sourced to a 'could not find' line ({src.get('64%')})",
-          src.get("64%", {}).get("kind") == "untraced" and "could not find" not in src.get("64%", {}).get("line", ""))
+    # P1 (rounding): 64% and 50% now trace — to the DATA lines they round
+    # (64.23%, 49.92%), never to the planner's question text
+    check(f"TSM run #28: three figures, all traced to data ({s})", s["claims"] == 3 and s["cited"] == 3)
+    src = {x["figure"]: x for x in tracer.figure_sources(verdict, TSM_PACKET, [],
+                                                         rounded={"64%": "64.23%", "50%": "49.92%"})}
+    check(f"'64%' is sourced to the gross-margin data line it rounds, never a 'could not find' line ({src.get('64%')})",
+          src.get("64%", {}).get("kind") == "cited" and "Gross margin (TTM)" in src["64%"]["line"]
+          and "rounded from 64.23%" in src["64%"]["line"] and "could not find" not in src["64%"]["line"])
+    bare = {x["figure"]: x for x in tracer.figure_sources(verdict, TSM_PACKET, [])}
+    check("without a rounding match it is listed untraced, still never sourced to the planner's text",
+          bare.get("64%", {}).get("kind") == "untraced" and "could not find" not in bare.get("64%", {}).get("line", ""))
+
+
+def test_the_claim_review_addendum_is_data():
+    # the addendum is appended AFTER [DATA GAPS]; its header carries text
+    # ("[FILINGS ADDENDUM — passages …]"), and its passages are filing quotes
+    # the governor must trace against (AAPL run #27: the $0.11 tariff refund)
+    packet = AAPL_PACKET + ("\n[DATA GAPS]\n- known gap (always): earnings-call transcript\n\n"
+                            "[FILINGS ADDENDUM — passages found in the indexed filings for the flagged claims]\n"
+                            '- $0.11: "diluted earnings per share of $2.02 included a favorable impact of $0.11 from tariff refunds"  '
+                            "[source: EDGAR/8-K press release, filed 2026-07-30]")
+    data = tracer.tracing_evidence(packet)
+    check("AAPL run #27: the addendum's $0.11 traces", tracer.trace_claim("$0.11", data) == "CITED")
+    check("…while the data-gap note stays out", "known gap" not in data)
+    src = {x["figure"]: x for x in tracer.figure_sources("The refund added $0.11 to EPS.", packet, [])}
+    check(f"…and its source is the addendum passage ({src.get('$0.11')})", "tariff refunds" in src.get("$0.11", {}).get("line", ""))

@@ -92,9 +92,12 @@ def review_stats(pre_verdict: str, evidence: str, final_verdict: str, report: di
     final_clean = _TAG_RE.sub("", final_verdict or "")
     claims = extract_numeric_claims(final_clean)
     # run #28: traced against DATA only — never the planner's own question text
-    from markut.guardrails.tracer import tracing_evidence
+    from markut.guardrails.tracer import claim_contexts, rounded_source, tracing_evidence
     data = tracing_evidence(evidence or "")
-    flagged = [c for c in claims if trace_claim(c, data) == "FLAGGED"]
+    sentences = {c["claim"]: c["sentence"] for c in claim_contexts(final_clean)}
+    # P1: an honest rounding under the same label is traced, not flagged
+    flagged = [c for c in claims if trace_claim(c, data) == "FLAGGED"
+               and not rounded_source(c, sentences.get(c, final_clean), data)]
     pre = extract_numeric_claims(pre_verdict or "")
     resolutions = report.get("resolutions", []) or []
     return {
@@ -160,6 +163,9 @@ def event_for(node: str, update: dict, before: dict, after: dict) -> dict:
             "reasoning": verification.get("reasoning", ""),
             "verdict_changed": bool(verification.get("verdict_changed", False)),
             "leads": update.get("targeted_news_evidence", "") or "",
+            # P1 (run #27): the filing passages the claim review read were never
+            # recorded, so the report could not show them
+            "addendum": _addendum_of(update.get("evidence") or ""),
         }}
     if node == "review":
         report = update.get("review_report", {}) or {}
@@ -190,6 +196,11 @@ def _usage_snapshot() -> dict:
 
 def _usage_delta(before: dict, after: dict) -> dict:
     return {k: after.get(k, 0) - before.get(k, 0) for k in after}
+
+
+def _addendum_of(evidence: str) -> str:
+    from markut.agents.nodes import split_addendum
+    return split_addendum(evidence)[1].strip() if evidence else ""
 
 
 def filing_history_forms(cik: str) -> list:

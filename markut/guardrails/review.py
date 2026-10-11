@@ -12,7 +12,8 @@ from markut.evidence.gaps import count_gaps
 from markut.guardrails.parsing import parse_review_json
 from markut.guardrails.tracer import (DISCLAIMER_TEXT, _as_float, check_scenarios,
     extract_numeric_claims, find_absence_claims, find_advice_language, find_mislabeled, has_disclaimer,
-    figure_sources, normalize_number, recompute_derived, strip_inline_anchors, trace_claim, tracing_evidence)
+    figure_sources, normalize_number, recompute_derived, rounded_source, strip_inline_anchors, strip_meta_references,
+    trace_claim, tracing_evidence)
 
 
 def _close(a, b, pct: bool) -> bool:
@@ -78,6 +79,17 @@ def _claim_sentences(text: str) -> list:
     return claim_contexts(text)
 
 
+def _rounded_map(text: str, flagged: list, data: str) -> dict:
+    """{claim: the data value it honestly rounds} for flagged claims (P1)."""
+    sentences = {c["claim"]: c["sentence"] for c in _claim_sentences(text)}
+    out = {}
+    for c in flagged:
+        src = rounded_source(c, sentences.get(c, text), data)
+        if src:
+            out[c] = src
+    return out
+
+
 def review_node(state: DebateState) -> dict:
     """OUTPUT-LAYER GUARDRAIL (layer 3 of 3) — the graph's TERMINAL node.
     Deterministic extract+trace decides WHAT is ungrounded; one bounded model
@@ -86,7 +98,8 @@ def review_node(state: DebateState) -> dict:
     inline. Annotation over censorship: the reader always sees the claim AND
     its epistemic status."""
     print("REVIEW: tracing verdict claims against the evidence packet")
-    verdict = state["verdict"] or ""
+    # P1 (run #28): a pointer to "the page" or "the sources" is never content
+    verdict, meta_removed = strip_meta_references(state["verdict"] or "")
     evidence = state["evidence"] or ""
     # Execution-layer bookkeeping lands here: conditional-edge functions
     # cannot write state in LangGraph, so the budget flag is RECORDED by the
@@ -101,6 +114,10 @@ def review_node(state: DebateState) -> dict:
     data = tracing_evidence(evidence)
     claims = extract_numeric_claims(verdict)
     flagged = [c for c in claims if trace_claim(c, data) == "FLAGGED"]
+    # P1: an honest rounding of a data value under the same label is traced
+    # ("38.6x trailing P/E" = 38.61) — never sent for revision, never tagged
+    rounded = _rounded_map(verdict, flagged, data)
+    flagged = [c for c in flagged if c not in rounded]
     advice = find_advice_language(verdict)
     # AUDIT FIX (run #2): presence is not truth — numbers that trace under the
     # WRONG period/basis, and multiple×EPS scenarios whose direction the
@@ -117,14 +134,15 @@ def review_node(state: DebateState) -> dict:
               "mislabeled": [dict(f) for f in mislabeled], "scenario_flags": [dict(f) for f in scenarios],
               "absence_flags": [dict(a) for a in absences],
               "miscomputed": [], "resolutions": [], "final_status": "clean", "revision_used": False,
-              "sources_unavailable": sources_unavailable}
+              "sources_unavailable": sources_unavailable,
+              "rounded": [{"claim": c, "source": s} for c, s in rounded.items()], "meta_removed": meta_removed}
 
     if not flagged and not advice and not mislabeled and not scenarios and not absences and has_disclaimer(verdict):
         print(f"REVIEW STATS: claims={len(claims)} cited={cited_count} flagged=0 | "
               f"derived=0 labeled=0 annotated=0 | mislabeled=0 scenario=0 miscomputed=0 | "
               f"sources_unavailable={sources_unavailable} | status=clean"
               + (" | BUDGET EXCEEDED" if budget_exceeded else ""))
-        report["sources"] = figure_sources(verdict, evidence, [], [])
+        report["sources"] = figure_sources(verdict, evidence, [], [], rounded=rounded)
         return {"verdict": verdict, "review_report": report,
                 "budget_exceeded": budget_exceeded}
 
@@ -219,6 +237,8 @@ def review_node(state: DebateState) -> dict:
         # prompt says so; this makes it true even when the model writes an
         # "(anchors: …)" block anyway — the block moves to the source list.
         revised, moved_anchors = strip_inline_anchors(revision["verdict"])
+        revised, _more_meta = strip_meta_references(revised)
+        report["meta_removed"] = report.get("meta_removed", []) + _more_meta
         report["inline_anchors_moved"] = moved_anchors
         report["resolutions"] = revision["resolutions"]
 
@@ -329,8 +349,10 @@ def review_node(state: DebateState) -> dict:
         report["absence_flags_after"] = [dict(a) for a in still_abs]
         # 2. which numbers still need an UNGROUNDED tag — decided on clean text,
         #    excluding numbers a MISCOMPUTED resolution already explains
-        to_tag = [claim for claim in extract_numeric_claims(revised)
-                  if trace_claim(claim, data) == "FLAGGED" and not _covered(claim)
+        _rev_claims = extract_numeric_claims(revised)
+        _rev_rounded = _rounded_map(revised, [c for c in _rev_claims if trace_claim(c, data) == "FLAGGED"], data)
+        to_tag = [claim for claim in _rev_claims
+                  if trace_claim(claim, data) == "FLAGGED" and not _covered(claim) and claim not in _rev_rounded
                   and not any(_close(_as_float(claim), _as_float(c), str(claim).strip().endswith("%"))
                               for r in miscomputed for c in _claim_numbers(r))]
         # 3. stamps, each pass blind to the tags the previous one wrote
@@ -365,8 +387,11 @@ def review_node(state: DebateState) -> dict:
             annotated_count += n
         report["final_status"] = "annotated" if annotated_count else "revised"
 
-    report["sources"] = figure_sources(_TAG_RE.sub("", revised), evidence, report["resolutions"],
-                                       report.get("inline_anchors_moved", []))
+    _clean_final = _TAG_RE.sub("", revised)
+    _final_rounded = _rounded_map(_clean_final, [c for c in extract_numeric_claims(_clean_final) if trace_claim(c, data) == "FLAGGED"], data)
+    report["rounded"] = [{"claim": c, "source": s_} for c, s_ in _final_rounded.items()]
+    report["sources"] = figure_sources(_clean_final, evidence, report["resolutions"],
+                                       report.get("inline_anchors_moved", []), rounded=_final_rounded)
     if not has_disclaimer(revised):
         # Deterministic append — a mandatory disclaimer is not something to
         # request from a model and hope.
@@ -382,7 +407,7 @@ def review_node(state: DebateState) -> dict:
     mis_n = len(report.get("mislabeled_after", report["mislabeled"]))
     sc_n = len(report.get("scenario_flags_after", report["scenario_flags"]))
     _final = extract_numeric_claims(_TAG_RE.sub("", revised))
-    _final_flagged = sum(1 for c in _final if trace_claim(c, data) == "FLAGGED")
+    _final_flagged = sum(1 for c in _final if trace_claim(c, data) == "FLAGGED" and c not in _final_rounded)
     print(f"REVIEW STATS (final verdict): claims={len(_final)} cited={len(_final) - _final_flagged} | draft: "
           f"claims={len(claims)} cited={cited_count} "
           f"flagged={len(flagged)} | derived={derived_n} labeled={labeled_n} "

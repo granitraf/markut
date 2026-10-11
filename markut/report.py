@@ -565,6 +565,13 @@ def build_report(run: dict) -> bytes:
         story.append(Paragraph("filings &amp; news", st["boxlabel"]))
         for line in rest_evidence.split("\n"):
             story.append(Paragraph(escape(line) or " ", st["mono"]))
+    # P1 (run #27): the filing passages the claim review read — part of the
+    # evidence the governor traced against, so part of the appendix
+    addenda = [d.get("addendum") for d in by.get("news_verify") or [] if d.get("addendum")]
+    if addenda:
+        story.append(Paragraph("filings addendum (passages the claim review found for flagged claims)", st["boxlabel"]))
+        for line in "\n".join(addenda).split("\n"):
+            story.append(Paragraph(escape(line) or " ", st["mono"]))
     story += [Paragraph("Appendix B — method", st["h1"]),
               Paragraph("Markut is a LangGraph state machine: Research → Bull ⇄ Bear → Judge (per round) → claim review → review governor. "
                         "The research agent discovers three evidence tools over MCP and assembles one packet per debate. Bull and bear "

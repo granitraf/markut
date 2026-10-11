@@ -123,7 +123,10 @@ _HISTORY_Q_RE = re.compile(r"(?i)\b(?:historically|history|over the (?:past|last
 _BOILERPLATE_EXCERPT_RE = re.compile(
     r"(?i)fiscal years? (?:\d{4}(?:,? and \d{4})? )?(?:spanned|was|were|is|are) (?:the )?(?:52|53)\b|52- or 53-week|53-week (?:fiscal )?(?:year|period)|"
     r"forward-looking statements?|safe harbor|basis of presentation|recently (?:issued|adopted) accounting|incorporated (?:herein )?by reference|"
-    r"should be read in conjunction with|table of contents")
+    r"should be read in conjunction with|table of contents|"
+    # P1 (run #27): a release's "about the company" paragraph names every
+    # product line and answers no question about any of them
+    r"\b(?:leads|leading) the (?:world|industry) in\b|\bis (?:a|the) (?:world['’]s )?leading (?:operator|provider|maker|manufacturer|developer|supplier|company)\b")
 _TOPIC_STOP = {"which", "where", "while", "their", "these", "those", "about", "could", "would", "should", "versus", "given", "company",
                "business", "quarter", "fiscal", "whether", "against", "durable", "sustainable", "growth", "growing", "trend", "trends",
                "imply", "implies", "really", "still", "keep", "keeps", "comes", "from", "there", "being", "rather", "drive", "driven",
@@ -150,6 +153,47 @@ def question_entities(q: dict, segments: list) -> list:
 def topic_words(q: dict) -> set:
     blob = " ".join([q.get("question", "")] + [str(x) for x in (q.get("kpis") or [])])
     return {_stem(w) for w in re.findall(r"[a-z][a-z-]{4,}", blob.lower()) if w not in _TOPIC_STOP and _stem(w) not in _TOPIC_STOP}
+
+
+def focus_excerpt(q: dict, text: str, segments: list) -> str:
+    """PURE. P1 (run #27): the excerpt starts on its question's topic.
+
+    A retrieved window spans neighbouring paragraphs, and the relevance check
+    passed it when the question's segment appeared ANYWHERE — so Q1 (iPhone)
+    opened on a renminbi / Greater China paragraph and Q5 (Mac, iPad) showed a
+    Japan paragraph that merely listed iPad among its drivers. A sentence
+    counts when it names one of the question's segments and does not open
+    with a DIFFERENT segment's name (that paragraph is about the other one);
+    with no named segments, when it carries one of the question's topic
+    words. The excerpt runs from the first such sentence until a sentence
+    opens another segment's paragraph. None -> '' (the chunk is rejected)."""
+    sents = split_sentences(re.sub(r"\s+", " ", text or "").strip()) or ([text] if text else [])
+    ents = question_entities(q, segments)
+    others = [o for o in segments if o not in ents]
+    words = topic_words(q)
+
+    def opens_other(sent):
+        head = sent.lower().lstrip(" \"'(“")
+        # a running page header ("Apple Inc. | Q3 2026 Form 10-Q | 14 Japan …")
+        # sits in front of the paragraph's own heading: look past it
+        head = re.sub(r"^[^|]{0,60}\|[^|]{0,60}\|\s*\d{1,3}\s+", "", head)[:80]
+        return any(head.startswith(a.lower()) for o in others for a in _aliases(o) if len(a) > 2)
+
+    def counts(sent):
+        low = sent.lower()
+        if ents:
+            return any(_mentions(low, e) for e in ents) and not opens_other(sent)
+        return bool(words & {_stem(w) for w in re.findall(r"[a-z][a-z-]{4,}", low)})
+
+    first = next((i for i, s in enumerate(sents) if counts(s)), None)
+    if first is None:
+        return ""
+    keep = [sents[first]]
+    for s in sents[first + 1:]:
+        if ents and opens_other(s):
+            break
+        keep.append(s)
+    return " ".join(keep)
 
 
 def excerpt_relevant(q: dict, text: str, segments: list) -> bool:
@@ -244,7 +288,9 @@ def question_blocks(coll, plan: dict, profile: dict, profiled_text: str, relaxed
         for r in results:
             if kept >= config.EXCERPTS_PER_QUESTION:
                 break
-            text = excerpt(r["text"])
+            # P1 (run #27): the shown text starts on the question's topic
+            focused = focus_excerpt(q, r["text"], names)
+            text = excerpt(focused) if focused else ""
             if not text or not excerpt_relevant(q, text, names):
                 continue
             seen_ids.add(r.get("id"))
