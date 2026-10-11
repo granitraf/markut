@@ -12,7 +12,7 @@ from markut.evidence.gaps import count_gaps
 from markut.guardrails.parsing import parse_review_json
 from markut.guardrails.tracer import (DISCLAIMER_TEXT, _as_float, check_scenarios,
     extract_numeric_claims, find_absence_claims, find_advice_language, find_mislabeled, has_disclaimer,
-    normalize_number, recompute_derived, trace_claim)
+    figure_sources, normalize_number, recompute_derived, strip_inline_anchors, trace_claim)
 
 
 def _close(a, b, pct: bool) -> bool:
@@ -119,6 +119,7 @@ def review_node(state: DebateState) -> dict:
               f"derived=0 labeled=0 annotated=0 | mislabeled=0 scenario=0 miscomputed=0 | "
               f"sources_unavailable={sources_unavailable} | status=clean"
               + (" | BUDGET EXCEEDED" if budget_exceeded else ""))
+        report["sources"] = figure_sources(verdict, evidence, [], [])
         return {"verdict": verdict, "review_report": report,
                 "budget_exceeded": budget_exceeded}
 
@@ -209,7 +210,11 @@ def review_node(state: DebateState) -> dict:
         annotated_count += extra
         report["final_status"] = "annotated"
     else:
-        revised = revision["verdict"]
+        # 2026-10-11: sources live beneath the verdict, never inside it. The
+        # prompt says so; this makes it true even when the model writes an
+        # "(anchors: …)" block anyway — the block moves to the source list.
+        revised, moved_anchors = strip_inline_anchors(revision["verdict"])
+        report["inline_anchors_moved"] = moved_anchors
         report["resolutions"] = revision["resolutions"]
 
         def _resolution_excuses(res):
@@ -355,6 +360,8 @@ def review_node(state: DebateState) -> dict:
             annotated_count += n
         report["final_status"] = "annotated" if annotated_count else "revised"
 
+    report["sources"] = figure_sources(_TAG_RE.sub("", revised), evidence, report["resolutions"],
+                                       report.get("inline_anchors_moved", []))
     if not has_disclaimer(revised):
         # Deterministic append — a mandatory disclaimer is not something to
         # request from a model and hope.

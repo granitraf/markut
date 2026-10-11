@@ -19,7 +19,7 @@ import re as _re
 
 from markut.guardrails.tracer import extract_evidence_numbers, extract_numeric_claims, norm_or_none
 
-MARKET_SUMMARY_SECTIONS = ("[QUOTE & VALUATION]", "[FUNDAMENTALS]", "[VALUATION]", "[ANALYST VIEW]", "[EVENTS]")
+MARKET_SUMMARY_SECTIONS = ("[QUOTE & VALUATION]", "[FUNDAMENTALS]", "[VALUATION]", "[EVENTS]")
 
 
 def _parse_json(raw: str) -> dict:

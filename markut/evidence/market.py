@@ -523,19 +523,12 @@ def market_snapshot(ticker: str) -> str:
     except Exception as e:
         out.append(f"[FMP ratios section unavailable: {e}]")
 
-    # ---- 3. ANALYST VIEW ----
-    try:
-        out.append("\n[ANALYST VIEW]")
-        apt = t.analyst_price_targets or {}
-        add_line("Price target (mean)", fmt_price(apt.get("mean")), "yfinance/analyst_price_targets")
-        th, tl = apt.get("high"), apt.get("low")
-        if th is not None and tl is not None:
-            add_line("Price target (high / low)", f"{fmt_price(th)} / {fmt_price(tl)}",
-                     "yfinance/analyst_price_targets")
-        add_line("Recommendation", info.get("recommendationKey"), "yfinance/info")
-        add_line("Analyst count", info.get("numberOfAnalystOpinions"), "yfinance/info")
-    except Exception as e:
-        out.append(f"[analyst section unavailable: {e}]")
+    # ---- 3. (no ANALYST VIEW) ----
+    # 2026-10-11: analyst ratings and price targets are opinions ABOUT the
+    # stock — the thing the debate's lean is compared against afterwards
+    # (evidence/consensus.py). In the packet they let the lean echo the
+    # consensus, so they are left out; analyst EPS forecasts stay (the
+    # valuation math runs on them).
 
     # ---- 4. EVENTS + MARKET CONTEXT ----
     past_dates = []

@@ -38,7 +38,19 @@ _METRIC_BARE_RE = re.compile(
     r"(?i)\b(?:P/?E|PE ratio|EV/EBITDA|EV/EBIT|EV/Sales|EV/Revenue|P/S|P/B|P/FCF|PEG(?: ratio)?|"
     r"price[- ]to[- ](?:earnings|book|sales|free cash flow)|multiple|ratio)"
     r"(?:\s*\([^)]{0,40}\))?\s*(?:of|at|is|was|near|around|=|:|stands at)?\s*(?:about\s+|roughly\s+|approximately\s+|~)?"
-    r"(\d{1,3}(?:\.\d+)?)(?![\d.%x]|\s?x\b)")
+    # a figure may END its sentence ("…P/E is 38.61."): a following period is
+    # fine unless a digit comes after it (2026-10-11 — the old lookahead
+    # rejected every sentence-final multiple)
+    r"(\d{1,3}(?:\.\d+)?)(?![\d%x]|\.\d|\s?x\b)")
+
+
+# 2026-10-11: a plain-language verdict writes a multiple in words — "38.61
+# times trailing earnings", "14 times forward EBITDA". No "x" and no metric
+# name before it, so neither pattern above saw the figure.
+_TIMES_RE = re.compile(
+    r"(?i)(?<![\d.])(\d{1,3}(?:\.\d+)?)\s+times\s+(?:its\s+|the\s+)?(?:trailing\s+|forward\s+|next[- ]year'?s?\s+|this[- ]year'?s?\s+)?"
+    r"(?:twelve[- ]month\s+|TTM\s+)?(?:GAAP\s+|non-GAAP\s+|adjusted\s+)?"
+    r"(?:earnings|sales|revenue|book(?:\s+value)?|EBITDA|EBIT|free cash flow|cash flow|EPS)\b")
 
 
 def extract_numeric_claims(text: str) -> list:
@@ -49,6 +61,8 @@ def extract_numeric_claims(text: str) -> list:
     for match in _CLAIM_RE.finditer(text or ""):
         found.append((match.start(), re.sub(r"\s+", " ", match.group(0)).strip()))
     for match in _METRIC_BARE_RE.finditer(text or ""):
+        found.append((match.start(1), match.group(1)))
+    for match in _TIMES_RE.finditer(text or ""):
         found.append((match.start(1), match.group(1)))
     seen, claims = set(), []
     for _, claim in sorted(found):
@@ -108,7 +122,11 @@ _EVIDENCE_NUM_RE = re.compile(
     re.IGNORECASE)
 
 
-_PCT_LABEL_RE = re.compile(r"^\s*-\s+[^:]*(?:%|percent|margin|rate|ratio|yield|growth)[^:]*:", re.IGNORECASE)
+# a LABEL line ("- Debt/Equity (mrq, %): 401.00"); a quoted excerpt line is
+# not one — its first colon sits inside "[source: …]", which made the whole
+# sentence a "label" and every number in it a percent ("2 percentage
+# points" -> 2%, 2026-10-11)
+_PCT_LABEL_RE = re.compile(r"^\s*-\s+(?!\[Q\d)[^:\"“]*(?:%|percent|margin|rate|ratio|yield|growth)[^:\"“]*:", re.IGNORECASE)
 _UNIT_HINT_RE = re.compile(r"(?i)\(?(?:units?:\s*|in\s+)(thousands|millions|billions)\b")
 
 
@@ -127,6 +145,10 @@ def extract_evidence_numbers(evidence: str) -> set:
             raw = m.group(0)
             key = normalize_number(raw)
             out.add(key)
+            # "50.1 percent" is 50.1% (2026-10-11: releases spell it out);
+            # "2 percentage points" is not a percent and stays bare
+            if not key.endswith("%") and re.match(r"\s*percent\b(?!age)", line[m.end():], re.IGNORECASE):
+                out.add(key + "%")
             if pct_label and not key.endswith("%") and "[ambiguous" not in key and not re.search(r"[tbmk]\b|trillion|billion|million|thousand", raw.lower()):
                 out.add(key + "%")
             if scale and re.fullmatch(r"\$?\s?\d{1,3}(?:,\d{3})+(?:\.\d+)?", raw.strip()):
@@ -471,6 +493,10 @@ def recompute_derived(claim: str, anchors: list) -> dict:
                 cands.append((abs((a / b - 1) * 100), f"({na} / {nb} - 1)", True))
                 cands.append((abs(a / b), f"{na} / {nb}", False))
             cands.append((abs(a - b), f"{na} - {nb}", False))
+            if str(na).strip().endswith("%") and not str(nb).strip().endswith("%"):
+                # a percentage minus percentage points is a percentage (2026-10-11,
+                # run #27: 50.1% gross margin less ~2 points of refunds = 48.1%)
+                cands.append((a - b, f"{na} - {nb} points", True))
             cands.append((a * b, f"{na} × {nb}", False))
             for value, formula, pct_formula in cands:
                 if is_pct != pct_formula:
@@ -547,3 +573,136 @@ def trim_to_sentence(text: str) -> str:
     if "\n" in t:
         return t.rsplit("\n", 1)[0].rstrip()
     return t
+
+
+# ---------------- readable verdict (2026-10-11): sources beneath, not inline ----------------
+# WHY: the governor used to restate every derived figure's anchors inside the
+# sentence ("…48.1% (anchors: 50.1% company gross margin, …)"), and run #27's
+# verdict grew from 6 figures to 20 — accurate, but it read as fact after
+# fact. Traceability now lives in a source list built here, in code, from the
+# same trace the governor already runs; the prose keeps only its own figures.
+_ANCHOR_OPEN_RE = re.compile(r"\s*\((?:anchors?|derived from|DERIVED from|DERIVED)\s*:?", re.IGNORECASE)
+
+
+def strip_inline_anchors(text: str) -> tuple:
+    """PURE. -> (text without '(anchors: …)' blocks, [the blocks' contents]).
+    Bracket-balanced, so a block holding its own parentheses ('= $279.75
+    (-16.9%)') leaves whole; the sentence around it is left intact."""
+    out, moved, i, s = [], [], 0, text or ""
+    while True:
+        m = _ANCHOR_OPEN_RE.search(s, i)
+        if not m:
+            out.append(s[i:])
+            break
+        depth, j = 1, m.end()
+        while j < len(s) and depth:
+            depth += {"(": 1, ")": -1}.get(s[j], 0)
+            j += 1
+        if depth:                       # unbalanced: leave the text as written
+            out.append(s[i:])
+            break
+        out.append(s[i:m.start()])
+        moved.append(s[m.end():j - 1].strip())
+        i = j
+    return "".join(out), moved
+
+
+# packet sections whose text is written by a model or describes the packet
+# itself: a figure there is not a source for anything
+_NOT_SOURCES = ("PROFILE", "KEY QUESTIONS", "WHAT WOULD MISLEAD", "COVERAGE GAPS", "DATA GAPS")
+
+
+def _source_lines(evidence: str) -> list:
+    """[(line, numbers, rank)] for every packet line that can be a source;
+    rank 0 = a sourced fact line, 1 = other evidence, 2 = news (untrusted)."""
+    out, section = [], ""
+    for raw in (evidence or "").splitlines():
+        line = raw.strip()
+        m = re.match(r"^\[([A-Z][A-Z0-9 &/]+?)(?:\s+Q\d)?\]", line)
+        if m:
+            section = m.group(1)
+            continue
+        if not line or section in _NOT_SOURCES:
+            continue
+        # question tags ("[Q2]") and source tags ("[source: T4]") are labels,
+        # not figures: a bare anchor like "2" must not match them
+        nums = extract_evidence_numbers(re.sub(r"\[(?:Q\d+|source:[^\]]*)\]", " ", line))
+        if nums:
+            rank = 2 if section == "NEWS" else (0 if "[source:" in line else 1)
+            out.append((line, nums, rank))
+    return out
+
+
+def _short(line: str, limit: int = 220) -> str:
+    line = re.sub(r"^-\s+", "", line)
+    tag = re.search(r"\s*(\[source:[^\]]*\])\s*$", line)
+    body = line[:tag.start()] if tag else line
+    if len(body) > limit:
+        body = body[:limit].rsplit(" ", 1)[0] + " …"
+    return body + (f"  {tag.group(1)}" if tag else "")
+
+
+def figure_sources(verdict: str, evidence: str, resolutions=None, moved_anchors=None) -> list:
+    """PURE. One entry per figure in the verdict: {"figure", "kind", "line"}.
+    kind: cited (the packet line it traces to, preferring a sourced fact
+    line), derived (computed from anchors the governor verified), judgment
+    (labeled as qualitative), untraced (no anchor — listed, never hidden)."""
+    lines = _source_lines(evidence)
+    def find(fig, must=None):
+        try:
+            key = normalize_number(fig)
+        except Exception:
+            return None
+        m = _RANGE_RE.match(fig.strip())
+        keys = [normalize_number(m.group(1) + (m.group(3) or "")), normalize_number(m.group(2) + (m.group(3) or ""))] if m else [key]
+        hits = [(rank, i, line) for i, (line, nums, rank) in enumerate(lines)
+                if all(k in nums for k in keys) and (must is None or must.search(line))]
+        return _short(min(hits)[2]) if hits else None
+    # a unitless anchor in a percent derivation is a count of percentage
+    # points: look for it only where the packet speaks of points — a bare "2"
+    # otherwise lands on any line holding a 2 ("$2.02", a table number)
+    points = re.compile(r"(?i)\bpoints?\b|\bpts\b|basis points")
+    def find_anchor(anchor, claim):
+        a = str(anchor).strip()
+        unitless = not re.search(r"[%$x]|[A-Za-z]", re.sub(r"(?i)percentage points?|points?|pts", "", a))
+        if str(claim).strip().endswith("%") and unitless:
+            return find(a, points)
+        return find(a)
+    by_claim = {}
+    for r in resolutions or []:
+        for c in extract_numeric_claims(str(r.get("claim", ""))) or [str(r.get("claim", "")).strip()]:
+            by_claim[c] = r
+    out, seen = [], set()
+    for fig in extract_numeric_claims(verdict or ""):
+        if fig in seen:
+            continue
+        seen.add(fig)
+        line = find(fig) if trace_claim(fig, evidence or "") == "CITED" else None
+        res = by_claim.get(fig)
+        if line:
+            out.append({"figure": fig, "kind": "cited", "line": line})
+        elif res and res.get("resolution") == "DERIVED" and res.get("qualified", True):
+            anchors = [str(a) for a in res.get("anchors") or []]
+            # the one line that holds EVERY anchor is the derivation's source
+            # (run #27: "gross margin was 50.1 percent, including … approximately
+            # 2 percentage points"); only then fall back to one line per anchor
+            keys = []
+            for a in anchors:
+                try:
+                    keys.append(normalize_number(a))
+                except Exception:
+                    keys = []
+                    break
+            joint = [(rank, i, line) for i, (line, nums, rank) in enumerate(lines) if keys and all(k in nums for k in keys)]
+            if joint:
+                text = f"computed from {' and '.join(anchors)} ({_short(min(joint)[2])})"
+            else:
+                text = "computed from " + "; ".join(f"{a} ({find_anchor(a, fig) or 'in the packet'})" for a in anchors)
+            out.append({"figure": fig, "kind": "derived", "line": text})
+        elif res and res.get("resolution") == "LABELED":
+            out.append({"figure": fig, "kind": "judgment", "line": "the judge's estimate, labeled as qualitative judgment"})
+        else:
+            hint = next((a for a in moved_anchors or [] if fig in a), "")
+            out.append({"figure": fig, "kind": "untraced",
+                        "line": "no line in the evidence packet holds this figure" + (f"; the governor's note: {hint}" if hint else "")})
+    return out

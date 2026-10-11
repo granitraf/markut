@@ -4,6 +4,7 @@ for every claim and the judge needed corrective retries — free-text "respond
 with ONLY JSON" is a request, output_config.format is a guarantee. The
 parsers in guardrails.parsing still validate SUBSTANCE (non-empty verdict,
 allowed resolution values, DERIVED needs anchors); the schema settles SHAPE."""
+from markut.evidence.consensus import LEANS
 
 JUDGE_SCHEMA = {
     "type": "object",
@@ -31,9 +32,15 @@ JUDGE_SCHEMA = {
         "verdict": {"type": "string"},
         "converged": {"type": "boolean"},
         "planner_coverage": {"type": "string"},
+        # 2026-10-11: the verdict opens with a stance on the evidence (no
+        # fence-sitting); the page places it on a five-point scale next to the
+        # analyst consensus, which the judge never sees
+        "lean": {"type": "string", "enum": LEANS},
+        "lean_confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "lean_reason": {"type": "string"},
     },
     "required": ["questions", "bull_strongest", "bear_strongest", "unsupported_claims", "reasoning", "verdict",
-                 "converged", "planner_coverage"],
+                 "converged", "planner_coverage", "lean", "lean_confidence", "lean_reason"],
     "additionalProperties": False,
 }
 

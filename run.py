@@ -44,6 +44,13 @@ def main():
     print("\n" + "=" * 60)
     print(f"DEBATE RAN {done.get('rounds', '?')} ROUND(S)  |  Converged: {done.get('converged', '?')}")
     print("=" * 60)
+    lean = review.get("lean") or {}
+    if lean:
+        # 2026-10-11: the stance first, then where it sits against analysts
+        print(f"LEAN: {str(lean.get('lean', '')).replace('_', ' ')} ({lean.get('confidence') or '—'} confidence) — {lean.get('reason', '')}")
+        if review.get("comparison"):
+            print(review["comparison"])
+        print("-" * 60)
     print("FINAL VERDICT:\n", review.get("verdict", "(no governed verdict — see error above)"))
     print("=" * 60)
     cached = (usage.get("cache_read") or 0) + (usage.get("cache_write") or 0)

@@ -54,7 +54,9 @@ def test_review_skeleton_and_prompt_verbatim(nodes_cell):
     skeleton = eval(_grab(seg, "json_skeleton"))
     assert skeleton == prompts.REVIEW_JSON_SKELETON
     rendered = eval(_grab(seg, "system_prompt"), {"json_skeleton": skeleton})
-    assert rendered == prompts.REVIEW_SYSTEM_PROMPT
+    # the notebook's prompt is kept verbatim; the live governor prompt is built
+    # from it (prompts.REVIEW_SYSTEM_PROMPT, 2026-10-11)
+    assert rendered == prompts.REVIEW_SYSTEM_PROMPT_NOTEBOOK
 
 
 def test_baseline_prompt_verbatim():

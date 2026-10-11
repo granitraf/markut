@@ -163,7 +163,9 @@ def test_judge_and_claim_review_request_schemas(stub_llm):
     state = {"ticker": "AVGO", "evidence": EVIDENCE, "bull_case": "b", "bear_case": "r",
              "bull_history": ["b"], "bear_history": ["r"], "round": 0, "verdict": ""}
     nodes.judge_node(state)
-    assert calls[0]["schema"]["required"] == ["questions", "bull_strongest", "bear_strongest", "unsupported_claims", "reasoning", "verdict", "converged", "planner_coverage"]
+    # 2026-10-11: the judge also returns its lean on the evidence
+    assert calls[0]["schema"]["required"] == ["questions", "bull_strongest", "bear_strongest", "unsupported_claims", "reasoning", "verdict",
+                                              "converged", "planner_coverage", "lean", "lean_confidence", "lean_reason"]
 
 
 def test_claim_review_repairs_once_and_logs_raw(stub_llm, monkeypatch, capsys):
@@ -411,7 +413,8 @@ def test_judge_prompt_has_checklist_and_verdict_format():
     assert j.startswith(prompts.JUDGE_SYSTEM_PROMPT_NOTEBOOK)
     for needle in ("Period and basis", "Overlapping percentages", "Company relationships", "The scenario grid",
                    "News-only claims", "PER-QUESTION RULINGS", '"planner_coverage"',
-                   "Debates that move the stock:", "What would change this view:", "Next catalyst:"):
+                   # 2026-10-11: the readable verdict's labels (was "Debates that move the stock:" …)
+                   "**What moves the stock**", "**What would change this view**", "**Next catalyst**"):
         assert needle in j, needle
     assert "48%" not in j and "top-five" not in j                       # no company figures in the checklist
     assert prompts.BULL_SYSTEM_PROMPT.endswith(prompts.ANALYST_ADDENDUM) and "[missed question]" in prompts.BEAR_SYSTEM_PROMPT

@@ -94,7 +94,58 @@ window.Markut = (function () {
     let html = esc(text || "");
     html = html.replace(/(\S+)\s\[UNGROUNDED — no evidence anchor\]/g, '<span class="ungrounded">$1 <small>UNGROUNDED · no evidence anchor</small></span>');
     html = highlightNums(html);
-    return html.split(/\n{2,}/).map((p) => "<p>" + p.replace(/\n/g, "<br>") + "</p>").join("");
+    // 2026-10-11: the verdict's bold labels ("**What moves the stock**") become
+    // sub-headings and its "- " lines a list; older verdicts are plain paragraphs
+    return html.split(/\n{2,}/).map((block) => {
+      let out = "", para = [], list = [];
+      const flushP = () => { if (para.length) { out += "<p>" + para.join("<br>") + "</p>"; para = []; } };
+      const flushL = () => { if (list.length) { out += "<ul>" + list.map((li) => `<li>${li}</li>`).join("") + "</ul>"; list = []; } };
+      for (const line of block.split("\n").filter((l) => l.trim())) {
+        let m;
+        if ((m = line.match(/^\s*\*\*([^*]+)\*\*\s*:?\s*$/))) { flushP(); flushL(); out += `<h4 class="vh">${m[1]}</h4>`; }
+        else if ((m = line.match(/^\s*[-•]\s+(.*)$/))) { flushP(); list.push(m[1]); }
+        else { flushL(); para.push(line.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")); }
+      }
+      flushP(); flushL(); return out;
+    }).join("");
+  }
+  /* leanHtml: the debate's lean on a five-point line (bearish / strong sell
+     left, bullish / strong buy right) with the analyst consensus — which the
+     agents never saw — on the same positions, its rating spread beneath, and
+     one plain sentence comparing the two. */
+  const LEANS = ["strongly_bearish", "bearish", "neutral", "bullish", "strongly_bullish"];
+  const STOPS = ["strong sell", "sell", "hold", "buy", "strong buy"];
+  function leanHtml(lean, cons, comparison) {
+    if (!lean || LEANS.indexOf(lean.lean) < 0) return "";
+    const at = (pos) => `${10 + pos * 80}%`;                 // label columns centre on 10/30/50/70/90%
+    const p = LEANS.indexOf(lean.lean) / 4;
+    const side = p < 0.5 ? "bear" : p > 0.5 ? "bull" : "flat";
+    const mean = cons && typeof cons.mean === "number" ? cons.mean : null;
+    const a = mean === null ? null : Math.min(1, Math.max(0, (5 - mean) / 4));
+    const counts = (cons && cons.counts) || null;
+    const total = counts ? Object.values(counts).reduce((x, y) => x + y, 0) : 0;
+    const keys = ["strong_sell", "sell", "hold", "buy", "strong_buy"];
+    return `<div class="lean">
+      <div class="lean-head"><span class="lean-k">lean</span> <b class="lean-v ${side}">${esc(lean.lean.replace(/_/g, " "))}</b>${lean.confidence ? ` <span class="lean-c">${esc(lean.confidence)} confidence</span>` : ""}</div>
+      ${lean.reason ? `<p class="lean-r">${esc(lean.reason)}</p>` : ""}
+      <div class="scale">
+        <div class="scale-lab">${LEANS.map((l) => `<span>${esc(l.replace(/_/g, " "))}</span>`).join("")}</div>
+        <div class="scale-track">${[0, 1, 2, 3, 4].map((i) => `<i class="tick" style="left:${at(i / 4)}"></i>`).join("")}
+          <span class="mk ours ${side}" style="left:${at(p)}" title="the debate's lean"></span>
+          ${a === null ? "" : `<span class="mk theirs" style="left:${at(a)}" title="analyst mean ${mean}"></span>`}</div>
+        <div class="scale-lab low">${STOPS.map((s) => `<span>${s}</span>`).join("")}</div>
+        ${total ? `<div class="spread">${keys.map((k, i) => counts[k] ? `<span class="s${i}" style="width:${(100 * counts[k] / total).toFixed(2)}%" title="${STOPS[i]} ${counts[k]}"></span>` : "").join("")}</div>
+          <div class="spread-legend">ratings this month: ${keys.map((k, i) => `${STOPS[i]} ${counts[k] || 0}`).join(" · ")}</div>` : ""}
+        <div class="scale-key"><span class="mk-key ours ${side}"></span> debate lean${a === null ? "" : ` <span class="mk-key theirs"></span> analyst mean ${mean}`}</div>
+      </div>
+      ${comparison ? `<p class="cmp">${esc(comparison)}</p>` : ""}
+      ${cons && cons.target_mean && cons.price ? `<p class="tgt">Analyst mean price target $${Number(cons.target_mean).toFixed(2)} vs price $${Number(cons.price).toFixed(2)}. Ratings and price targets were kept out of the debate, so the lean was formed without them.</p>` : ""}
+    </div>`;
+  }
+  function sourcesHtml(sources) {
+    if (!sources || !sources.length) return "";
+    return `<details class="pt srcs"><summary>sources · ${sources.length} figure${sources.length === 1 ? "" : "s"} in the verdict</summary><ul class="srclist">` +
+      sources.map((s) => `<li><span class="n">${esc(s.figure)}</span>${s.kind && s.kind !== "cited" ? ` <span class="sk ${esc(s.kind)}">${esc(s.kind)}</span>` : ""} ${esc(s.line || "")}</li>`).join("") + `</ul></details>`;
   }
   function taggedNumbers(text) { return [...String(text || "").matchAll(/(\S+)\s\[UNGROUNDED — no evidence anchor\]/g)].map((m) => m[1]); }
 
@@ -292,7 +343,9 @@ window.Markut = (function () {
         clearPending();
         const s = d.stats || {}; const tagged = taggedNumbers(d.verdict);
         return card("review", `<h3><span class="who">governed verdict</span> <span class="pill">${esc(s.status || "")}</span>${d.budget_exceeded ? ' <span class="pill live">budget exceeded</span>' : ""}</h3>
+          ${leanHtml(d.lean, d.consensus, d.comparison)}
           <div class="verdict">${verdictHtml(d.verdict)}</div>
+          ${sourcesHtml((d.report || {}).sources)}
           ${kvs([["claims", num(s.claims)], ["cited", num(s.cited)], ["flagged", num(s.flagged)], ["derived", num(s.derived)], ["labeled", num(s.labeled)], ["annotated", num(s.annotated)]])}
           ${tagged.length ? `<div class="tagged"><span class="k">left tagged — no evidence anchor:</span> ${tagged.map((t) => `<span class="ungrounded">${esc(t)}</span>`).join(" ")}</div>` : `<div class="tagged"><span class="k">every number in the verdict traced to the evidence packet${s.sources_unavailable ? `; ${s.sources_unavailable} source${s.sources_unavailable === 1 ? "" : "s"} unavailable (see data gaps)` : ""}.</span></div>`}
           ${note(d)}`);

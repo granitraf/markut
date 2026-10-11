@@ -277,11 +277,18 @@ def judge_node(state: DebateState) -> dict:
                          + " [Judge reply was cut off at the output cap twice; fields recovered from the partial reply.]",
             "verdict": salvaged.get("verdict") or "[Judge reply truncated twice — no verdict text was recovered for this round.]",
             "converged": bool(salvaged.get("converged", False)),
+            # a salvaged lean counts only if it is a real scale position
+            "lean": salvaged.get("lean") if salvaged.get("lean") in LEANS else None,
+            "lean_confidence": salvaged.get("lean_confidence"),
+            "lean_reason": salvaged.get("lean_reason", ""),
             "truncated": True,
         }
 
     decision.setdefault("questions", [])
     decision.setdefault("planner_coverage", "")
+    if decision.get("lean") not in LEANS:
+        decision["lean"] = None           # never a default stance
+    print(f"JUDGE LEAN: {decision.get('lean') or 'not recorded'} ({decision.get('lean_confidence') or '—'}) — {decision.get('lean_reason', '')}")
     return {
         "verdict": decision["verdict"],
         "converged": bool(decision["converged"]),
@@ -290,6 +297,7 @@ def judge_node(state: DebateState) -> dict:
     }
 
 
+from markut.evidence.consensus import LEANS
 import re as _re
 
 # P0 (run #26): the label a reader sees comes from an EXPLICIT flag ruling,

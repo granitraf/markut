@@ -221,6 +221,86 @@ def parse_packet(evidence: str) -> tuple:
     return [s for s in grid if (s["rows"] or s.get("notes")) and s["name"] != "DATA GAPS"], rest
 
 
+# ---------------------------------------------------------------- lean scale (2026-10-11)
+def lean_scale_drawing(lean: dict, consensus: dict, width: float):
+    """The debate's lean and the analyst consensus on one five-point line:
+    bearish / strong sell on the left, bullish / strong buy on the right.
+    Our marker sits on the line; the analysts' marker below it, with their
+    rating spread as a bar. Either half may be missing."""
+    from reportlab.graphics.shapes import Circle, Drawing, Line, Polygon, Rect, String
+    from markut.evidence.consensus import ANALYST_STOPS, LEAN_LABELS, LEANS, analyst_position, lean_position
+    pad, h = 34.0, 96.0
+    d = Drawing(width, h)
+    x = lambda pos: pad + pos * (width - 2 * pad)
+    y_track = 62
+    d.add(Line(pad, y_track, width - pad, y_track, strokeColor=LINE, strokeWidth=1.2))
+    for i, key in enumerate(LEANS):
+        xi = x(i / 4)
+        d.add(Line(xi, y_track - 3, xi, y_track + 3, strokeColor=LINE, strokeWidth=1))
+        d.add(String(xi, y_track + 9, LEAN_LABELS[key], fontName="Mono", fontSize=6.6, fillColor=MUTED, textAnchor="middle"))
+        d.add(String(xi, y_track - 16, ANALYST_STOPS[i], fontName="Mono", fontSize=6.6, fillColor=MUTED, textAnchor="middle"))
+    p = lean_position((lean or {}).get("lean"))
+    if p is not None:
+        color = BEAR if p < 0.5 else (BULL if p > 0.5 else INK)
+        d.add(Circle(x(p), y_track, 5.5, fillColor=color, strokeColor=colors.white, strokeWidth=1))
+        d.add(String(x(p), y_track + 19, "debate", fontName="Mono-Bold", fontSize=7, fillColor=color, textAnchor="middle"))
+    a = analyst_position((consensus or {}).get("mean"))
+    if a is not None:
+        xa = x(a)
+        d.add(Polygon([xa, y_track - 3, xa - 5, y_track - 11, xa + 5, y_track - 11], fillColor=JUDGE, strokeColor=JUDGE))
+        d.add(String(xa, y_track - 27, f"analysts {consensus['mean']:g}", fontName="Mono-Bold", fontSize=7, fillColor=JUDGE, textAnchor="middle"))
+        counts = consensus.get("counts") or {}
+        total = sum(counts.values()) if counts else 0
+        if total:
+            # spread bar, ordered like the line: strong sell -> strong buy
+            shades = ["#c0392b", "#e08a7e", "#b9b6ad", "#7fc29b", "#1f8a4c"]
+            cx, bar_w = pad, width - 2 * pad
+            for key, shade in zip(["strong_sell", "sell", "hold", "buy", "strong_buy"], shades):
+                w = bar_w * counts.get(key, 0) / total
+                if w > 0:
+                    d.add(Rect(cx, 14, w, 7, fillColor=colors.HexColor(shade), strokeColor=colors.white, strokeWidth=0.5))
+                cx += w
+            legend = " · ".join(f"{name} {counts.get(key, 0)}" for name, key in
+                                zip(ANALYST_STOPS, ["strong_sell", "sell", "hold", "buy", "strong_buy"]))
+            # no total here: the provider's monthly spread and its mean rating count
+            # analysts differently (AAPL: 44 vs 39) — one count is shown, in the comparison
+            d.add(String(pad, 3, "ratings this month: " + legend, fontName="Mono", fontSize=6.4, fillColor=MUTED))
+    return d
+
+
+def _restore_marks(markup: str) -> str:
+    # footnote markers are written as markup before _inline escapes the text
+    return (markup.replace("&lt;super&gt;", "<super>").replace("&lt;/super&gt;", "</super>")
+            .replace("&lt;font name='Mono' size='7' color='#8e1b12'&gt;", "<font name='Mono' size='7' color='#8e1b12'>")
+            .replace("&lt;/font&gt;", "</font>"))
+
+
+def verdict_flow(verdict: str, st: dict) -> tuple:
+    """The governed verdict as flowables: paragraphs, its bold labels as
+    sub-headings, its bullets as bullets; UNGROUNDED tags as footnote
+    markers. -> (flowables, [tagged numbers])."""
+    paras, tags = footnote_verdict(verdict)
+    out = []
+    for block in paras:
+        lines = [l for l in block.split("\n") if l.strip()]
+        text_lines = []
+        def flush():
+            if text_lines:
+                out.append(Paragraph(_restore_marks(_inline(" ".join(text_lines), strip_bold=False)), st["verdict"]))
+                text_lines.clear()
+        for line in lines:
+            label = re.match(r"^\s*\*\*([^*]+)\*\*\s*:?\s*$", line)
+            bullet = re.match(r"^\s*[-*•]\s+(.*)$", line)
+            if label:
+                flush(); out.append(Paragraph(escape(label.group(1)), st["pt"]))
+            elif bullet:
+                flush(); out.append(Paragraph(_restore_marks(_inline(bullet.group(1), strip_bold=False)), st["bullet"], bulletText="•"))
+            else:
+                text_lines.append(line)
+        flush()
+    return out, tags
+
+
 def footnote_verdict(verdict: str) -> tuple:
     """Replace each '<number> [UNGROUNDED — …]' with a superscript marker; return
     (markup, [numbers]) so the footnotes can be listed beneath."""
@@ -331,11 +411,24 @@ def build_report(run: dict) -> bytes:
     story.append(Paragraph("Conclusion — governed verdict", st["h1"]))
     story.append(Paragraph("The judge's final verdict after the review governor traced every number to the evidence packet. "
                            "Numbers with no anchor are footnoted, not removed.", st["small"]))
-    paras, tags = footnote_verdict(verdict)
-    for p in paras:
-        story.append(Paragraph(_inline(p, strip_bold=False).replace("&lt;super&gt;", "<super>").replace("&lt;/super&gt;", "</super>")
-                               .replace("&lt;font name='Mono' size='7' color='#8e1b12'&gt;", "<font name='Mono' size='7' color='#8e1b12'>").replace("&lt;/font&gt;", "</font>"),
-                               st["verdict"]))
+    # 2026-10-11: the stance first — the debate's lean on the evidence, placed
+    # on a scale next to the analyst consensus the agents never saw
+    lean, consensus = review.get("lean") or None, review.get("consensus") or None
+    if lean:
+        story.append(Paragraph(f"<b>Lean: {escape(str(lean.get('lean', '')).replace('_', ' '))}</b>"
+                               + (f" · {escape(str(lean.get('confidence')))} confidence" if lean.get("confidence") else ""), st["h2"]))
+        if lean.get("reason"):
+            story.append(Paragraph(_inline(lean["reason"]), st["verdict"]))
+        story.append(lean_scale_drawing(lean, consensus, width))
+        if review.get("comparison"):
+            story.append(Paragraph(escape(review["comparison"]), st["small"]))
+        if consensus and consensus.get("target_mean") and consensus.get("price"):
+            story.append(Paragraph(f"Analyst mean price target ${consensus['target_mean']:,.2f} vs price ${consensus['price']:,.2f}. "
+                                   "Analyst ratings and price targets were kept out of the debate, so the lean above was formed without them.",
+                                   st["small"]))
+        story.append(Spacer(1, 6))
+    flow, tags = verdict_flow(verdict, st)
+    story += flow
     if tags:
         for i, t in enumerate(tags, 1):
             story.append(Paragraph(f"[{i}]  <font name='Mono'>{escape(t)}</font> — no anchor in the evidence packet; left tagged by the governor.", st["foot"]))
@@ -343,6 +436,13 @@ def build_report(run: dict) -> bytes:
         n = (stats or {}).get("sources_unavailable", 0)
         story.append(Paragraph("Every number in the verdict traced to the evidence packet"
                                + (f"; {n} source{'s' if n != 1 else ''} unavailable (see data gaps)." if n else "."), st["foot"]))
+    sources = ((review.get("report") or {}).get("sources")) or []
+    if sources:
+        story.append(Paragraph("Sources for the figures above", st["label"]))
+        for s_ in sources:
+            story.append(Paragraph(f"<font name='Mono'>{escape(str(s_.get('figure', '')))}</font> — "
+                                   + ("" if s_.get("kind") == "cited" else f"<i>{escape(str(s_.get('kind', '')))}</i>: ")
+                                   + escape(str(s_.get("line", ""))), st["foot"]))
     if stats:
         srow = [("claims", stats.get("claims")), ("cited", stats.get("cited")), ("flagged", stats.get("flagged")),
                 ("derived", stats.get("derived")), ("labeled", stats.get("labeled")), ("annotated", stats.get("annotated")), ("status", stats.get("status"))]

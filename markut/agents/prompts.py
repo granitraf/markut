@@ -72,7 +72,7 @@ REVIEW_JSON_SKELETON = (
     "}"
 )
 
-REVIEW_SYSTEM_PROMPT = (
+REVIEW_SYSTEM_PROMPT_NOTEBOOK = (
     "You are the debate's output reviewer, revising YOUR OWN final verdict "
     "so every number is traceable to the evidence and the framing is "
     "research, not advice.\n"
@@ -96,6 +96,34 @@ REVIEW_SYSTEM_PROMPT = (
     "object per flagged claim, even if there is only one:\n"
     + REVIEW_JSON_SKELETON
 )
+
+# 2026-10-11 (readable verdict): the live governor keeps the notebook's rules
+# but (1) a DERIVED number's anchors go in the resolution record only — code
+# lists every figure's source beneath the verdict, so the prose stops reading
+# as fact after fact (run #27 grew from 6 figures to 20) — and (2) it keeps
+# the verdict's shape and adds no figures. Built from the notebook text with
+# checked replacements, so the notebook prompt itself stays verbatim.
+_REVIEW_DERIVED_NOTEBOOK = (
+    "  DERIVED - the number follows arithmetically from evidence numbers; "
+    "restate it WITH its anchors inline in the verdict, e.g. '20-50% "
+    "upside (anchors: DCF fair value $244.85 vs price $195.55, mean "
+    "analyst target $301.62)';\n")
+_REVIEW_DERIVED_LIVE = (
+    "  DERIVED - the number follows arithmetically from evidence numbers; "
+    "list those numbers, copied verbatim, in the resolution's anchors and "
+    "do NOT write them into the verdict text — the page lists every "
+    "figure's source beneath the verdict;\n")
+_REVIEW_KEEP_NOTEBOOK = "advice disclaimer. Keep everything else materially unchanged.\n"
+_REVIEW_KEEP_LIVE = (
+    "advice disclaimer. Keep everything else materially unchanged: the "
+    "verdict's shape (its opening paragraph, its bold labels and bullet "
+    "points) and its length; never add a figure the verdict did not "
+    "already contain, except as the replacement for a flagged one, and "
+    "never write one figure twice in two forms.\n")
+assert _REVIEW_DERIVED_NOTEBOOK in REVIEW_SYSTEM_PROMPT_NOTEBOOK and _REVIEW_KEEP_NOTEBOOK in REVIEW_SYSTEM_PROMPT_NOTEBOOK
+REVIEW_SYSTEM_PROMPT = (REVIEW_SYSTEM_PROMPT_NOTEBOOK
+                        .replace(_REVIEW_DERIVED_NOTEBOOK, _REVIEW_DERIVED_LIVE)
+                        .replace(_REVIEW_KEEP_NOTEBOOK, _REVIEW_KEEP_LIVE))
 
 
 BASELINE_SYSTEM_PROMPT = (
@@ -138,6 +166,16 @@ JUDGE_CHECKLIST = (
     '"stronger_side": "bull" | "bear" | "neither", "confidence": "low" | "medium" | "high", "unsupported_claims": '
     "claims either side made on this question that the packet does not support (at most 2, one sentence each)},\n"
     '  "planner_coverage": "adequate", or ONE sentence naming what the five questions missed.\n'
+    '  "lean": "strongly_bearish" | "bearish" | "neutral" | "bullish" | "strongly_bullish" — where the debate\'s evidence '
+    "points for the stock at today's price, weighing the business evidence AND the valuation together;\n"
+    '  "lean_confidence": "low" | "medium" | "high";\n'
+    '  "lean_reason": one plain sentence under 30 words naming the point that decides the lean.\n'
+    "\nLEAN RULES: pick a side. 'neutral' is allowed only when the two sides' strongest points genuinely offset — then "
+    "lean_reason names both and says why they cancel. Missing or unresolved data lowers lean_confidence; it is never by itself "
+    "a reason for 'neutral'. 'strongly_bearish' / 'strongly_bullish' only when the business evidence and the valuation point the "
+    "same way and lean_confidence is high. Decide from the packet and the debate only: the packet holds no analyst ratings or "
+    "price targets on purpose (they are compared with your lean afterwards) — do not guess at them. 'Balanced' means fair to "
+    "both sides' evidence, not undecided.\n"
     "\nCHECKLIST — apply to EVERY claim before giving it weight, and name failures in unsupported_claims:\n"
     "  1. Period and basis: does the number's period (quarter / TTM / fiscal year / forward) and accounting basis "
     "(GAAP / non-GAAP) match the evidence label it comes from? A quarterly rate presented as annual, or a trailing "
@@ -157,12 +195,25 @@ JUDGE_CHECKLIST = (
     "  7. Third-party models: a line labeled 'unverified third-party model' gets no weight in the verdict.\n"
     "\nLENGTH LIMITS (hard — a reply that overruns is cut off and discarded): each question answer under 40 words; "
     "bull_strongest and bear_strongest under 60 words each; reasoning under 120 words; unsupported_claims at most 6 "
-    "entries of one sentence each; verdict under 350 words INCLUDING the three closing parts.\n"
-    "\nVERDICT FORMAT: keep research framing (findings, scenarios, sensitivities — never instructions to "
-    "investors) and END the verdict with three short labeled parts:\n"
-    "  'Debates that move the stock:' the 2-3 unresolved questions that actually drive the valuation;\n"
-    "  'What would change this view:' the specific evidence that would;\n"
-    "  'Next catalyst:' the next earnings date from [EVENTS] if present, else the next filing."
+    "entries of one sentence each; verdict under 230 words INCLUDING its labeled parts.\n"
+    "\nVERDICT FORMAT (2026-10-11 — a reader should finish it in a minute; the per-question rulings already hold the "
+    "detail, so do not repeat them). Write it in this exact shape:\n"
+    "  First, ONE short paragraph of 3-4 sentences, each under 25 words, that explains the lean in plain language: what "
+    "the evidence shows about the business, then what today's price already assumes. Use only the 3-5 figures that matter "
+    "most. No parentheses inside sentences, no strings of numbers, no source labels — sources are listed beneath the "
+    "verdict by code.\n"
+    "  Then these three parts, each label on its own line exactly as written, each item a complete plain sentence:\n"
+    "  **What moves the stock**\n"
+    "  - 2-3 bullets, each naming one open question and why it matters, e.g. '- Whether the latest growth comes from "
+    "lasting pricing or a one-time product cycle, because that sets next year's earnings.'\n"
+    "  **What would change this view**\n"
+    "  - More bullish if … (one sentence)\n"
+    "  - More bearish if … (one sentence)\n"
+    "  **Next catalyst**\n"
+    "  - One sentence with the next earnings date from [EVENTS] if present, else the next filing.\n"
+    "  End with the line: Research, not investment advice.\n"
+    "Keep research framing (findings and sensitivities, never instructions to investors) and never write a buy / sell / "
+    "hold rating: the lean field carries the stance."
 )
 JUDGE_SYSTEM_PROMPT = JUDGE_SYSTEM_PROMPT_NOTEBOOK + JUDGE_CHECKLIST
 
@@ -177,7 +228,9 @@ NEWS_VERIFY_SYSTEM_PROMPT = NEWS_VERIFY_SYSTEM_PROMPT_NOTEBOOK + (
     "when the packet does not settle it."
     " LENGTH LIMITS (hard): each evidence_summary under 50 words; reasoning under 100 words; "
     "revised_verdict must be an EMPTY string unless verdict_changed is true — never restate an "
-    "unchanged verdict."
+    "unchanged verdict. A revised_verdict keeps the verdict's shape: its opening paragraph, the bold labels "
+    "**What moves the stock**, **What would change this view**, **Next catalyst** with their bullet points, and "
+    "its length."
 )
 
 

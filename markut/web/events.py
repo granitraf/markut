@@ -160,7 +160,13 @@ def event_for(node: str, update: dict, before: dict, after: dict) -> dict:
         }}
     if node == "review":
         report = update.get("review_report", {}) or {}
+        # 2026-10-11: the judge's stance rides with the governed verdict it
+        # opens; a decision without one (legacy / salvaged) stays None
+        decision = (before or {}).get("judge_decision") or {}
+        lean = ({"lean": decision["lean"], "confidence": decision.get("lean_confidence"), "reason": decision.get("lean_reason", "")}
+                if decision.get("lean") else None)
         return {"event": "review", "data": {
+            "lean": lean,
             "verdict": update.get("verdict", ""),
             "report": report,
             "stats": review_stats(before["verdict"], before["evidence"],
@@ -180,11 +186,14 @@ def _usage_delta(before: dict, after: dict) -> dict:
     return {k: after.get(k, 0) - before.get(k, 0) for k in after}
 
 
-def stream_debate(ticker: str, max_rounds: int = None, app=None, check_sec: bool = True):
+def stream_debate(ticker: str, max_rounds: int = None, app=None, check_sec: bool = True, consensus: dict = None):
     """Generator: validate (input guardrail layers 1-2) -> build graph ->
     stream -> yield one event per node. app= is the test seam (anything
     with .stream(state, stream_mode="updates")); check_sec=False skips the
-    network CIK lookup so wiring is provable offline."""
+    network CIK lookup so wiring is provable offline. consensus= supplies the
+    analyst consensus (tests); otherwise it is read from the provider after
+    the debate, when check_sec allows network — never inside the graph, so no
+    agent sees it."""
     if max_rounds is None:
         max_rounds = config.DEFAULT_MAX_ROUNDS
     if max_rounds < config.MIN_ROUNDS:
@@ -230,7 +239,16 @@ def stream_debate(ticker: str, max_rounds: int = None, app=None, check_sec: bool
                     tot[k] += v
                 before = state
                 state = apply_update(state, update or {})
-                yield stamp(event_for(node, update or {}, before, state), used)
+                event = event_for(node, update or {}, before, state)
+                if node == "review":
+                    if consensus is None and check_sec:
+                        from markut.evidence.consensus import fetch_analyst_consensus
+                        consensus = fetch_analyst_consensus(ticker)
+                    from markut.evidence.consensus import compare_lean
+                    lean = event["data"].get("lean") or {}
+                    event["data"]["consensus"] = consensus
+                    event["data"]["comparison"] = compare_lean(lean.get("lean"), consensus)
+                yield stamp(event, used)
                 if node == "research":
                     # mirror of coverage_route on the same state: the gate's ruling, reported
                     d = coverage_decision(state)
