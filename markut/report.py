@@ -228,6 +228,85 @@ def _consensus_caption(consensus: dict) -> str:
     return ("Analyst rating: " + note + ".") if note else ""
 
 
+def _money(v, ccy: str = "USD") -> str:
+    return f"${float(v):,.2f}" if (ccy or "USD").upper() == "USD" else f"{ccy.upper()} {float(v):,.2f}"
+
+
+def targets_drawing(consensus: dict, width: float):
+    """The analysts' price targets on one axis (2026-10-11): the low-to-high
+    range as a bar, the mean and median marked on it, today's price marked
+    below. None without a low and a high target."""
+    from reportlab.graphics.shapes import Drawing, Line, Polygon, Rect, String
+    c = consensus or {}
+    lo, hi, price = c.get("target_low"), c.get("target_high"), c.get("price")
+    if not lo or not hi:
+        return None
+    ccy = c.get("currency") or "USD"
+    vals = [float(v) for v in (lo, hi, price) if v]
+    a, b = min(vals), max(vals)
+    span = (b - a) or 1.0
+    a, b = a - span * 0.08, b + span * 0.08
+    # one row per kind of label (the mean on top, low and high above the bar,
+    # the price below) so they never collide however close the numbers are
+    pad, h = 40.0, 84.0
+    d = Drawing(width, h)
+    x = lambda v: pad + (float(v) - a) / (b - a) * (width - 2 * pad)
+    y = 46
+    d.add(Rect(pad, y - 1, width - 2 * pad, 2, fillColor=colors.HexColor("#d9d6cf"), strokeColor=None))
+    d.add(Rect(x(lo), y - 5, x(hi) - x(lo), 10, fillColor=colors.HexColor("#cfc6e8"), strokeColor=None))
+    for v, label, anchor in ((lo, "low", "start"), (hi, "high", "end")):
+        d.add(String(x(v), y + 9, f"{label} {_money(v, ccy)}", fontName="Mono", fontSize=7, fillColor=MUTED, textAnchor=anchor))
+    purple = colors.HexColor("#8e7cc3")
+    if c.get("target_mean"):
+        xm = x(c["target_mean"])
+        d.add(Line(xm, y - 8, xm, y + 8, strokeColor=purple, strokeWidth=2.5))
+        d.add(String(min(width - pad - 30, max(pad + 30, xm)), y + 22, f"mean {_money(c['target_mean'], ccy)}", fontName="Mono-Bold",
+                     fontSize=7.4, fillColor=purple, textAnchor="middle"))
+    if c.get("target_median") and c.get("target_median") != c.get("target_mean"):
+        xd = x(c["target_median"])
+        d.add(Line(xd, y - 6, xd, y + 6, strokeColor=purple, strokeWidth=1, strokeDashArray=[2, 2]))
+    if price:
+        xp = x(price)
+        d.add(Polygon([xp, y - 7, xp - 6, y - 17, xp + 6, y - 17], fillColor=INK, strokeColor=None))
+        d.add(String(min(width - pad - 30, max(pad + 30, xp)), y - 28, f"price {_money(price, ccy)}", fontName="Mono-Bold", fontSize=7.4,
+                     fillColor=INK, textAnchor="middle"))
+    return d
+
+
+def analyst_section(consensus: dict, width: float, st: dict) -> list:
+    """The analysts' price targets and their recent moves (2026-10-11) —
+    shown after the verdict and kept out of the debate. [] without coverage."""
+    from markut.evidence.consensus import actions_summary, target_upside
+    c = consensus or {}
+    if not c or not (c.get("target_low") and c.get("target_high")) and not (c.get("actions") or {}).get("items"):
+        return []
+    ccy = c.get("currency") or "USD"
+    out = [Spacer(1, 8), Paragraph("Analyst price targets — not used in the debate", st["h2"]),
+           Paragraph("Shown after the verdict as a separate check: the debate's lean above was formed without analyst ratings or targets.",
+                     st["small"])]
+    d = targets_drawing(c, width)
+    if d is not None:
+        out.append(d)
+        up = target_upside(c)
+        parts = [f"low {_money(c['target_low'], ccy)}"] + ([f"mean {_money(c['target_mean'], ccy)}"] if c.get("target_mean") else []) + \
+                ([f"median {_money(c['target_median'], ccy)}"] if c.get("target_median") else []) + [f"high {_money(c['target_high'], ccy)}"]
+        line = " · ".join(parts) + (f"; today's price {_money(c['price'], ccy)}" if c.get("price") else "") + \
+            (f", {up:+.1f}% to the mean target" if up is not None else "") + (f" ({c['n']} analysts)" if c.get("n") else "")
+        out.append(Paragraph(escape(line), st["small"]))
+    acts = c.get("actions") or {}
+    out.append(Paragraph("Recent analyst actions", st["label"]))
+    if acts.get("items"):
+        if actions_summary(acts.get("summary")):
+            out.append(Paragraph(escape(actions_summary(acts["summary"])), st["small"]))
+        for i in acts["items"]:
+            out.append(Paragraph(f"<font name='Mono'>{escape(i['date'])}</font>  {escape(i['text'])}", st["foot"]))
+    elif acts.get("latest"):
+        out.append(Paragraph(escape(f"None in the last 90 days; the latest: {acts['latest']['text']} ({acts['latest']['date']})."), st["foot"]))
+    else:
+        out.append(Paragraph("No upgrades, downgrades or price-target changes reported by the data provider.", st["foot"]))
+    return out
+
+
 def lean_scale_drawing(lean: dict, consensus: dict, width: float):
     """The debate's lean and the analyst consensus on one five-point scale:
     a red-to-green track from strongly bearish / strong sell to strongly
@@ -456,10 +535,6 @@ def build_report(run: dict) -> bytes:
             story.append(Paragraph(escape(_consensus_caption(consensus)), st["small"]))
         if review.get("comparison"):
             story.append(Paragraph(escape(review["comparison"]), st["small"]))
-        if consensus and consensus.get("target_mean") and consensus.get("price"):
-            story.append(Paragraph(f"Analyst mean price target ${consensus['target_mean']:,.2f} vs price ${consensus['price']:,.2f}. "
-                                   "Analyst ratings and price targets were kept out of the debate, so the lean above was formed without them.",
-                                   st["small"]))
         story.append(Spacer(1, 6))
     flow, tags = verdict_flow(verdict, st)
     story += flow
@@ -486,6 +561,8 @@ def build_report(run: dict) -> bytes:
         stt.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), PANEL), ("LEFTPADDING", (0, 0), (-1, -1), 6),
                                  ("TOPPADDING", (0, 0), (-1, 0), 6), ("BOTTOMPADDING", (0, 1), (-1, 1), 6)]))
         story += [Spacer(1, 6), stt]
+    # 2026-10-11: the analysts' targets and recent moves, after the verdict
+    story += analyst_section(review.get("consensus"), width, st)
 
     # ---- 3. the debate ----
     story += [CondPageBreak(3.2 * inch), Paragraph("The debate", st["h1"]),

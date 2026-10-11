@@ -41,7 +41,80 @@ def analyst_label(mean):
     return None if pos is None else ANALYST_STOPS[min(4, int(round(pos * 4)))]
 
 
-def analyst_consensus(info: dict, summary_rows, targets) -> dict:
+RATING_KINDS = {"up": "upgrade", "down": "downgrade", "init": "initiated"}
+
+
+def _money(v, ccy: str = "USD") -> str:
+    v = float(v)
+    body = f"{v:,.0f}" if abs(v - round(v)) < 0.005 else f"{v:,.2f}"
+    return f"${body}" if (ccy or "USD").upper() == "USD" else f"{ccy.upper()} {body}"
+
+
+def analyst_actions(rows, today: str = None, days: int = 90, cap: int = 8, ccy: str = "USD") -> dict:
+    """PURE. The key recent analyst moves (2026-10-11): upgrades, downgrades,
+    initiations and price-target changes in the last `days`, newest first —
+    every rating change kept, then the newest target changes up to `cap`; a
+    reiteration at an unchanged target is not a move. -> {"items": [{date,
+    firm, kind, text}], "summary": counts over the window, "latest": the most
+    recent action of any age (named when the window is empty)}."""
+    from datetime import date, timedelta
+    rows = [r for r in (rows or []) if r.get("date") and r.get("firm")]
+    if not rows:
+        return {"items": [], "summary": None, "latest": None}
+    cutoff = (date.fromisoformat((today or date.today().isoformat())[:10]) - timedelta(days=days)).isoformat()
+    num = lambda v: float(v) if v not in (None, "") and v == v and float(v) > 0 else None
+    moves = []
+    for r in sorted(rows, key=lambda r: str(r["date"]), reverse=True):
+        now, prior = num(r.get("pt_now")), num(r.get("pt_prior"))
+        kind = RATING_KINDS.get(str(r.get("action", "")).lower())
+        if not kind and now and prior and abs(now - prior) > 0.005:
+            kind = "target_cut" if now < prior else "target_raise"
+        if not kind:
+            continue
+        to, frm, firm = (r.get("to_grade") or "").strip(), (r.get("from_grade") or "").strip(), r["firm"].strip()
+        target = (f"price target {_money(now, ccy)} from {_money(prior, ccy)}" if now and prior and abs(now - prior) > 0.005
+                  else f"price target {_money(now, ccy)}" if now else "")
+        if kind == "upgrade" or kind == "downgrade":
+            text = f"{firm} {kind}d to {to}" + (f" from {frm}" if frm and frm != to else "") + (f"; {target}" if target else "")
+        elif kind == "initiated":
+            text = f"{firm} initiated at {to}" + (f"; {target}" if target else "")
+        else:
+            verb = "cut" if kind == "target_cut" else "raised"
+            text = f"{firm} {verb} its price target to {_money(now, ccy)} from {_money(prior, ccy)}" + (f" ({to})" if to else "")
+        moves.append({"date": str(r["date"])[:10], "firm": firm, "kind": kind, "text": text,
+                      "pt_change": bool(now and prior and abs(now - prior) > 0.005), "pt_cut": bool(now and prior and now < prior)})
+    recent = [m for m in moves if m["date"] >= cutoff]
+    ratings = [m for m in recent if m["kind"] in ("upgrade", "downgrade", "initiated")][:cap]
+    targets = [m for m in recent if m not in ratings][:max(0, cap - len(ratings))]
+    items = sorted(ratings + targets, key=lambda m: m["date"], reverse=True)
+    summary = {"days": days, "upgrades": sum(m["kind"] == "upgrade" for m in recent),
+               "downgrades": sum(m["kind"] == "downgrade" for m in recent),
+               "initiations": sum(m["kind"] == "initiated" for m in recent),
+               "target_cuts": sum(m["pt_cut"] for m in recent),
+               "target_raises": sum(m["pt_change"] and not m["pt_cut"] for m in recent)} if recent else None
+    return {"items": [{k: m[k] for k in ("date", "firm", "kind", "text")} for m in items], "summary": summary,
+            "latest": {k: moves[0][k] for k in ("date", "firm", "kind", "text")} if moves else None}
+
+
+def target_upside(c) -> float:
+    """PURE. % from today's price to the mean analyst target; None without both."""
+    try:
+        return (float(c["target_mean"]) / float(c["price"]) - 1) * 100
+    except (TypeError, ValueError, KeyError, ZeroDivisionError):
+        return None
+
+
+def actions_summary(summary) -> str:
+    """'2 downgrades · 10 price-target cuts in the last 90 days' ('' when none)."""
+    if not summary:
+        return ""
+    parts = [(summary["upgrades"], "upgrade"), (summary["downgrades"], "downgrade"), (summary["initiations"], "initiation"),
+             (summary["target_raises"], "price-target raise"), (summary["target_cuts"], "price-target cut")]
+    shown = [f"{n} {w}{'s' if n != 1 else ''}" for n, w in parts if n]
+    return (" · ".join(shown) + f" in the last {summary['days']} days") if shown else ""
+
+
+def analyst_consensus(info: dict, summary_rows, targets, actions: dict = None) -> dict:
     """PURE. Provider fields -> {mean, label, n, counts, target_mean,
     target_high, target_low, price, source}. counts is None when the
     provider has no rating-spread table. None when there is no rating at
@@ -69,8 +142,11 @@ def analyst_consensus(info: dict, summary_rows, targets) -> dict:
     t = targets or {}
     return {"mean": mean, "label": analyst_label(mean), "n": int(n) if n else None, "counts": counts,
             "target_mean": t.get("mean") or info.get("targetMeanPrice"), "target_high": t.get("high"), "target_low": t.get("low"),
-            "price": info.get("currentPrice") or info.get("regularMarketPrice"),
-            "source": "yfinance (recommendation mean, ratings spread, analyst price targets)"}
+            "target_median": t.get("median") or info.get("targetMedianPrice"),
+            "price": info.get("currentPrice") or info.get("regularMarketPrice") or t.get("current"),
+            "currency": (info.get("currency") or "USD").upper(),
+            "actions": actions or {"items": [], "summary": None, "latest": None},
+            "source": "yfinance (recommendation mean, ratings spread, analyst price targets, upgrades and downgrades)"}
 
 
 def fetch_analyst_consensus(ticker: str):
@@ -89,7 +165,14 @@ def fetch_analyst_consensus(ticker: str):
             targets = t.analyst_price_targets or None
         except Exception:
             targets = None
-        return analyst_consensus(info, rows, targets)
+        try:
+            ud = t.upgrades_downgrades
+            moves = [{"date": str(idx)[:10], "firm": r.get("Firm"), "to_grade": r.get("ToGrade"), "from_grade": r.get("FromGrade"),
+                      "action": r.get("Action"), "pt_action": r.get("priceTargetAction"), "pt_now": r.get("currentPriceTarget"),
+                      "pt_prior": r.get("priorPriceTarget")} for idx, r in ud.head(80).iterrows()] if ud is not None and len(ud) else []
+        except Exception:
+            moves = []
+        return analyst_consensus(info, rows, targets, actions=analyst_actions(moves, ccy=(info.get("currency") or "USD")))
     except Exception as e:
         print(f"CONSENSUS: unavailable ({type(e).__name__}: {e})")
         return None

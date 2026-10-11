@@ -181,8 +181,61 @@ window.Markut = (function () {
       <div class="scale">${scaleSvg(p, a, mean, (cons && cons.counts) || null)}</div>
       ${cnote ? `<p class="cnote">Analyst rating: ${esc(cnote)}.</p>` : ""}
       ${comparison ? `<p class="cmp">${esc(comparison)}</p>` : ""}
-      ${cons && cons.target_mean && cons.price ? `<p class="tgt">Analyst mean price target $${Number(cons.target_mean).toFixed(2)} vs price $${Number(cons.price).toFixed(2)}. Ratings and price targets were kept out of the debate${withheld ? "." : ", so the lean was formed without them."}</p>` : ""}
     </div>`;
+  }
+  // 2026-10-11: the analysts' price targets and their recent moves — after
+  // the verdict, kept out of the debate (the lean above was formed without them)
+  function money(v, ccy) {
+    const body = Number(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return !ccy || ccy === "USD" ? `$${body}` : `${ccy} ${body}`;
+  }
+  function targetsSvg(c) {
+    // one row per kind of label, so they never collide however close the
+    // numbers are: the mean on top, low and high above the bar, the price below
+    const lo = Number(c.target_low), hi = Number(c.target_high), price = c.price ? Number(c.price) : null, ccy = c.currency;
+    const vals = [lo, hi].concat(price ? [price] : []);
+    let a = Math.min(...vals), b = Math.max(...vals);
+    const span = (b - a) || 1; a -= span * 0.1; b += span * 0.1;
+    // a narrower drawing than the card: its labels scale up on a phone (2026-10-11)
+    const W = 440, pad = 10, y = 52, x = (v) => pad + (v - a) / (b - a) * (W - 2 * pad);
+    let g = `<line x1="${pad}" x2="${W - pad}" y1="${y}" y2="${y}" class="tg-axis"/>`;
+    g += `<rect x="${x(lo)}" y="${y - 6}" width="${Math.max(2, x(hi) - x(lo))}" height="12" rx="3" class="tg-range"/>`;
+    g += `<text x="${x(lo)}" y="${y - 12}" class="tg-lab" text-anchor="start">low ${esc(money(lo, ccy))}</text>`;
+    g += `<text x="${x(hi)}" y="${y - 12}" class="tg-lab" text-anchor="end">high ${esc(money(hi, ccy))}</text>`;
+    if (c.target_median && c.target_median !== c.target_mean) g += `<line x1="${x(+c.target_median)}" x2="${x(+c.target_median)}" y1="${y - 8}" y2="${y + 8}" class="tg-median"/>`;
+    if (c.target_mean) {
+      const xm = Math.min(W - 64, Math.max(64, x(+c.target_mean)));
+      g += `<line x1="${x(+c.target_mean)}" x2="${x(+c.target_mean)}" y1="${y - 10}" y2="${y + 10}" class="tg-mean"/>` +
+        `<text x="${xm}" y="${y - 30}" class="tg-mlab" text-anchor="middle">mean ${esc(money(c.target_mean, ccy))}</text>`;
+    }
+    if (price) {
+      const xp = Math.min(W - 56, Math.max(56, x(price)));
+      g += `<polygon points="${x(price)},${y + 8} ${x(price) - 6},${y + 19} ${x(price) + 6},${y + 19}" class="tg-price"/>` +
+        `<text x="${xp}" y="${y + 34}" class="tg-plab" text-anchor="middle">price ${esc(money(price, ccy))}</text>`;
+    }
+    return `<svg viewBox="0 0 ${W} 96" class="tg-svg" role="img" aria-label="analyst price targets">${g}</svg>`;
+  }
+  function analystHtml(c) {
+    if (!c) return "";
+    const acts = c.actions || {}, items = acts.items || [];
+    const hasT = c.target_low && c.target_high;
+    if (!hasT && !items.length) return "";
+    const ccy = c.currency, s = acts.summary;
+    const up = c.target_mean && c.price ? (c.target_mean / c.price - 1) * 100 : null;
+    const parts = hasT ? [`low ${money(c.target_low, ccy)}`].concat(c.target_mean ? [`mean ${money(c.target_mean, ccy)}`] : [],
+      c.target_median ? [`median ${money(c.target_median, ccy)}`] : [], [`high ${money(c.target_high, ccy)}`]) : [];
+    const line = parts.join(" · ") + (c.price ? `; today's price ${money(c.price, ccy)}` : "") +
+      (up !== null ? `, ${up >= 0 ? "+" : ""}${up.toFixed(1)}% to the mean target` : "") + (c.n ? ` (${c.n} analysts)` : "");
+    const words = s ? [[s.upgrades, "upgrade"], [s.downgrades, "downgrade"], [s.initiations, "initiation"], [s.target_raises, "price-target raise"],
+      [s.target_cuts, "price-target cut"]].filter(([n]) => n).map(([n, w]) => `${n} ${w}${n === 1 ? "" : "s"}`) : [];
+    const kindCls = (k) => k === "downgrade" || k === "target_cut" ? "down" : k === "upgrade" || k === "target_raise" ? "up" : "flat";
+    const list = items.length
+      ? `${words.length ? `<p class="acts-sum">${esc(words.join(" · "))} in the last ${s.days} days</p>` : ""}<ul class="acts">` +
+        items.map((i) => `<li class="${kindCls(i.kind)}"><span class="dt">${esc(i.date)}</span> ${esc(i.text)}</li>`).join("") + `</ul>`
+      : `<p class="acts-sum">${acts.latest ? `None in the last 90 days; the latest: ${esc(acts.latest.text)} (${esc(acts.latest.date)}).` : "No upgrades, downgrades or price-target changes reported by the data provider."}</p>`;
+    return `<div class="anv"><h4>Analyst price targets <span class="anv-note">not used in the debate</span></h4>
+      ${hasT ? `${targetsSvg(c)}<p class="tg-line">${esc(line)}</p>` : ""}
+      <h5>Recent analyst actions</h5>${list}</div>`;
   }
   function sourcesHtml(sources) {
     if (!sources || !sources.length) return "";
@@ -392,6 +445,7 @@ window.Markut = (function () {
           ${sourcesHtml((d.report || {}).sources)}
           ${kvs([["claims", num(s.claims)], ["cited", num(s.cited)], ["flagged", num(s.flagged)], ["derived", num(s.derived)], ["labeled", num(s.labeled)], ["annotated", num(s.annotated)]])}
           ${tagged.length ? `<div class="tagged"><span class="k">left tagged — no evidence anchor:</span> ${tagged.map((t) => `<span class="ungrounded">${esc(t)}</span>`).join(" ")}</div>` : `<div class="tagged"><span class="k">every number in the verdict traced to the evidence packet${s.sources_unavailable ? `; ${s.sources_unavailable} source${s.sources_unavailable === 1 ? "" : "s"} unavailable (see data gaps)` : ""}.</span></div>`}
+          ${analystHtml(d.consensus)}
           ${note(d)}`);
       },
       done(d) {
