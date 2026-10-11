@@ -36,6 +36,10 @@ input, select { font: inherit; padding: 8px 10px; border: 1px solid var(--line);
 /* ---- timeline ---- */
 .timeline { display: flex; flex-direction: column; gap: 14px; }
 .card { background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--line); border-radius: 10px; padding: 16px 18px 14px; animation: arrive .35s ease-out; }
+/* nothing leaves its card: long tokens break, every box can shrink, and a
+   card that still had wider content would scroll inside itself instead of
+   spilling over the page (run #27: core-figure lines ran off the page) */
+.card { min-width: 0; overflow-wrap: anywhere; overflow-x: auto; }
 @keyframes arrive { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .card h3 { margin: 0 0 10px; font-size: 13px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-weight: 500; }
 .card h3 .who { text-transform: uppercase; letter-spacing: .1em; font-size: 11.5px; font-weight: 700; }
@@ -95,19 +99,24 @@ summary.typing::after, .argtitle.typing::after, .typing::after { content: "▍";
 .gaps .gk { font-size: 10.5px; text-transform: uppercase; letter-spacing: .1em; color: var(--review); margin-right: 4px; }
 .gaps .gi { color: var(--muted); } .gaps .gi b { color: var(--ink); font-weight: 500; margin-right: 4px; }
 .gaps .gi.known { font-style: italic; }
-/* evidence packet: key/value grid + small tables. Values never wrap; labels do. */
+/* evidence packet: key/value grid + small tables. Short values never wrap;
+   a long value (.pkr.long) takes the full row and wraps under its label. */
 .pk { margin: 0 0 16px; }
 .pkh { font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); margin: 8px 0 6px; }
 .pkg { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 0 32px; }
 .pkr { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
 .pkk { color: var(--muted); line-height: 1.45; min-width: 0; }
 .pkv { flex: 0 0 auto; white-space: nowrap; font-variant-numeric: tabular-nums; color: #f0f0f0; background: rgba(255,255,255,.07); border-radius: 4px; padding: 1px 7px; }
+.pkg > .pkr { min-width: 0; } .pkv { max-width: 100%; }
+.pkr.long { grid-column: 1 / -1; flex-direction: column; align-items: stretch; gap: 4px; }
+.pkr.long .pkv, .pk.wrap .pkv { white-space: normal; flex: 0 1 auto; min-width: 0; line-height: 1.5; }
 .pkn { color: var(--muted); font-size: 12.5px; line-height: 1.5; padding: 8px 0 2px; }
 .pkn + .pkn { border-top: 1px dotted var(--line); }
 .pkt { width: 100%; border-collapse: collapse; margin: 12px 0 4px; font-size: 13px; font-variant-numeric: tabular-nums; }
-.pkt th { text-align: right; font-weight: 500; font-size: 10.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.pkt th { text-align: right; font-weight: 500; font-size: 10.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); padding: 4px 8px; border-bottom: 1px solid var(--line); }
 .pkt th:first-child, .pkt td:first-child { text-align: left; padding-left: 0; }
-.pkt td { text-align: right; padding: 6px 8px; border-bottom: 1px dotted var(--line); white-space: nowrap; }
+.pkt td { text-align: right; padding: 6px 8px; border-bottom: 1px dotted var(--line); overflow-wrap: break-word; }
+.pkt .nw { white-space: nowrap; }   /* a short figure ("$45,781 million") stays on one line; sentences wrap */
 .pkt td:first-child { color: var(--muted); white-space: normal; }
 .pkt td:last-child, .pkt th:last-child { padding-right: 0; }
 .pkt b { font-weight: 600; color: #f0f0f0; } .pkt small { color: var(--muted); font-size: 11.5px; margin-left: 4px; }
@@ -119,7 +128,7 @@ summary.typing::after, .argtitle.typing::after, .typing::after { content: "▍";
 .ungrounded small { font-weight: 500; font-size: 11px; opacity: .85; }
 .tagged { margin-top: 10px; font-size: 13px; display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
 .tagged .k { color: var(--muted); }
-pre.evidence { font: 12.5px/1.5 var(--mono); white-space: pre-wrap; margin: 8px 0 0; max-height: 360px; overflow: auto; background: var(--bg); padding: 10px; border-radius: 8px; }
+pre.evidence { font: 12.5px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 0; max-height: 360px; overflow: auto; background: var(--bg); padding: 10px; border-radius: 8px; }
 details summary { cursor: pointer; color: var(--accent); font-size: 14px; }
 .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 8px; margin: 14px 0 0; max-width: 72ch; }
 .kv div { background: var(--bg); border-radius: 8px; padding: 8px 10px; }

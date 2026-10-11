@@ -104,11 +104,17 @@ window.Markut = (function () {
   /* packetHtml: the evidence packet's market lines ("[SECTION]" headers and
      "- Key: value  [source: x]") become a two-column key/value grid; the
      valuation block's EPS×multiple scenario rows become a small table;
-     BASIS/PERIOD notes become full-width text. Values never wrap —
-     labels do. Everything after the market lines (filings, news) stays
+     BASIS/PERIOD notes become full-width text. Short values never wrap;
+     long ones take the full row and wrap. Everything after the market lines (filings, news) stays
      collapsed as text. */
   const FLAG_LABELS = { upheld: "flag upheld", overturned: "flag overturned", unresolved: "unresolved" };
   const WRAP_SECTIONS = /^(PROFILE|KEY QUESTIONS|WHAT WOULD MISLEAD|COVERAGE GAPS)$/;
+  // A value longer than this is a sentence ("Total net sales: 109,417 million
+  // (quarter, …) vs …"), not a figure: it takes the full row and wraps. Short
+  // figures stay on one line. A section where a third of the values are long
+  // is laid out as one column (CORE FIGURES spilled off the card before).
+  const LONG_VALUE = 34;
+  const isLong = (r) => String(r.v || "").length > LONG_VALUE;
   function packetHtml(evidence) {
     const lines = String(evidence || "").split("\n");
     const sections = []; let s = null;
@@ -140,8 +146,9 @@ window.Markut = (function () {
           (missing.length ? missing.map((r) => `<span class="gi"><b>${esc(r.k)}</b> ${esc(r.v)}</span>`).join("") : `<span class="gi">none — every source responded</span>`) +
           items.filter((r) => /^known gap/.test(r.k)).map((r) => `<span class="gi known">${esc(r.v)}</span>`).join("") + `</div>`;
       }
-      const wrap = WRAP_SECTIONS.test(sec.name);
       const kv = sec.rows.filter((r) => !r.sub);
+      const longRows = kv.filter(isLong).length;
+      const wrap = WRAP_SECTIONS.test(sec.name) || (longRows > 0 && longRows * 3 >= kv.length);
       const isText = !kv.length && !sec.scenarios.length && sec.text.length;
       if (isText) {
         const body = sec.text.join("\n").trim();
@@ -150,7 +157,7 @@ window.Markut = (function () {
         return `<details class="pt pk-text"><summary>${esc(label)}</summary><pre class="evidence">${esc(body)}</pre></details>`;
       }
       let h = `<div class="pk ${wrap ? "wrap" : ""}"><div class="pkh">${esc(sec.name.toLowerCase())}</div>`;
-      if (kv.length) h += `<div class="pkg">` + kv.map((r) => `<div class="pkr"><span class="pkk">${esc(r.k)}</span><span class="pkv">${esc(r.v)}</span></div>`).join("") + `</div>`;
+      if (kv.length) h += `<div class="pkg">` + kv.map((r) => `<div class="pkr${isLong(r) ? " long" : ""}"><span class="pkk">${esc(r.k)}</span><span class="pkv">${esc(r.v)}</span></div>`).join("") + `</div>`;
       if (sec.scenarios.length) {
         const cols = sec.scenarios[0].cells.map((c) => c.name);           // p25 / median / p75, or 0.8x fwd / fwd / 1.2x fwd
         h += `<table class="pkt"><thead><tr><th>implied price (EPS × multiple)</th>${cols.map((c, i) => `<th>${esc(c)} <small>${esc(sec.scenarios[0].cells[i].mult)}</small></th>`).join("")}</tr></thead><tbody>` +
@@ -217,7 +224,7 @@ window.Markut = (function () {
         let body = p.business ? `<p class="md">${esc(p.business)}</p>` : `<p class="note">no profile could be built${(d.gaps || []).length ? ": " + esc(d.gaps.join("; ")) : ""}</p>`;
         const segs = (p.segments || []).filter((x) => x && x.name);
         if (segs.length) body += `<table class="pkt"><thead><tr><th>segment</th><th>latest revenue</th><th>yoy</th><th>period</th></tr></thead><tbody>` +
-          segs.map((x) => `<tr><td>${esc(x.name)}</td><td><b>${esc(x.latest_revenue || "—")}</b></td><td>${esc(x.latest_yoy || "—")}</td><td><small>${esc(x.period || "")}</small></td></tr>`).join("") + `</tbody></table>`;
+          segs.map((x) => `<tr><td>${esc(x.name)}</td><td><b${String(x.latest_revenue || "").length <= 20 ? ' class="nw"' : ""}>${esc(x.latest_revenue || "—")}</b></td><td>${esc(x.latest_yoy || "—")}</td><td><small>${esc(x.period || "")}</small></td></tr>`).join("") + `</tbody></table>`;
         const kpis = (p.company_kpis || []).filter((x) => x && x.name);
         if (kpis.length) body += `<div class="kpis"><span class="k">the metrics this company reports</span><ul class="claims">${kpis.map((x) => `<li><b>${esc(x.name)}</b>${x.unit ? ` <small>(${esc(x.unit)})</small>` : ""} — ${esc(x.definition || "")}${x.segment && !/company-?wide/i.test(x.segment) ? ` <small>· ${esc(x.segment)}</small>` : ""}</li>`).join("")}</ul></div>`;
         if ((d.gaps || []).length) body += `<p class="note">profile gaps: ${esc(d.gaps.join("; "))}</p>`;
